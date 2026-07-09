@@ -331,6 +331,10 @@ class Worker(QThread):
             self._run_repo_detail()
         elif self.mode == "clone":
             self._run_clone()
+        elif self.mode == "create_mirror":
+            self._run_create_mirror()
+        elif self.mode == "sync_mirrors":
+            self._run_sync_mirrors()
         elif self.mode == "upgrade_engine":
             self._run_upgrade_engine()
         elif self.mode == "healthcheck":
@@ -377,7 +381,7 @@ class Worker(QThread):
         c = self.cfg
         root = c["remote_root"]
         self.log.emit(f"--- 列出 {root} 底下的倉庫 ---")
-        # 每行輸出：name<TAB>status<TAB>policy。status=空庫或最後commit；policy=none/soft/strict
+        # 每行：name<TAB>status<TAB>policy<TAB>mirror_url（mirror_url 非空代表是 GitHub 鏡像）
         cmd = "\n".join([
             "echo ___BEGIN___",
             f'for d in "{root}"/*/; do',
@@ -388,11 +392,13 @@ class Worker(QThread):
             f"  pf='{root}/ci_policies/'\"$name\"'.policy'; pol=none",
             "  [ -f \"$pf\" ] && pol=$(sed -n 's/^[[:space:]]*POLICY=//p' \"$pf\" | head -1)",
             "  [ -z \"$pol\" ] && pol=none",
+            "  mu=''",
+            "  [ \"$(git --git-dir=\"$d\" config --get remote.origin.mirror 2>/dev/null)\" = true ] && mu=$(git --git-dir=\"$d\" config --get remote.origin.url 2>/dev/null)",
             "  if [ -z \"$info\" ]; then",
-            "    printf '%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\"",
+            "    printf '%s\\t%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\" \"$mu\"",
             "  else",
             "    dt=${info%%|*}; br=${info#*|}",
-            "    printf '%s\\t%s (%s)\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\"",
+            "    printf '%s\\t%s (%s)\\t%s\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\" \"$mu\"",
             "  fi",
             "done",
             "echo ___END___",
@@ -420,11 +426,13 @@ class Worker(QThread):
             name = parts[0].strip() if parts else ""
             status = parts[1].strip() if len(parts) > 1 else ""
             pol = parts[2].strip() if len(parts) > 2 else "none"
-            items.append((name, status, pol))
+            mirror = parts[3].strip() if len(parts) > 3 else ""
+            items.append((name, status, pol, mirror))
         items.sort(key=lambda t: t[0].lower())
         self.repos.emit(items)
         n_empty = sum(1 for t in items if t[1].startswith("空庫"))
-        self.done.emit(True, f"找到 {len(items)} 個倉庫（其中 {n_empty} 個空庫）。")
+        n_mir = sum(1 for t in items if len(t) > 3 and t[3])
+        self.done.emit(True, f"找到 {len(items)} 個倉庫（空庫 {n_empty}、鏡像 {n_mir}）。")
 
     # --- 安全下庄 / 刪除倉庫 ---
     def _run_delete(self):
@@ -781,6 +789,81 @@ class Worker(QThread):
             msg = (err or out).strip()
             tail = msg.splitlines()[-1] if msg else "未知錯誤"
             self.done.emit(False, f"clone 失敗：{tail}")
+
+    # --- 在 NAS 建立 GitHub 鏡像庫（git clone --mirror，NAS 直接對 GitHub 拉）---
+    def _run_create_mirror(self):
+        c = self.cfg
+        root = c["remote_root"]
+        url = (c.get("mirror_url", "") or "").strip()
+        name = c.get("repo_name", "")
+        if not name.endswith(".git"):
+            name += ".git"
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許英數與 . _ -）：{name!r}")
+            return
+        # URL 白名單：只允許常見 git 遠端格式，且不得含引號/空白/反引號/$
+        if not re.match(r"^(https://|http://|git@|ssh://|file://)[A-Za-z0-9@._:/~?=&%+\-]+$", url):
+            self.done.emit(False, "GitHub URL 格式不合規（僅允許 https:// / git@ / ssh:// / file:// 開頭的正常網址）。")
+            return
+        self.log.emit(f"--- 建立 GitHub 鏡像：{name} ← {url} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; url='{url}'",
+            "repo=\"$BASE/$name\"",
+            "if [ -e \"$repo\" ]; then echo EXISTS; echo ___END___; exit 0; fi",
+            "if git clone --mirror \"$url\" \"$repo\" >/dev/null 2>&1; then",
+            "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null",
+            "  echo ___OK___",
+            "else",
+            "  rm -rf \"$repo\"; echo CLONE_FAIL",
+            "fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if "EXISTS" in out:
+            self.done.emit(False, f"倉庫已存在，未建立：{name}")
+        elif rc == 0 and "___OK___" in out:
+            clone_url = f"{c['user']}@{c['host']}:{root}/{name}"
+            self.done.emit(True, f"已建立鏡像：{name}\n上游：{url}\n本地 Clone URL：{clone_url}\n（日後用『同步鏡像』或排程更新）")
+        else:
+            self.done.emit(False, "建立鏡像失敗（NAS 連不到 GitHub？私有庫需在 NAS 設金鑰/token？）。")
+
+    # --- 同步鏡像（remote update --prune）；names 空則同步全部鏡像 ---
+    def _run_sync_mirrors(self):
+        root = self.cfg["remote_root"]
+        names = [n for n in self.cfg.get("mirror_names", []) if is_safe_name(n)]
+        flt = ("".join(" " + n + " " for n in names)) if names else ""
+        self.log.emit(f"--- 同步鏡像（{'選取 ' + str(len(names)) + ' 個' if names else '全部'}）---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; FILTER='{flt}'",
+            "n=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  name=$(basename \"$repo\")",
+            "  [ \"$(git --git-dir=\"$repo\" config --get remote.origin.mirror 2>/dev/null)\" = true ] || continue",
+            "  if [ -n \"$FILTER\" ]; then case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac; fi",
+            "  n=$((n+1))",
+            "  if git --git-dir=\"$repo\" remote update --prune >/dev/null 2>&1; then",
+            "    echo \"[OK]   $name\"",
+            "  else",
+            "    echo \"[FAIL] $name\"",
+            "  fi",
+            "done",
+            "[ \"$n\" = 0 ] && echo '（沒有符合的鏡像庫）'",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "同步失敗（連線或權限問題）。")
+            return
+        body = self._between(out)
+        self.hooks.emit(body)
+        nfail = body.count("[FAIL]")
+        nok = body.count("[OK]")
+        self.done.emit(nfail == 0, f"鏡像同步完成：成功 {nok}、失敗 {nfail}。")
 
     # --- 一鍵升級 NAS 上的 CI 引擎（自動備份 + 換檔）---
     def _run_upgrade_engine(self):
@@ -1549,6 +1632,58 @@ class ArchiveDialog(QDialog):
 
 
 # ============================================================
+# 註冊 GitHub 鏡像 對話框
+# ============================================================
+class MirrorDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("註冊 GitHub 鏡像庫")
+        self.setMinimumWidth(500)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("讓 NAS 直接對應一個 GitHub 倉庫（NAS 會去 GitHub 拉，之後可同步/排程）。"))
+        g = QGridLayout()
+        g.addWidget(QLabel("GitHub URL："), 0, 0)
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://github.com/作者/repo.git")
+        self.url_edit.textChanged.connect(self._suggest_name)
+        g.addWidget(self.url_edit, 0, 1)
+        g.addWidget(QLabel("NAS 庫名："), 1, 0)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("自動由 URL 帶入，可改（會自動補 .git）")
+        g.addWidget(self.name_edit, 1, 1)
+        lay.addLayout(g)
+        note = QLabel("提醒：鏡像庫是唯讀對應上游，別把自己的 commit 推進去。私有庫需在 NAS 端設好 GitHub 金鑰/token。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#666;")
+        lay.addWidget(note)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._ok)
+        bb.rejected.connect(self.reject)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("建立鏡像")
+        lay.addWidget(bb)
+
+    def _suggest_name(self, url):
+        if self.name_edit.text().strip() and self.name_edit.property("edited"):
+            return
+        seg = url.rstrip("/").split("/")[-1] if url else ""
+        if seg.endswith(".git"):
+            seg = seg[:-4]
+        self.name_edit.setText(seg)
+
+    def _ok(self):
+        if not self.url_edit.text().strip():
+            QMessageBox.information(self, "缺 URL", "請輸入 GitHub URL。")
+            return
+        if not self.name_edit.text().strip():
+            QMessageBox.information(self, "缺庫名", "請輸入 NAS 庫名。")
+            return
+        self.accept()
+
+    def values(self):
+        return self.url_edit.text().strip(), self.name_edit.text().strip()
+
+
+# ============================================================
 # 主視窗
 # ============================================================
 class MainWindow(QMainWindow):
@@ -1704,13 +1839,26 @@ class MainWindow(QMainWindow):
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("輸入關鍵字即時篩選…")
         self.filter_edit.textChanged.connect(self.apply_repo_filter)
+        self.mirror_reg_btn = QPushButton("註冊鏡像…")
+        self.mirror_reg_btn.setToolTip("讓 NAS 直接對應一個 GitHub 倉庫（git clone --mirror）。")
+        self.mirror_reg_btn.clicked.connect(self.on_create_mirror)
+        self.mirror_sync_btn = QPushButton("同步鏡像")
+        self.mirror_sync_btn.setToolTip("對選取的鏡像庫執行 remote update；沒選就同步全部鏡像。")
+        self.mirror_sync_btn.clicked.connect(self.on_sync_mirrors)
+
         top_row.addWidget(self.refresh_btn)
         top_row.addWidget(self.ci_status_btn)
         top_row.addWidget(self.upgrade_btn)
-        top_row.addWidget(self.create_btn)
-        top_row.addWidget(self.archive_btn)
         top_row.addWidget(self.filter_edit, stretch=1)
         bp.addLayout(top_row)
+
+        top_row2 = QHBoxLayout()
+        top_row2.addWidget(self.create_btn)
+        top_row2.addWidget(self.archive_btn)
+        top_row2.addWidget(self.mirror_reg_btn)
+        top_row2.addWidget(self.mirror_sync_btn)
+        top_row2.addStretch(1)
+        bp.addLayout(top_row2)
 
         self.repo_list = QListWidget()
         self.repo_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -2077,6 +2225,8 @@ class MainWindow(QMainWindow):
         self.upgrade_btn.setEnabled(not busy)
         self.create_btn.setEnabled(not busy)
         self.archive_btn.setEnabled(not busy)
+        self.mirror_reg_btn.setEnabled(not busy)
+        self.mirror_sync_btn.setEnabled(not busy)
         for b in (self.hc_btn, self.repair_btn, self.push_log_btn,
                   self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
@@ -2152,16 +2302,17 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_repos(self, items: list):
-        # items: list of (name, status, policy)；容錯舊格式
+        # items: (name, status, policy, mirror_url)；容錯舊格式
         norm = []
         for it in items:
             if isinstance(it, (list, tuple)):
                 name = str(it[0])
                 status = str(it[1]) if len(it) > 1 else ""
                 pol = str(it[2]) if len(it) > 2 else "none"
-                norm.append((name, status, pol))
+                mirror = str(it[3]) if len(it) > 3 else ""
+                norm.append((name, status, pol, mirror))
             else:
-                norm.append((str(it), "", "none"))
+                norm.append((str(it), "", "none", ""))
         self._all_repos = norm
         self.apply_repo_filter(self.filter_edit.text())
 
@@ -2178,17 +2329,32 @@ class MainWindow(QMainWindow):
     def apply_repo_filter(self, text: str):
         text = (text or "").strip().lower()
         self.repo_list.clear()
-        for name, status, pol in self._all_repos:
+        for name, status, pol, mirror in self._all_repos:
             if text and text not in name.lower():
                 continue
             ci = {"soft": "CI:soft", "strict": "CI:strict"}.get(pol, "CI:—")
-            label = f"{name}    ·    {status}    ·    {ci}" if status else f"{name}    ·    {ci}"
-            it = QListWidgetItem(label)
+            parts = [name]
+            if status:
+                parts.append(status)
+            parts.append(ci)
+            if mirror:
+                parts.append("↺鏡像")
+            it = QListWidgetItem("    ·    ".join(parts))
             it.setData(Qt.ItemDataRole.UserRole, name)
             it.setData(Qt.ItemDataRole.UserRole + 1, pol)
+            it.setData(Qt.ItemDataRole.UserRole + 2, mirror)
+            if mirror:
+                it.setToolTip(f"GitHub 鏡像 ← {mirror}")
             if status.startswith("空庫"):
                 it.setForeground(Qt.GlobalColor.gray)
             self.repo_list.addItem(it)
+
+    def _selected_mirror_names(self):
+        out = []
+        for it in self.repo_list.selectedItems():
+            if it.data(Qt.ItemDataRole.UserRole + 2):
+                out.append(it.data(Qt.ItemDataRole.UserRole) or it.text())
+        return out
 
     def _selected_repo_name(self) -> str:
         items = self.repo_list.selectedItems()
@@ -2581,6 +2747,51 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("❌ " + msg.replace("\n", " "))
             self.browse_status.setStyleSheet("color:#b00020;")
             QMessageBox.warning(self, "Clone 失敗", msg)
+
+    # ---------- GitHub 鏡像 ----------
+    def on_create_mirror(self):
+        dlg = MirrorDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        url, name = dlg.values()
+        cfg = dict(self.collect_identity_cfg())
+        cfg.update({"mirror_url": url, "repo_name": name})
+        self.save_current_profile(silent=True)
+        self.browse_status.setText(f"建立鏡像「{name}」中…（clone --mirror 可能較久）")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="create_mirror")
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self.on_mirror_create_done)
+        self.worker.start()
+
+    def on_mirror_create_done(self, ok: bool, msg: str):
+        self.set_busy(False)
+        if ok:
+            self.browse_status.setText("✔ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#1a7f37;")
+            QMessageBox.information(self, "完成", msg)
+            self.on_refresh()
+        else:
+            self.browse_status.setText("❌ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#b00020;")
+            QMessageBox.warning(self, "建立鏡像失敗", msg)
+
+    def on_sync_mirrors(self):
+        names = self._selected_mirror_names()  # 選取中的鏡像；空=全部
+        cfg = dict(self.collect_identity_cfg())
+        cfg["mirror_names"] = names
+        self.save_current_profile(silent=True)
+        scope = f"選取的 {len(names)} 個鏡像" if names else "全部鏡像"
+        self._ci_title = "鏡像同步結果"
+        self.browse_status.setText(f"同步{scope}中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="sync_mirrors")
+        self.worker.log.connect(self.append_log)
+        self.worker.hooks.connect(self.on_ci_result)
+        self.worker.done.connect(self.on_ci_done)
+        self.worker.start()
 
 
 def main():
