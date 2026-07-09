@@ -1,0 +1,75 @@
+# ============================================
+# .gitignore — 通用（Keil MDK / Python / ESP-IDF）
+# ============================================
+
+# ========== Keil MDK (ARMCLANG) ==========
+*.uvguix.*
+*.uvoptx
+*.bak
+*.dbgconf
+*.scvd
+JLinkSettings.ini
+*.uvgui.*
+*.__i
+*._ia
+*.__ii
+Objects/
+Listings/
+Output/
+DebugConfig/
+RTE/_*/
+RTE/
+*.o
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.crf
+*.d
+*.dep
+*.lnp
+*.htm
+*.build_log.htm
+*.iex
+*.sct
+*.tra
+*.l1p
+*.l2p
+*.fed
+*.cdb
+*.ddb
+*.i
+*.reggroups
+
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+dist/
+build/
+*.exe
+*.spec
+
+# ========== ESP-IDF ==========
+sdkconfig.old
+managed_components/
+
+# ========== 編輯器 / 工具 ==========
+.vscode/
+.idea/
+
+# ========== Synology / Windows ==========
+@eaDir/
+Thumbs.db
+Desktop.ini
+~$*
+*.tmp

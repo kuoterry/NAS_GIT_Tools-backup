@@ -1,0 +1,8 @@
+# NAS Git 專案串接工具 — Python 相依套件
+# 安裝： pip install -r requirements.txt
+#
+# 只有 GUI 需要 PyQt6；pyinstaller 只有「打包成 exe」時才需要。
+PyQt6>=6.6
+
+# 打包 exe 用（平常直接跑 .py 不需要，build_exe.bat 會自動裝）
+pyinstaller>=6.0
