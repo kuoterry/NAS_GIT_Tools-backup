@@ -26,7 +26,7 @@ Everything lives in `nas_git_connector.py`:
   2. **瀏覽倉庫 / Clone URL (Browse)** — list remote repos (flags empty repos and GitHub mirrors), view/set per-repo CI policy, view repo details, clone locally, archive/delete repos, register a GitHub mirror (`git clone --mirror` on the NAS) and sync selected/all mirrors on demand.
   3. **維運 / 日誌 (Maintenance/Logs)** — health check, one-click repair (reapply hook templates + fix group perms), tail server logs.
 - Every long-running UI action follows the same pattern: collect a `cfg` dict → spawn a `Worker(cfg, mode=...)` → connect its signals → `worker.start()`. `set_busy()` disables the relevant buttons while a worker runs.
-- **Dialogs** (`DeleteRepoDialog`, `TextViewDialog`, `SetCiDialog`, `CreateRepoDialog`, `ArchiveDialog`) are small, single-purpose, and follow the same Worker pattern for anything that hits the network.
+- **Dialogs** (`DeleteRepoDialog`, `TextViewDialog`, `SetCiDialog`, `CreateRepoDialog`, `ArchiveDialog`, `MirrorDialog`) are small, single-purpose, and follow the same Worker pattern for anything that hits the network.
 
 ### Server-side CI system
 
@@ -40,7 +40,7 @@ The NAS runs a shared `pre-receive.ci` hook engine (one copy for all repos) that
 
 - `CONTAINER_ROOTS` (`D:\git`, `D:\GIT`) and disk roots are hard-blocked from being connected as a "project" (`is_container_root`) — prevents accidentally git-initing an entire drive/container folder.
 - `find_nested_repos` detects git repos nested inside the chosen folder and forces a "I understand the risk" checkbox before proceeding (they'd otherwise become gitlinks).
-- `is_safe_name` whitelists repo/archive names to `[A-Za-z0-9][A-Za-z0-9._-]*`, rejecting `.`, `..`, `_archived` — every remote path built from user input goes through this before being interpolated into a shell command.
+- `is_safe_name` whitelists repo/archive names via `^[^\W_][\w.-]*$` (Unicode-aware — first char must be alnum/CJK, not `_` or punctuation; rest can include `.`/`-`), rejecting `.`, `..`, `_archived` — every remote path built from user input goes through this before being interpolated into a shell command.
 - Repo deletion defaults to "safe takedown" (move to `_archived/`) rather than `rm -rf`; hard delete requires typing the exact repo name to confirm.
 - SSH passwords are masked in the log output (`_mask`) and only persisted to the registry (`QSettings`) if the user explicitly opts in via "記住此身份的密碼".
 
