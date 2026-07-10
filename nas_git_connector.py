@@ -72,9 +72,11 @@ if os.name == "nt":
 else:
     _NO_WINDOW = 0
 
-# 倉庫 / 封存項目名稱白名單：只允許英數與 . _ -，且須以英數開頭。
-# 一次擋掉 / \ ' " $ ` 空白 中文 及 . .. _archived 等危險或保留名稱。
-_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# 倉庫 / 封存項目名稱白名單：只允許「文字字元」（含中日韓文字/字母/數字，不含底線）開頭，
+# 後面可接文字字元、底線、. -。名稱會用單引號整段包進 SSH shell 指令，
+# 這裡擋的是會破壞 quoting 或有路徑意義的字元：/ \ ' " $ ` 空白 ; | & ( ) < > 等，
+# 中日韓文字本身不構成 shell 注入風險，故放行。仍排除 . .. _archived 等保留名稱。
+_SAFE_NAME_RE = re.compile(r"^[^\W_][\w.-]*$", re.UNICODE)
 
 
 def is_safe_name(name: str) -> bool:
@@ -443,7 +445,7 @@ class Worker(QThread):
 
         # 安全檢查：名稱不得含路徑分隔、上層、引號，或指到保留目錄
         if not is_safe_name(name):
-            self.done.emit(False, f"倉庫名稱不合規（僅允許英數與 . _ -，須英數開頭）：{name!r}")
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -，須以中英數開頭）：{name!r}")
             return
 
         path = f"{root}/{name}"
@@ -484,7 +486,7 @@ class Worker(QThread):
         root = c["remote_root"]
         name = c.get("repo_name", "")
         if not is_safe_name(name):
-            self.done.emit(False, f"倉庫名稱不合規（僅允許英數與 . _ -，須英數開頭）：{name!r}")
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -，須以中英數開頭）：{name!r}")
             return
         path = f"{root}/{name}"
         self.log.emit(f"--- 讀取 {name} 的 CI 規則報告 ---")
@@ -651,7 +653,7 @@ class Worker(QThread):
             self.done.emit(False, f"不支援的 policy：{pol!r}")
             return
         if not is_safe_name(name):
-            self.done.emit(False, f"倉庫名稱不合規（僅允許英數與 . _ -，須英數開頭）：{name!r}")
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -，須以中英數開頭）：{name!r}")
             return
         self.log.emit(f"--- 設定 {name} 的 CI：POLICY={pol} ---")
         cmd = "\n".join([
@@ -732,7 +734,7 @@ class Worker(QThread):
         root = c["remote_root"]
         name = c.get("repo_name", "")
         if not is_safe_name(name):
-            self.done.emit(False, f"倉庫名稱不合規（僅允許英數與 . _ -）：{name!r}")
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
             return
         self.log.emit(f"--- repo 明細：{name} ---")
         cmd = "\n".join([
@@ -799,7 +801,7 @@ class Worker(QThread):
         if not name.endswith(".git"):
             name += ".git"
         if not is_safe_name(name):
-            self.done.emit(False, f"倉庫名稱不合規（僅允許英數與 . _ -）：{name!r}")
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
             return
         # URL 白名單：只允許常見 git 遠端格式，且不得含引號/空白/反引號/$
         if not re.match(r"^(https://|http://|git@|ssh://|file://)[A-Za-z0-9@._:/~?=&%+\-]+$", url):
@@ -1004,7 +1006,7 @@ class Worker(QThread):
         if not name.endswith(".git"):
             name += ".git"
         if not is_safe_name(name):
-            self.done.emit(False, f"倉庫名稱不合規（僅允許英數與 . _ -）：{name!r}")
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
             return
         if pol not in ("none", "soft", "strict"):
             pol = "none"
@@ -1042,7 +1044,7 @@ class Worker(QThread):
         root = c["remote_root"]
         name = c.get("repo_name", "")
         if not is_safe_name(name):
-            self.done.emit(False, f"倉庫名稱不合規（僅允許英數與 . _ -）：{name!r}")
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
             return
         self.log.emit(f"--- CI 自我測試：{name} ---")
         cmd = "\n".join([
@@ -1408,7 +1410,7 @@ class TextViewDialog(QDialog):
         lay = QVBoxLayout(self)
         view = QPlainTextEdit()
         view.setReadOnly(True)
-        view.setFont(QFont("Consolas", 10))
+        view.setFont(QFont("NSimSun", 10))
         view.setPlainText(text)
         view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         lay.addWidget(view, stretch=1)
