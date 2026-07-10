@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Single-file PyQt6 GUI tool (`nas_git_connector.py`, ~2600 lines) that connects a local project folder to a Synology NAS Git server (`kcc3713.synology.me`, bare repos under `/volume1/Git_Server`). It also manages that Git server: browsing repos, per-repo CI policy, archive/restore, health checks, log viewing. Written for a single user's home/office dual-machine workflow.
+Single-file PyQt6 GUI tool (`nas_git_connector.py`, ~2800 lines) that connects a local project folder to a Synology NAS Git server (`kcc3713.synology.me`, bare repos under `/volume1/Git_Server`). It also manages that Git server: browsing repos, per-repo CI policy, archive/restore, health checks, log viewing, GitHub mirror registration/sync. Written for a single user's home/office dual-machine workflow.
 
 ## Commands
 
@@ -20,10 +20,10 @@ No test suite, linter, or CI config exists in this repo — verification is manu
 
 Everything lives in `nas_git_connector.py`:
 
-- **`Worker(QThread)`** — the only thing allowed to touch the network/filesystem/subprocess. Runs one "mode" per instantiation (`connect`, `test`, `list`, `delete`, `hooks`, `ci_status`, `set_ci`, `set_ci_batch`, `repo_detail`, `clone`, `upgrade_engine`, `healthcheck`, `repair`, `log`, `create_repo`, `ci_selftest`, `archive_list`, `archive_restore`, `archive_purge`). Communicates back to the UI only via Qt signals (`log`, `done`, `repos`, `hooks`) — never touches widgets directly, to avoid cross-thread crashes. All NAS interaction goes through `_ssh()` (keyless `ssh` by default, or `plink -pw` if a password is set) and remote commands are shell scripts built as `"\n".join([...])` heredoc-style, delimited by `___BEGIN___`/`___END___` markers that `_between()` strips out to filter SSH login banners.
+- **`Worker(QThread)`** — the only thing allowed to touch the network/filesystem/subprocess. Runs one "mode" per instantiation (`connect`, `test`, `list`, `delete`, `hooks`, `ci_status`, `set_ci`, `set_ci_batch`, `repo_detail`, `clone`, `create_mirror`, `sync_mirrors`, `upgrade_engine`, `healthcheck`, `repair`, `log`, `create_repo`, `ci_selftest`, `archive_list`, `archive_restore`, `archive_purge`). Communicates back to the UI only via Qt signals (`log`, `done`, `repos`, `hooks`) — never touches widgets directly, to avoid cross-thread crashes. All NAS interaction goes through `_ssh()` (keyless `ssh` by default, or `plink -pw` if a password is set) and remote commands are shell scripts built as `"\n".join([...])` heredoc-style, delimited by `___BEGIN___`/`___END___` markers that `_between()` strips out to filter SSH login banners.
 - **`MainWindow(QMainWindow)`** — one window, three tabs sharing a profile/identity panel at the top (SSH user/host/remote root/password):
   1. **串接專案 (Connect)** — pick a local folder, git-init/add-remote/push it to a new/existing bare repo on the NAS.
-  2. **瀏覽倉庫 / Clone URL (Browse)** — list remote repos, view/set per-repo CI policy, view repo details, clone locally, archive/delete repos.
+  2. **瀏覽倉庫 / Clone URL (Browse)** — list remote repos (flags empty repos and GitHub mirrors), view/set per-repo CI policy, view repo details, clone locally, archive/delete repos, register a GitHub mirror (`git clone --mirror` on the NAS) and sync selected/all mirrors on demand.
   3. **維運 / 日誌 (Maintenance/Logs)** — health check, one-click repair (reapply hook templates + fix group perms), tail server logs.
 - Every long-running UI action follows the same pattern: collect a `cfg` dict → spawn a `Worker(cfg, mode=...)` → connect its signals → `worker.start()`. `set_busy()` disables the relevant buttons while a worker runs.
 - **Dialogs** (`DeleteRepoDialog`, `TextViewDialog`, `SetCiDialog`, `CreateRepoDialog`, `ArchiveDialog`) are small, single-purpose, and follow the same Worker pattern for anything that hits the network.
@@ -31,6 +31,10 @@ Everything lives in `nas_git_connector.py`:
 ### Server-side CI system
 
 The NAS runs a shared `pre-receive.ci` hook engine (one copy for all repos) that self-loads a per-repo policy file from `ci_policies/<repo>.policy` (`POLICY=none|soft|strict`). `PATCHED_ENGINE_B64` in this file is a base64-encoded copy of that engine script, pushed to the NAS by the "升級 CI 引擎" (upgrade engine) action — keep it in sync with `hooks_template/pre-receive.ci` on the server if that script changes. Policy rules enforced: branch name must match `develop|feature/*|release/*`, commit message must start with `feat:`/`fix:`/`chore:`/`docs:` or contain `[JIRA-n]`/`[TASK-n]`. `soft` warns via Telegram only; `strict` blocks the push.
+
+### GitHub mirrors
+
+`sync_github_mirrors.sh` is a standalone server-side script (not run from the GUI) meant to be deployed to the NAS at `/volume1/Git_Server/tools/` and scheduled via DSM 任務排程表. It loops all `*.git` repos, skips any without `remote.origin.mirror=true`, and runs `git remote update --prune` on the rest, logging to `logs/mirror_sync.log` and optionally notifying Telegram (reads token/chat id from `config/tg_bot.conf` on the NAS — never hardcode credentials in this script). It's the scheduled counterpart to the GUI's on-demand "同步鏡像" button (`sync_mirrors` Worker mode), which runs the same `remote update --prune` logic over SSH instead of a local cron job.
 
 ### Safety mechanisms baked into the code
 
