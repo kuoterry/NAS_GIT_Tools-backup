@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QPlainTextEdit, QComboBox, QCheckBox,
     QFileDialog, QMessageBox, QGroupBox, QInputDialog, QTabWidget, QListWidget,
-    QDialog, QRadioButton, QDialogButtonBox, QListWidgetItem, QSpinBox
+    QDialog, QRadioButton, QDialogButtonBox, QListWidgetItem, QSpinBox, QTextBrowser
 )
 
 # ============================================================
@@ -1690,18 +1690,24 @@ class DeleteRepoDialog(QDialog):
 # 通用文字檢視對話框（用於顯示 CI hook 內容）
 # ============================================================
 class TextViewDialog(QDialog):
-    def __init__(self, parent, title, text):
+    def __init__(self, parent, title, text, markdown=False):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(720, 560)
         self._text = text
 
         lay = QVBoxLayout(self)
-        view = QPlainTextEdit()
-        view.setReadOnly(True)
-        view.setFont(QFont("NSimSun", 10))
-        view.setPlainText(text)
-        view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        if markdown:
+            view = QTextBrowser()
+            view.setReadOnly(True)
+            view.setOpenExternalLinks(True)
+            view.setMarkdown(text)
+        else:
+            view = QPlainTextEdit()
+            view.setReadOnly(True)
+            view.setFont(QFont("NSimSun", 10))
+            view.setPlainText(text)
+            view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         lay.addWidget(view, stretch=1)
 
         row = QHBoxLayout()
@@ -1802,7 +1808,8 @@ class RepoFilesDialog(QDialog):
         self.content_worker.start()
 
     def _show_content(self, path, text):
-        dlg = TextViewDialog(self, f"{self.repo_name}:{path}", text or "（空檔案）")
+        is_md = path.lower().endswith((".md", ".markdown"))
+        dlg = TextViewDialog(self, f"{self.repo_name}:{path}", text or "（空檔案）", markdown=is_md)
         dlg.exec()
 
     def on_view_done(self, ok, msg):
