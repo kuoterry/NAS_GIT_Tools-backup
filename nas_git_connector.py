@@ -50,6 +50,24 @@ CONTAINER_ROOTS = [
 # 封存區保留政策提醒：項目封存超過這麼多天，就在封存區清單上標記提醒（僅提醒，不自動清除）。
 ARCHIVE_STALE_DAYS = 90
 
+# 健康檢查用：單一檔案超過這個大小（bytes）就建議改用 Git LFS，僅提醒不自動處理。
+LFS_SUGGEST_BYTES = 5 * 1024 * 1024
+
+# 本機操作稽核 log：這套工具做的破壞性動作（刪 repo、砍 tag、砍 SSH 金鑰、批次清封存、GC 等）
+# NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
+AUDIT_LOG_PATH = os.path.join(os.path.expanduser("~"), ".nas_git_connector", "audit.log")
+DESTRUCTIVE_MODES = {"delete", "rename_repo", "repo_gc", "tag_delete", "ssh_keys_delete", "archive_purge"}
+
+
+def audit_log(user: str, host: str, action: str, detail: str):
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{ts}\t{user}@{host}\t{action}\t{detail}\n")
+    except OSError:
+        pass
+
 # ============================================================
 # 預設身份(Profile)：第一次執行會自動建立。
 # 每個身份各自記住自己的 SSH 使用者 / 主機 / 根目錄。
@@ -90,6 +108,16 @@ def is_safe_name(name: str) -> bool:
 def shq(value: str) -> str:
     """把任意字串包成單引號 POSIX shell 字面值，用於分支名、檔案路徑等非白名單值。"""
     return "'" + value.replace("'", "'\\''") + "'"
+
+
+def fmt_size_kb(kb: int) -> str:
+    """把 du -sk 回傳的 KB 數字格式化成人類可讀大小（K/M/G）。"""
+    v = float(kb)
+    for unit in ("K", "M", "G", "T"):
+        if v < 1024 or unit == "T":
+            return f"{v:.0f}{unit}" if unit == "K" else f"{v:.1f}{unit}"
+        v /= 1024
+    return f"{v:.1f}T"
 
 # 修補版 CI 引擎（pre-receive.ci）內容，base64 編碼。
 # 一鍵升級時解碼寫入 NAS 的 /volume1/Git_Server/hooks_template/pre-receive.ci。
@@ -330,6 +358,8 @@ class Worker(QThread):
             self._run_list()
         elif self.mode == "delete":
             self._run_delete()
+        elif self.mode == "rename_repo":
+            self._run_rename_repo()
         elif self.mode == "hooks":
             self._run_hooks()
         elif self.mode == "ci_status":
@@ -435,11 +465,12 @@ class Worker(QThread):
             "  [ -z \"$pol\" ] && pol=none",
             "  mu=''",
             "  [ \"$(git --git-dir=\"$d\" config --get remote.origin.mirror 2>/dev/null)\" = true ] && mu=$(git --git-dir=\"$d\" config --get remote.origin.url 2>/dev/null)",
+            "  sz=$(du -sk \"$d\" 2>/dev/null | cut -f1); [ -z \"$sz\" ] && sz=0",
             "  if [ -z \"$info\" ]; then",
-            "    printf '%s\\t%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\" \"$mu\"",
+            "    printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\" \"$mu\" \"$sz\"",
             "  else",
             "    dt=${info%%|*}; br=${info#*|}",
-            "    printf '%s\\t%s (%s)\\t%s\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\" \"$mu\"",
+            "    printf '%s\\t%s (%s)\\t%s\\t%s\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\" \"$mu\" \"$sz\"",
             "  fi",
             "done",
             "echo ___END___",
@@ -468,7 +499,11 @@ class Worker(QThread):
             status = parts[1].strip() if len(parts) > 1 else ""
             pol = parts[2].strip() if len(parts) > 2 else "none"
             mirror = parts[3].strip() if len(parts) > 3 else ""
-            items.append((name, status, pol, mirror))
+            try:
+                size_kb = int(parts[4].strip()) if len(parts) > 4 else 0
+            except ValueError:
+                size_kb = 0
+            items.append((name, status, pol, mirror, size_kb))
         items.sort(key=lambda t: t[0].lower())
         self.repos.emit(items)
         n_empty = sum(1 for t in items if t[1].startswith("空庫"))
@@ -518,6 +553,49 @@ class Worker(QThread):
             self.done.emit(True, okmsg)
         else:
             self.done.emit(False, f"處理失敗（可能是權限或磁碟空間問題）：{name}")
+
+    # --- 重新命名倉庫（含同步改 ci_policies/<repo>.policy 檔名）---
+    def _run_rename_repo(self):
+        c = self.cfg
+        root = c["remote_root"]
+        old_name = c.get("repo_name", "")
+        new_name = c.get("new_name", "")
+        if not new_name.endswith(".git"):
+            new_name += ".git"
+        if not is_safe_name(old_name):
+            self.done.emit(False, f"倉庫名稱不合規：{old_name!r}")
+            return
+        if not is_safe_name(new_name):
+            self.done.emit(False, f"新名稱不合規（僅允許中英數字與 . _ -，須以中英數開頭）：{new_name!r}")
+            return
+        if old_name == new_name:
+            self.done.emit(False, "新舊名稱相同，未執行。")
+            return
+        old_path = f"{root}/{old_name}"
+        new_path = f"{root}/{new_name}"
+        self.log.emit(f"--- 重新命名：{old_name} → {new_name} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"old='{old_path}'; new='{new_path}'",
+            "[ -e \"$old/HEAD\" ] || { echo NOTREPO; echo ___END___; exit 0; }",
+            "[ -e \"$new\" ] && { echo TARGET_EXISTS; echo ___END___; exit 0; }",
+            "mv \"$old\" \"$new\" && echo MOVED",
+            f"oldpf='{root}/ci_policies/{old_name}.policy'; newpf='{root}/ci_policies/{new_name}.policy'",
+            "[ -f \"$oldpf\" ] && mv \"$oldpf\" \"$newpf\"",
+            "echo ___OK___",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        body = self._between(out)
+        if rc == 0 and "___OK___" in body:
+            self.done.emit(True, f"已重新命名：{old_name} → {new_name}")
+        elif "TARGET_EXISTS" in body:
+            self.done.emit(False, f"重新命名失敗：目標名稱已存在（{new_name}）。")
+        elif "NOTREPO" in body:
+            self.done.emit(False, f"找不到、或不是有效的裸倉庫：{old_name}")
+        else:
+            self.done.emit(False, "重新命名失敗（連線或權限問題）。")
 
     # --- 讀取該庫的 CI 規則（server-side hook 內容）---
     def _run_hooks(self):
@@ -1007,36 +1085,44 @@ class Worker(QThread):
         root = self.cfg["remote_root"]
         pattern = self.cfg.get("pattern", "")
         if not pattern:
+            self.repos.emit([])
             self.done.emit(False, "請輸入搜尋字串。")
             return
         self.log.emit(f"--- 跨庫搜尋：{pattern} ---")
         cmd = "\n".join([
             "echo ___BEGIN___",
             f"BASE='{root}'; PATTERN={shq(pattern)}",
-            "hit=0",
             "for repo in \"$BASE\"/*.git; do",
             "  [ -d \"$repo\" ] || continue",
             "  name=$(basename \"$repo\")",
             "  base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
             "  [ -z \"$base\" ] && continue",
-            "  out=$(git --git-dir=\"$repo\" grep -n -I -e \"$PATTERN\" \"$base\" 2>/dev/null)",
-            "  if [ -n \"$out\" ]; then",
-            "    hit=1",
-            "    echo \"== $name ($base) ==\"",
-            "    echo \"$out\" | sed 's/^/  /'",
-            "    echo",
-            "  fi",
+            "  git --git-dir=\"$repo\" grep -n -I -e \"$PATTERN\" \"$base\" 2>/dev/null | "
+            "sed \"s/^/HIT\\t$name\\t/\"",
             "done",
-            "[ \"$hit\" = 0 ] && echo \"（沒有找到符合的內容）\"",
             "echo ___END___",
             "true",
         ])
         rc, out, _ = self._ssh(cmd)
         if rc != 0:
+            self.repos.emit([])
             self.done.emit(False, "搜尋失敗（連線或權限問題）。")
             return
-        self.hooks.emit(self._between(out))
-        self.done.emit(True, f"搜尋「{pattern}」完成。")
+        hits = []
+        for ln in self._between(out).splitlines():
+            if not ln.startswith("HIT\t"):
+                continue
+            parts = ln[4:].split("\t", 1)
+            if len(parts) != 2:
+                continue
+            repo_name, grepline = parts
+            gparts = grepline.split(":", 3)
+            if len(gparts) < 4:
+                continue
+            _tree, path, lineno, content = gparts
+            hits.append((repo_name, path, lineno, content))
+        self.repos.emit(hits)
+        self.done.emit(True, f"搜尋「{pattern}」完成，共 {len(hits)} 筆符合。")
 
     # --- 比較同倉庫內兩個分支/commit ---
     def _run_repo_diff(self):
@@ -1434,6 +1520,21 @@ class Worker(QThread):
             "  [ -n \"$msg\" ] && echo \"[!!] $n:$msg\"",
             "done",
             "[ \"$bad\" = 0 ] && echo '[OK] 所有 repo 的 hook 與群組正常'",
+            "echo",
+            "echo '== LFS 使用建議 =='",
+            "lfs_hits=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  n=$(basename \"$repo\")",
+            "  base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
+            "  [ -z \"$base\" ] && continue",
+            f"  big=$(git --git-dir=\"$repo\" ls-tree -r -l \"$base\" 2>/dev/null | awk '$4+0 > {LFS_SUGGEST_BYTES} {{c++}} END{{print c+0}}')",
+            "  if [ \"${big:-0}\" -gt 0 ] 2>/dev/null; then",
+            f"    echo \"[  ] $n：有 $big 個檔案超過 {LFS_SUGGEST_BYTES // (1024*1024)}MB，考慮改用 Git LFS 存放大型二進位檔\"",
+            "    lfs_hits=$((lfs_hits+1))",
+            "  fi",
+            "done",
+            "[ \"$lfs_hits\" = 0 ] && echo '[OK] 沒有偵測到明顯需要上 LFS 的大型檔案'",
             "echo",
             "echo '== 日誌 =='",
             "[ -d \"$BASE/logs\" ] && echo '[OK] logs 目錄存在' || echo '[  ] 無 logs 目錄'",
@@ -1911,7 +2012,7 @@ class DeleteRepoDialog(QDialog):
 # 通用文字檢視對話框（用於顯示 CI hook 內容）
 # ============================================================
 class TextViewDialog(QDialog):
-    def __init__(self, parent, title, text, markdown=False):
+    def __init__(self, parent, title, text, markdown=False, goto_line=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(720, 560)
@@ -1929,6 +2030,16 @@ class TextViewDialog(QDialog):
             view.setFont(QFont("NSimSun", 10))
             view.setPlainText(text)
             view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            if goto_line:
+                try:
+                    n = int(goto_line)
+                    block = view.document().findBlockByNumber(max(0, n - 1))
+                    cur = view.textCursor()
+                    cur.setPosition(block.position())
+                    view.setTextCursor(cur)
+                    view.centerCursor()
+                except (ValueError, TypeError):
+                    pass
         lay.addWidget(view, stretch=1)
 
         row = QHBoxLayout()
@@ -2432,6 +2543,8 @@ class TagDialog(QDialog):
     def _on_delete_done(self, ok, msg):
         self.on_done(ok, msg)
         if ok:
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "tag_delete",
+                      f"{self.repo_name}: {msg}".replace("\n", " "))
             self.refresh()
 
 
@@ -2557,7 +2670,7 @@ class ArchiveDialog(QDialog):
         self.setWindowTitle("封存區 _archived/ 管理")
         self.resize(580, 440)
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("「安全下庄」搬走或打包的倉庫放這裡，可還原或永久刪除。"))
+        lay.addWidget(QLabel("「安全下庄」搬走或打包的倉庫放這裡，可還原或永久刪除。每一項前面有勾選框，可多選後批次清理。"))
         self.list = QListWidget()
         lay.addWidget(self.list, stretch=1)
         row = QHBoxLayout()
@@ -2571,6 +2684,15 @@ class ArchiveDialog(QDialog):
         row.addStretch(1)
         row.addWidget(self.close_b)
         lay.addLayout(row)
+
+        row2 = QHBoxLayout()
+        self.check_stale_b = QPushButton(f"勾選超過 {ARCHIVE_STALE_DAYS} 天的項目")
+        self.bulk_purge_b = QPushButton("清理已勾選…")
+        row2.addWidget(self.check_stale_b)
+        row2.addWidget(self.bulk_purge_b)
+        row2.addStretch(1)
+        lay.addLayout(row2)
+
         self.status = QLabel("")
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
@@ -2578,11 +2700,13 @@ class ArchiveDialog(QDialog):
         self.refresh_b.clicked.connect(self.refresh)
         self.restore_b.clicked.connect(self.on_restore)
         self.purge_b.clicked.connect(self.on_purge)
+        self.check_stale_b.clicked.connect(self.on_check_stale)
+        self.bulk_purge_b.clicked.connect(self.on_bulk_purge)
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
     def _busy(self, b):
-        for x in (self.refresh_b, self.restore_b, self.purge_b):
+        for x in (self.refresh_b, self.restore_b, self.purge_b, self.check_stale_b, self.bulk_purge_b):
             x.setEnabled(not b)
 
     def _sel(self):
@@ -2617,6 +2741,8 @@ class ArchiveDialog(QDialog):
             else:
                 label = f"{name}    [{kind}, {size}]"
             it = QListWidgetItem(label)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Unchecked)
             it.setData(Qt.ItemDataRole.UserRole, name)
             self.list.addItem(it)
 
@@ -2657,8 +2783,71 @@ class ArchiveDialog(QDialog):
             msg += f"\n其中 {n_stale} 個已封存超過 {ARCHIVE_STALE_DAYS} 天（見 ⚠ 標記），建議檢查是否可清理。"
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#b06000;" if (ok and n_stale) else ("color:#1a7f37;" if ok else "color:#b00020;"))
+        if ok and self.worker and self.worker.mode == "archive_purge":
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "archive_purge", msg.replace("\n", " "))
         if ok and self.worker and self.worker.mode in ("archive_restore", "archive_purge"):
             self.refresh()
+
+    def on_check_stale(self):
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            name = it.data(Qt.ItemDataRole.UserRole)
+            age = self._archived_age_days(name) if name else None
+            if age is not None and age >= ARCHIVE_STALE_DAYS:
+                it.setCheckState(Qt.CheckState.Checked)
+
+    def _checked_names(self):
+        names = []
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                n = it.data(Qt.ItemDataRole.UserRole)
+                if n:
+                    names.append(n)
+        return names
+
+    def on_bulk_purge(self):
+        names = self._checked_names()
+        if not names:
+            self.status.setText("請先勾選要清理的項目。")
+            return
+        r = QMessageBox.question(
+            self, "批次永久刪除",
+            f"確定永久刪除以下 {len(names)} 個封存項目？此動作無法復原：\n" + "\n".join(names))
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._purge_queue = list(names)
+        self._purge_ok = 0
+        self._purge_fail = 0
+        self._busy(True)
+        self._run_next_purge()
+
+    def _run_next_purge(self):
+        if not self._purge_queue:
+            self._busy(False)
+            msg = f"批次清理完成：成功 {self._purge_ok}、失敗 {self._purge_fail}。"
+            self.status.setText(("✔ " if self._purge_fail == 0 else "⚠ ") + msg)
+            self.status.setStyleSheet("color:#1a7f37;" if self._purge_fail == 0 else "color:#b06000;")
+            self.refresh()
+            return
+        name = self._purge_queue.pop(0)
+        self._purging_name = name
+        self.status.setText(f"刪除中… {name}（剩 {len(self._purge_queue) + 1} 個）")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["arch_name"] = name
+        self.worker = Worker(cfg, mode="archive_purge")
+        self.worker.done.connect(self._on_bulk_purge_one_done)
+        self.worker.start()
+
+    def _on_bulk_purge_one_done(self, ok, msg):
+        if ok:
+            self._purge_ok += 1
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "archive_purge",
+                      getattr(self, "_purging_name", "").replace("\n", " ") + " (批次清理)")
+        else:
+            self._purge_fail += 1
+        self._run_next_purge()
 
 
 # ============================================================
@@ -2821,6 +3010,7 @@ class SshKeysDialog(QDialog):
             return
         cfg = dict(self.cfg)
         cfg["key_line"] = line
+        self._deleting_line = line
         self._busy(True)
         self.status.setText("刪除中…")
         self.status.setStyleSheet("")
@@ -2831,7 +3021,109 @@ class SshKeysDialog(QDialog):
     def _on_delete_done(self, ok, msg):
         self.on_done(ok, msg)
         if ok:
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "ssh_keys_delete",
+                      getattr(self, "_deleting_line", "").replace("\n", " "))
             self.refresh()
+
+
+# ============================================================
+# 跨庫搜尋結果對話框（雙擊直接開啟檔案並跳到該行）
+# ============================================================
+class GrepResultsDialog(QDialog):
+    def __init__(self, parent, cfg, pattern):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.pattern = pattern
+        self.worker = None
+        self.content_worker = None
+        self.setWindowTitle(f"跨庫搜尋結果 — {pattern}")
+        self.resize(780, 540)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(f"搜尋「{pattern}」（各庫預設分支）。雙擊或按「開啟檔案」可直接預覽並跳到該行。"))
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(self.on_open)
+        lay.addWidget(self.list, stretch=1)
+
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新搜尋")
+        self.open_b = QPushButton("開啟檔案")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.refresh_b)
+        row.addWidget(self.open_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.refresh_b.clicked.connect(self.refresh)
+        self.open_b.clicked.connect(self.on_open)
+        self.close_b.clicked.connect(self.accept)
+        self.refresh()
+
+    def _busy(self, b):
+        for x in (self.refresh_b, self.open_b):
+            x.setEnabled(not b)
+
+    def refresh(self):
+        self.list.clear()
+        self._busy(True)
+        self.status.setText("搜尋中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["pattern"] = self.pattern
+        self.worker = Worker(cfg, mode="grep_all")
+        self.worker.repos.connect(self.on_entries)
+        self.worker.done.connect(self.on_done)
+        self.worker.start()
+
+    def on_entries(self, hits):
+        self.list.clear()
+        for repo, path, lineno, content in hits:
+            it = QListWidgetItem(f"{repo}  {path}:{lineno}   {content.strip()}")
+            it.setData(Qt.ItemDataRole.UserRole, (repo, path, lineno))
+            self.list.addItem(it)
+        if not hits:
+            self.list.addItem(QListWidgetItem("（沒有找到符合的內容）"))
+
+    def on_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+    def on_open(self):
+        it = self.list.currentItem()
+        if not it:
+            self.status.setText("請先選一筆結果。")
+            return
+        data = it.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        repo, path, lineno = data
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = repo
+        cfg["file_path"] = path
+        self._busy(True)
+        self.status.setText(f"讀取「{repo}:{path}」中…")
+        self.status.setStyleSheet("")
+        self.content_worker = Worker(cfg, mode="file_content")
+        self.content_worker.hooks.connect(lambda text, r=repo, p=path, ln=lineno: self._show(r, p, ln, text))
+        self.content_worker.done.connect(self.on_open_done)
+        self.content_worker.start()
+
+    def _show(self, repo, path, lineno, text):
+        is_md = path.lower().endswith((".md", ".markdown"))
+        dlg = TextViewDialog(self, f"{repo}:{path}", text or "（空檔案）",
+                              markdown=is_md, goto_line=None if is_md else lineno)
+        dlg.exec()
+
+    def on_open_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
 
 
 # ============================================================
@@ -3042,6 +3334,9 @@ class MainWindow(QMainWindow):
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("輸入關鍵字即時篩選…")
         self.filter_edit.textChanged.connect(self.apply_repo_filter)
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["排序：名稱", "排序：大小（大到小）", "排序：最近活動"])
+        self.sort_combo.currentIndexChanged.connect(lambda _=None: self.apply_repo_filter(self.filter_edit.text()))
         self.mirror_reg_btn = QPushButton("註冊鏡像…")
         self.mirror_reg_btn.setToolTip("讓 NAS 直接對應一個 GitHub 倉庫（git clone --mirror）。")
         self.mirror_reg_btn.clicked.connect(self.on_create_mirror)
@@ -3053,6 +3348,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.ci_status_btn)
         top_row.addWidget(self.upgrade_btn)
         top_row.addWidget(self.filter_edit, stretch=1)
+        top_row.addWidget(self.sort_combo)
         bp.addLayout(top_row)
 
         top_row2 = QHBoxLayout()
@@ -3100,6 +3396,11 @@ class MainWindow(QMainWindow):
         self.batch_ci_btn.setToolTip("對『目前選取的多個』倉庫一次套用同一 CI 規則（可按住 Ctrl/Shift 多選）。")
         self.batch_ci_btn.clicked.connect(self.on_set_ci_batch)
         danger_row.addWidget(self.batch_ci_btn)
+        self.rename_btn = QPushButton("重新命名…")
+        self.rename_btn.setEnabled(False)
+        self.rename_btn.setToolTip("真正 rename 這個倉庫（含同步改 ci_policies/<repo>.policy 檔名），不是封存再重建。")
+        self.rename_btn.clicked.connect(self.on_rename_repo)
+        danger_row.addWidget(self.rename_btn)
         danger_row.addStretch(1)
         self.delete_btn = QPushButton("安全下庄 / 刪除此倉庫…")
         self.delete_btn.setEnabled(False)
@@ -3199,9 +3500,13 @@ class MainWindow(QMainWindow):
         self.viol_log_btn.clicked.connect(lambda: self.on_view_log("ci_violation.log", "CI 違規日誌"))
         self.dbg_log_btn = QPushButton("post-receive 除錯日誌")
         self.dbg_log_btn.clicked.connect(lambda: self.on_view_log("post_receive_debug.log", "post-receive 除錯日誌"))
+        self.audit_log_btn = QPushButton("本機操作稽核紀錄")
+        self.audit_log_btn.setToolTip("這套工具在本機做過的刪除/砍 tag/砍金鑰/GC/批次清封存等破壞性動作紀錄。")
+        self.audit_log_btn.clicked.connect(self.on_view_audit_log)
         lg.addWidget(self.push_log_btn, 0, 0)
         lg.addWidget(self.viol_log_btn, 0, 1)
         lg.addWidget(self.dbg_log_btn, 0, 2)
+        lg.addWidget(self.audit_log_btn, 1, 0)
         mp.addWidget(log_box)
 
         self.maint_status = QLabel("維運動作都會走目前選定的身份（金鑰/plink）。")
@@ -3490,6 +3795,7 @@ class MainWindow(QMainWindow):
         self.detail_btn.setEnabled(not busy and has_sel)
         self.files_btn.setEnabled(not busy and has_sel)
         self.batch_ci_btn.setEnabled(not busy and has_sel)
+        self.rename_btn.setEnabled(not busy and has_sel)
         self.clone_btn.setEnabled(not busy and has_sel)
         self.log_btn.setEnabled(not busy and has_sel)
         self.merged_btn.setEnabled(not busy and has_sel)
@@ -3560,7 +3866,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_repos(self, items: list):
-        # items: (name, status, policy, mirror_url)；容錯舊格式
+        # items: (name, status, policy, mirror_url, size_kb)；容錯舊格式
         norm = []
         for it in items:
             if isinstance(it, (list, tuple)):
@@ -3568,9 +3874,13 @@ class MainWindow(QMainWindow):
                 status = str(it[1]) if len(it) > 1 else ""
                 pol = str(it[2]) if len(it) > 2 else "none"
                 mirror = str(it[3]) if len(it) > 3 else ""
-                norm.append((name, status, pol, mirror))
+                try:
+                    size_kb = int(it[4]) if len(it) > 4 else 0
+                except (TypeError, ValueError):
+                    size_kb = 0
+                norm.append((name, status, pol, mirror, size_kb))
             else:
-                norm.append((str(it), "", "none", ""))
+                norm.append((str(it), "", "none", "", 0))
         self._all_repos = norm
         self.apply_repo_filter(self.filter_edit.text())
 
@@ -3586,15 +3896,25 @@ class MainWindow(QMainWindow):
 
     def apply_repo_filter(self, text: str):
         text = (text or "").strip().lower()
+        rows = [r for r in self._all_repos if not text or text in r[0].lower()]
+        sort_idx = self.sort_combo.currentIndex() if hasattr(self, "sort_combo") else 0
+        if sort_idx == 1:  # 大小（大到小）
+            rows.sort(key=lambda r: r[4], reverse=True)
+        elif sort_idx == 2:  # 最近活動（依 status 裡的日期，新到舊；空庫排最後）
+            def activity_key(r):
+                m = re.match(r"^(\d{4}-\d{2}-\d{2})", r[1])
+                return (0, m.group(1)) if m else (1, "")
+            rows.sort(key=activity_key, reverse=True)
+        else:  # 名稱
+            rows.sort(key=lambda r: r[0].lower())
         self.repo_list.clear()
-        for name, status, pol, mirror in self._all_repos:
-            if text and text not in name.lower():
-                continue
+        for name, status, pol, mirror, size_kb in rows:
             ci = {"soft": "CI:soft", "strict": "CI:strict"}.get(pol, "CI:—")
             parts = [name]
             if status:
                 parts.append(status)
             parts.append(ci)
+            parts.append(fmt_size_kb(size_kb))
             if mirror:
                 parts.append("↺鏡像")
             it = QListWidgetItem("    ·    ".join(parts))
@@ -3647,6 +3967,7 @@ class MainWindow(QMainWindow):
         self.detail_btn.setEnabled(has)
         self.files_btn.setEnabled(has)
         self.batch_ci_btn.setEnabled(len(self.repo_list.selectedItems()) >= 1)
+        self.rename_btn.setEnabled(has)
         self.clone_btn.setEnabled(has)
         self.log_btn.setEnabled(has)
         self.merged_btn.setEnabled(has)
@@ -3700,12 +4021,50 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
+            c = self.collect_identity_cfg()
+            audit_log(c.get("user", ""), c.get("host", ""), "delete", msg.replace("\n", " "))
             QMessageBox.information(self, "完成", msg)
             self.on_refresh()  # 重新列出，讓清單即時更新
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
             QMessageBox.warning(self, "未完成", msg)
+
+    # ---------- 重新命名倉庫 ----------
+    def on_rename_repo(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        current = name[:-4] if name.endswith(".git") else name
+        new_name, ok = QInputDialog.getText(self, "重新命名倉庫", f"「{current}」的新名稱：", text=current)
+        new_name = new_name.strip()
+        if not ok or not new_name or new_name == current:
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_name"] = name
+        cfg["new_name"] = new_name
+        self.save_current_profile(silent=True)
+        self.browse_status.setText(f"重新命名「{name}」中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="rename_repo")
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self.on_rename_done)
+        self.worker.start()
+
+    def on_rename_done(self, ok: bool, msg: str):
+        self.set_busy(False)
+        if ok:
+            self.browse_status.setText("✔ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#1a7f37;")
+            c = self.collect_identity_cfg()
+            audit_log(c.get("user", ""), c.get("host", ""), "rename_repo", msg.replace("\n", " "))
+            self.on_refresh()
+        else:
+            self.browse_status.setText("❌ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#b00020;")
+            QMessageBox.warning(self, "重新命名失敗", msg)
 
     # ---------- 檢視 CI 規則 / Hook ----------
     def on_view_ci(self):
@@ -3749,6 +4108,9 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
+            if self.worker and self.worker.mode in DESTRUCTIVE_MODES:
+                c = self.collect_identity_cfg()
+                audit_log(c.get("user", ""), c.get("host", ""), self.worker.mode, msg.replace("\n", " "))
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
@@ -3854,6 +4216,16 @@ class MainWindow(QMainWindow):
 
     def on_view_log(self, logfile, title):
         self._start_maint("log", title, extra={"logfile": logfile, "log_lines": 200})
+
+    def on_view_audit_log(self):
+        try:
+            with open(AUDIT_LOG_PATH, encoding="utf-8") as f:
+                text = f.read().strip()
+        except OSError:
+            text = ""
+        dlg = TextViewDialog(self, "本機操作稽核紀錄",
+                              text or f"（目前沒有紀錄，檔案：{AUDIT_LOG_PATH}）")
+        dlg.exec()
 
     def on_maint_done(self, ok: bool, msg: str):
         self.set_busy(False)
@@ -4072,17 +4444,9 @@ class MainWindow(QMainWindow):
         if not ok or not term:
             return
         cfg = dict(self.collect_identity_cfg())
-        cfg["pattern"] = term
         self.save_current_profile(silent=True)
-        self._ci_title = f"跨庫搜尋結果 — {term}"
-        self.browse_status.setText(f"搜尋「{term}」中…")
-        self.browse_status.setStyleSheet("")
-        self.set_busy(True)
-        self.worker = Worker(cfg, mode="grep_all")
-        self.worker.log.connect(self.append_log)
-        self.worker.hooks.connect(self.on_ci_result)
-        self.worker.done.connect(self.on_ci_done)
-        self.worker.start()
+        dlg = GrepResultsDialog(self, cfg, term)
+        dlg.exec()
 
     # ---------- 從 NAS clone 到本地 ----------
     def on_clone(self):
