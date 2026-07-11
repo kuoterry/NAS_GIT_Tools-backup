@@ -1,0 +1,3 @@
+# 金鑰管理工具 — Python 相依套件
+# 安裝： pip install -r requirements.txt
+PyQt6>=6.6
