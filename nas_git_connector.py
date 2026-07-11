@@ -331,6 +331,8 @@ class Worker(QThread):
             self._run_set_ci_batch()
         elif self.mode == "repo_detail":
             self._run_repo_detail()
+        elif self.mode == "repo_files":
+            self._run_repo_files()
         elif self.mode == "clone":
             self._run_clone()
         elif self.mode == "create_mirror":
@@ -765,6 +767,39 @@ class Worker(QThread):
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {name} 明細。")
+
+    # --- 列出 repo 在預設分支下所有檔案（不用 clone）---
+    def _run_repo_files(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        self.log.emit(f"--- 檔案列表：{name} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            "branch=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
+            "if [ -z \"$branch\" ]; then",
+            "  echo \"（空庫，尚無任何分支/commit，無檔案可列）\"",
+            "else",
+            "  echo \"== 檔案列表：$name（分支：$branch）==\"",
+            "  git --git-dir=\"$repo\" ls-tree -r -l \"$branch\" | "
+            "awk -F'\\t' '{n=split($1,a,\" \"); size=a[n]; printf \"%8s  %s\\n\", size, $2}'",
+            "  echo",
+            "  cnt=$(git --git-dir=\"$repo\" ls-tree -r --name-only \"$branch\" | wc -l)",
+            "  echo \"共 $cnt 個檔案\"",
+            "fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取檔案列表失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out))
+        self.done.emit(True, f"已讀取 {name} 檔案列表。")
 
     # --- 從 NAS clone 到本地（本機執行 git clone，走金鑰/plink）---
     def _run_clone(self):
@@ -1889,6 +1924,11 @@ class MainWindow(QMainWindow):
         self.detail_btn.setToolTip("看此庫的分支、各分支最後 commit、大小、標籤數。")
         self.detail_btn.clicked.connect(self.on_repo_detail)
         danger_row.addWidget(self.detail_btn)
+        self.files_btn = QPushButton("檔案列表…")
+        self.files_btn.setEnabled(False)
+        self.files_btn.setToolTip("不用 clone，直接列出此庫在預設分支下的所有檔案與大小。")
+        self.files_btn.clicked.connect(self.on_repo_files)
+        danger_row.addWidget(self.files_btn)
         self.batch_ci_btn = QPushButton("批次設定 CI…")
         self.batch_ci_btn.setEnabled(False)
         self.batch_ci_btn.setToolTip("對『目前選取的多個』倉庫一次套用同一 CI 規則（可按住 Ctrl/Shift 多選）。")
@@ -2238,6 +2278,7 @@ class MainWindow(QMainWindow):
         self.set_ci_btn.setEnabled(not busy and has_sel)
         self.selftest_btn.setEnabled(not busy and has_sel)
         self.detail_btn.setEnabled(not busy and has_sel)
+        self.files_btn.setEnabled(not busy and has_sel)
         self.batch_ci_btn.setEnabled(not busy and has_sel)
         self.clone_btn.setEnabled(not busy and has_sel)
         if busy:
@@ -2389,6 +2430,7 @@ class MainWindow(QMainWindow):
         self.set_ci_btn.setEnabled(has)
         self.selftest_btn.setEnabled(has)
         self.detail_btn.setEnabled(has)
+        self.files_btn.setEnabled(has)
         self.batch_ci_btn.setEnabled(len(self.repo_list.selectedItems()) >= 1)
         self.clone_btn.setEnabled(has)
 
@@ -2705,6 +2747,24 @@ class MainWindow(QMainWindow):
         self.browse_status.setStyleSheet("")
         self.set_busy(True)
         self.worker = Worker(cfg, mode="repo_detail")
+        self.worker.log.connect(self.append_log)
+        self.worker.hooks.connect(self.on_ci_result)
+        self.worker.done.connect(self.on_ci_done)
+        self.worker.start()
+
+    def on_repo_files(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_name"] = name
+        self.save_current_profile(silent=True)
+        self._ci_title = f"檔案列表 — {name}"
+        self.browse_status.setText(f"讀取「{name}」檔案列表中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="repo_files")
         self.worker.log.connect(self.append_log)
         self.worker.hooks.connect(self.on_ci_result)
         self.worker.done.connect(self.on_ci_done)
