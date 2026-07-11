@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QPlainTextEdit, QComboBox, QCheckBox,
     QFileDialog, QMessageBox, QGroupBox, QInputDialog, QTabWidget, QListWidget,
-    QDialog, QRadioButton, QDialogButtonBox, QListWidgetItem
+    QDialog, QRadioButton, QDialogButtonBox, QListWidgetItem, QSpinBox
 )
 
 # ============================================================
@@ -340,6 +340,18 @@ class Worker(QThread):
             self._run_repo_files()
         elif self.mode == "file_content":
             self._run_file_content()
+        elif self.mode == "repo_gc":
+            self._run_repo_gc()
+        elif self.mode == "repo_log":
+            self._run_repo_log()
+        elif self.mode == "repo_branches":
+            self._run_repo_branches()
+        elif self.mode == "merged_branches":
+            self._run_merged_branches()
+        elif self.mode == "grep_all":
+            self._run_grep_all()
+        elif self.mode == "repo_diff":
+            self._run_repo_diff()
         elif self.mode == "clone":
             self._run_clone()
         elif self.mode == "create_mirror":
@@ -843,6 +855,201 @@ class Worker(QThread):
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {path}。")
+
+    # --- 對選取的倉庫執行 git gc（回收空間、整理 pack）---
+    def _run_repo_gc(self):
+        c = self.cfg
+        root = c["remote_root"]
+        names = [n for n in c.get("repo_names", []) if is_safe_name(n)]
+        if not names:
+            self.done.emit(False, "沒有選取任何倉庫。")
+            return
+        flt = "".join(" " + n + " " for n in names)
+        self.log.emit(f"--- Git GC 維護（{len(names)} 個倉庫）---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; FILTER='{flt}'",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  name=$(basename \"$repo\")",
+            "  case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac",
+            "  before=$(du -sh \"$repo\" 2>/dev/null | cut -f1)",
+            "  if git --git-dir=\"$repo\" gc --quiet >/dev/null 2>&1; then",
+            "    after=$(du -sh \"$repo\" 2>/dev/null | cut -f1)",
+            "    echo \"[OK]   $name  $before -> $after\"",
+            "  else",
+            "    echo \"[FAIL] $name\"",
+            "  fi",
+            "done",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "GC 失敗（連線或權限問題）。")
+            return
+        body = self._between(out)
+        self.hooks.emit(body)
+        nfail = body.count("[FAIL]")
+        nok = body.count("[OK]")
+        self.done.emit(nfail == 0, f"GC 完成：成功 {nok}、失敗 {nfail}。")
+
+    # --- 讀取某分支的完整 commit log（非只最後一筆）---
+    def _run_repo_log(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        branch = c.get("branch", "")
+        count = c.get("count", 50)
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        if not branch:
+            self.done.emit(False, "缺少分支名稱。")
+            return
+        self.log.emit(f"--- Commit Log：{name} ({branch}) ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            f"git --git-dir=\"$repo\" log {shq(branch)} -n {int(count)} "
+            "--date=short --pretty=format:'%h  %ad  %an  %s' 2>&1",
+            "echo",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取 log 失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out))
+        self.done.emit(True, f"已讀取 {name}（{branch}）最近 {count} 筆 commit。")
+
+    # --- 列出某倉庫所有分支名稱（供下拉選單用）---
+    def _run_repo_branches(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.repos.emit([])
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            "git --git-dir=\"$repo\" for-each-ref --sort=-committerdate "
+            "--format='%(refname:short)' refs/heads 2>/dev/null",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.repos.emit([])
+            self.done.emit(False, "讀取分支清單失敗（連線或權限問題）。")
+            return
+        names = [ln.strip() for ln in self._between(out).splitlines() if ln.strip()]
+        self.repos.emit(names)
+        self.done.emit(True, f"共 {len(names)} 個分支。")
+
+    # --- 已完全合併進預設分支的分支清單（僅列出，不自動刪除）---
+    def _run_merged_branches(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        self.log.emit(f"--- 已合併分支：{name} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            "base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
+            "if [ -z \"$base\" ]; then",
+            "  echo \"（空庫，無法判斷已合併分支）\"",
+            "else",
+            "  echo \"== 已合併進 $base 的分支（可考慮清理，本工具不會自動刪除）==\"",
+            "  git --git-dir=\"$repo\" for-each-ref --merged \"$base\" --sort=-committerdate "
+            "--format='%(refname:short)|%(committerdate:short)|%(authorname)|%(subject)' refs/heads 2>/dev/null | "
+            "while IFS='|' read -r rn cd an su; do",
+            "    [ \"$rn\" = \"$base\" ] && continue",
+            "    printf '  %s  |  %s  |  %s  |  %s\\n' \"$rn\" \"$cd\" \"$an\" \"$su\"",
+            "  done",
+            "fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取已合併分支失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out))
+        self.done.emit(True, f"已讀取 {name} 的已合併分支清單。")
+
+    # --- 跨所有倉庫全文搜尋（各庫預設分支下）---
+    def _run_grep_all(self):
+        root = self.cfg["remote_root"]
+        pattern = self.cfg.get("pattern", "")
+        if not pattern:
+            self.done.emit(False, "請輸入搜尋字串。")
+            return
+        self.log.emit(f"--- 跨庫搜尋：{pattern} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; PATTERN={shq(pattern)}",
+            "hit=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  name=$(basename \"$repo\")",
+            "  base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
+            "  [ -z \"$base\" ] && continue",
+            "  out=$(git --git-dir=\"$repo\" grep -n -I -e \"$PATTERN\" \"$base\" 2>/dev/null)",
+            "  if [ -n \"$out\" ]; then",
+            "    hit=1",
+            "    echo \"== $name ($base) ==\"",
+            "    echo \"$out\" | sed 's/^/  /'",
+            "    echo",
+            "  fi",
+            "done",
+            "[ \"$hit\" = 0 ] && echo \"（沒有找到符合的內容）\"",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "搜尋失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out))
+        self.done.emit(True, f"搜尋「{pattern}」完成。")
+
+    # --- 比較同倉庫內兩個分支/commit ---
+    def _run_repo_diff(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        ref_a = c.get("ref_a", "")
+        ref_b = c.get("ref_b", "")
+        stat_only = c.get("stat_only", True)
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        if not ref_a or not ref_b:
+            self.done.emit(False, "請指定要比較的兩個分支/commit。")
+            return
+        self.log.emit(f"--- Diff：{name}  {ref_a}..{ref_b} ---")
+        opt = "--stat" if stat_only else ""
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            f"git --git-dir=\"$repo\" diff {opt} {shq(ref_a)} {shq(ref_b)} 2>&1",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "比較失敗（連線或權限問題）。")
+            return
+        body = self._between(out)
+        self.hooks.emit(body or "（沒有差異）")
+        self.done.emit(True, f"已比較 {ref_a}..{ref_b}。")
 
     # --- 從 NAS clone 到本地（本機執行 git clone，走金鑰/plink）---
     def _run_clone(self):
@@ -1601,6 +1808,207 @@ class RepoFilesDialog(QDialog):
 
 
 # ============================================================
+# Commit Log 瀏覽對話框（某分支的完整歷史，不只最後一筆）
+# ============================================================
+class RepoLogDialog(QDialog):
+    def __init__(self, parent, cfg, repo_name):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.repo_name = repo_name
+        self.worker = None
+        self.branch_worker = None
+        self.setWindowTitle(f"Commit Log — {repo_name}")
+        self.resize(720, 560)
+
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("分支："))
+        self.branch_combo = QComboBox()
+        row.addWidget(self.branch_combo, stretch=1)
+        row.addWidget(QLabel("筆數："))
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, 1000)
+        self.count_spin.setValue(50)
+        row.addWidget(self.count_spin)
+        self.query_b = QPushButton("查詢")
+        self.query_b.clicked.connect(self.on_query)
+        row.addWidget(self.query_b)
+        lay.addLayout(row)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setFont(QFont("Consolas", 10))
+        self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        lay.addWidget(self.view, stretch=1)
+
+        brow = QHBoxLayout()
+        copy_b = QPushButton("複製全部")
+        copy_b.clicked.connect(lambda: QApplication.clipboard().setText(self.view.toPlainText()))
+        close_b = QPushButton("關閉")
+        close_b.clicked.connect(self.accept)
+        brow.addWidget(copy_b)
+        brow.addStretch(1)
+        brow.addWidget(close_b)
+        lay.addLayout(brow)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self._load_branches()
+
+    def _busy(self, b):
+        self.query_b.setEnabled(not b)
+
+    def _load_branches(self):
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        self.branch_worker = Worker(cfg, mode="repo_branches")
+        self.branch_worker.repos.connect(self._on_branches)
+        self.branch_worker.done.connect(self._on_branches_done)
+        self.branch_worker.start()
+
+    def _on_branches(self, names):
+        self.branch_combo.clear()
+        self.branch_combo.addItems(names)
+
+    def _on_branches_done(self, ok, msg):
+        if ok and self.branch_combo.count() > 0:
+            self.on_query()
+        elif not ok:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+
+    def on_query(self):
+        branch = self.branch_combo.currentText().strip()
+        if not branch:
+            self.status.setText("此庫沒有可用分支。")
+            return
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        cfg["branch"] = branch
+        cfg["count"] = self.count_spin.value()
+        self._busy(True)
+        self.status.setText(f"讀取「{branch}」log 中…")
+        self.status.setStyleSheet("")
+        self.worker = Worker(cfg, mode="repo_log")
+        self.worker.hooks.connect(self.view.setPlainText)
+        self.worker.done.connect(self.on_query_done)
+        self.worker.start()
+
+    def on_query_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+
+# ============================================================
+# Diff 比較對話框（同倉庫內任兩個分支/commit）
+# ============================================================
+class RepoDiffDialog(QDialog):
+    def __init__(self, parent, cfg, repo_name):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.repo_name = repo_name
+        self.worker = None
+        self.branch_worker = None
+        self.setWindowTitle(f"Diff 比較 — {repo_name}")
+        self.resize(760, 580)
+
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("A："))
+        self.combo_a = QComboBox()
+        self.combo_a.setEditable(True)
+        row.addWidget(self.combo_a, stretch=1)
+        row.addWidget(QLabel("B："))
+        self.combo_b = QComboBox()
+        self.combo_b.setEditable(True)
+        row.addWidget(self.combo_b, stretch=1)
+        lay.addLayout(row)
+
+        row2 = QHBoxLayout()
+        self.stat_chk = QCheckBox("只顯示統計（--stat，不看完整內容差異）")
+        self.stat_chk.setChecked(True)
+        row2.addWidget(self.stat_chk)
+        row2.addStretch(1)
+        self.diff_b = QPushButton("比較")
+        self.diff_b.clicked.connect(self.on_diff)
+        row2.addWidget(self.diff_b)
+        lay.addLayout(row2)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setFont(QFont("Consolas", 10))
+        self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        lay.addWidget(self.view, stretch=1)
+
+        brow = QHBoxLayout()
+        copy_b = QPushButton("複製全部")
+        copy_b.clicked.connect(lambda: QApplication.clipboard().setText(self.view.toPlainText()))
+        close_b = QPushButton("關閉")
+        close_b.clicked.connect(self.accept)
+        brow.addWidget(copy_b)
+        brow.addStretch(1)
+        brow.addWidget(close_b)
+        lay.addLayout(brow)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self._load_branches()
+
+    def _busy(self, b):
+        self.diff_b.setEnabled(not b)
+
+    def _load_branches(self):
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        self.branch_worker = Worker(cfg, mode="repo_branches")
+        self.branch_worker.repos.connect(self._on_branches)
+        self.branch_worker.done.connect(self._on_branches_done)
+        self.branch_worker.start()
+
+    def _on_branches(self, names):
+        self.combo_a.clear()
+        self.combo_b.clear()
+        self.combo_a.addItems(names)
+        self.combo_b.addItems(names)
+        if len(names) >= 2:
+            self.combo_b.setCurrentIndex(1)
+
+    def _on_branches_done(self, ok, msg):
+        if not ok:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+
+    def on_diff(self):
+        ref_a = self.combo_a.currentText().strip()
+        ref_b = self.combo_b.currentText().strip()
+        if not ref_a or not ref_b:
+            self.status.setText("請指定 A 與 B 兩個分支/commit。")
+            return
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        cfg["ref_a"] = ref_a
+        cfg["ref_b"] = ref_b
+        cfg["stat_only"] = self.stat_chk.isChecked()
+        self._busy(True)
+        self.status.setText(f"比較 {ref_a}..{ref_b} 中…")
+        self.status.setStyleSheet("")
+        self.worker = Worker(cfg, mode="repo_diff")
+        self.worker.hooks.connect(self.view.setPlainText)
+        self.worker.done.connect(self.on_diff_done)
+        self.worker.start()
+
+    def on_diff_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+
+# ============================================================
 # 設定 CI 對話框（每個 repo 獨立）
 # ============================================================
 class SetCiDialog(QDialog):
@@ -2076,7 +2484,35 @@ class MainWindow(QMainWindow):
         self.delete_btn.setToolTip("先在清單選一個倉庫。預設會搬到封存區(可還原)。")
         self.delete_btn.clicked.connect(self.on_delete_repo)
         danger_row.addWidget(self.delete_btn)
+
+        tools_row = QHBoxLayout()
+        self.log_btn = QPushButton("Commit Log…")
+        self.log_btn.setEnabled(False)
+        self.log_btn.setToolTip("瀏覽此庫某分支的完整 commit 歷史（不只最後一筆）。")
+        self.log_btn.clicked.connect(self.on_repo_log)
+        tools_row.addWidget(self.log_btn)
+        self.merged_btn = QPushButton("已合併分支…")
+        self.merged_btn.setEnabled(False)
+        self.merged_btn.setToolTip("列出已完全合併進預設分支、可考慮清理的分支（僅列出，不會自動刪除）。")
+        self.merged_btn.clicked.connect(self.on_merged_branches)
+        tools_row.addWidget(self.merged_btn)
+        self.diff_btn = QPushButton("Diff 比較…")
+        self.diff_btn.setEnabled(False)
+        self.diff_btn.setToolTip("比較此庫任兩個分支/commit 的差異，不用 clone。")
+        self.diff_btn.clicked.connect(self.on_repo_diff)
+        tools_row.addWidget(self.diff_btn)
+        self.gc_btn = QPushButton("GC 維護…")
+        self.gc_btn.setEnabled(False)
+        self.gc_btn.setToolTip("對選取的倉庫執行 git gc，回收空間、整理 pack（可多選）。")
+        self.gc_btn.clicked.connect(self.on_repo_gc)
+        tools_row.addWidget(self.gc_btn)
+        self.search_all_btn = QPushButton("搜尋所有倉庫…")
+        self.search_all_btn.setToolTip("在所有倉庫的預設分支下做全文搜尋（git grep），不用逐一 clone。")
+        self.search_all_btn.clicked.connect(self.on_grep_all)
+        tools_row.addWidget(self.search_all_btn)
+        tools_row.addStretch(1)
         bp.addLayout(danger_row)
+        bp.addLayout(tools_row)
 
         url_box = QGroupBox("Clone URL（點上面的倉庫即產生）")
         ug = QGridLayout(url_box)
@@ -2405,6 +2841,7 @@ class MainWindow(QMainWindow):
         self.archive_btn.setEnabled(not busy)
         self.mirror_reg_btn.setEnabled(not busy)
         self.mirror_sync_btn.setEnabled(not busy)
+        self.search_all_btn.setEnabled(not busy)
         for b in (self.hc_btn, self.repair_btn, self.push_log_btn,
                   self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
@@ -2417,6 +2854,10 @@ class MainWindow(QMainWindow):
         self.files_btn.setEnabled(not busy and has_sel)
         self.batch_ci_btn.setEnabled(not busy and has_sel)
         self.clone_btn.setEnabled(not busy and has_sel)
+        self.log_btn.setEnabled(not busy and has_sel)
+        self.merged_btn.setEnabled(not busy and has_sel)
+        self.diff_btn.setEnabled(not busy and has_sel)
+        self.gc_btn.setEnabled(not busy and has_sel)
         if busy:
             self.run_btn.setText("執行中…")
         else:
@@ -2569,6 +3010,10 @@ class MainWindow(QMainWindow):
         self.files_btn.setEnabled(has)
         self.batch_ci_btn.setEnabled(len(self.repo_list.selectedItems()) >= 1)
         self.clone_btn.setEnabled(has)
+        self.log_btn.setEnabled(has)
+        self.merged_btn.setEnabled(has)
+        self.diff_btn.setEnabled(has)
+        self.gc_btn.setEnabled(has)
 
     def copy_clone_url(self):
         url = self.clone_edit.text().strip()
@@ -2897,6 +3342,86 @@ class MainWindow(QMainWindow):
         self.save_current_profile(silent=True)
         dlg = RepoFilesDialog(self, cfg, name)
         dlg.exec()
+
+    def on_repo_log(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = RepoLogDialog(self, cfg, name)
+        dlg.exec()
+
+    def on_repo_diff(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = RepoDiffDialog(self, cfg, name)
+        dlg.exec()
+
+    def on_merged_branches(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_name"] = name
+        self.save_current_profile(silent=True)
+        self._ci_title = f"已合併分支 — {name}"
+        self.browse_status.setText(f"讀取「{name}」已合併分支中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="merged_branches")
+        self.worker.log.connect(self.append_log)
+        self.worker.hooks.connect(self.on_ci_result)
+        self.worker.done.connect(self.on_ci_done)
+        self.worker.start()
+
+    def on_repo_gc(self):
+        names = self._selected_repo_names()
+        if not names:
+            self.browse_status.setText("請先在清單選一個或多個倉庫。")
+            return
+        r = QMessageBox.question(
+            self, "GC 維護",
+            f"確定對以下 {len(names)} 個倉庫執行 git gc？此動作會整理 pack、回收空間，過程可能需要一些時間：\n"
+            + "、".join(names))
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_names"] = names
+        self.save_current_profile(silent=True)
+        self._ci_title = "GC 維護結果"
+        self.browse_status.setText(f"對 {len(names)} 個倉庫執行 GC 中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="repo_gc")
+        self.worker.log.connect(self.append_log)
+        self.worker.hooks.connect(self.on_ci_result)
+        self.worker.done.connect(self.on_ci_done)
+        self.worker.start()
+
+    def on_grep_all(self):
+        term, ok = QInputDialog.getText(self, "搜尋所有倉庫", "輸入要搜尋的字串（在各庫預設分支下搜尋）：")
+        term = term.strip()
+        if not ok or not term:
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["pattern"] = term
+        self.save_current_profile(silent=True)
+        self._ci_title = f"跨庫搜尋結果 — {term}"
+        self.browse_status.setText(f"搜尋「{term}」中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="grep_all")
+        self.worker.log.connect(self.append_log)
+        self.worker.hooks.connect(self.on_ci_result)
+        self.worker.done.connect(self.on_ci_done)
+        self.worker.start()
 
     # ---------- 從 NAS clone 到本地 ----------
     def on_clone(self):
