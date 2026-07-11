@@ -1961,9 +1961,11 @@ class RepoFilesDialog(QDialog):
         row = QHBoxLayout()
         self.refresh_b = QPushButton("重新整理")
         self.view_b = QPushButton("檢視內容")
+        self.blame_b = QPushButton("Blame")
         self.close_b = QPushButton("關閉")
         row.addWidget(self.refresh_b)
         row.addWidget(self.view_b)
+        row.addWidget(self.blame_b)
         row.addStretch(1)
         row.addWidget(self.close_b)
         lay.addLayout(row)
@@ -1974,11 +1976,12 @@ class RepoFilesDialog(QDialog):
 
         self.refresh_b.clicked.connect(self.refresh)
         self.view_b.clicked.connect(self.on_view)
+        self.blame_b.clicked.connect(self.on_blame)
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
     def _busy(self, b):
-        for x in (self.refresh_b, self.view_b):
+        for x in (self.refresh_b, self.view_b, self.blame_b):
             x.setEnabled(not b)
 
     def refresh(self):
@@ -2031,6 +2034,27 @@ class RepoFilesDialog(QDialog):
         self._busy(False)
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+    def on_blame(self):
+        it = self.list.currentItem()
+        if not it:
+            self.status.setText("請先選一個檔案。")
+            return
+        path = it.data(Qt.ItemDataRole.UserRole)
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        cfg["file_path"] = path
+        self._busy(True)
+        self.status.setText(f"讀取「{path}」blame 中…")
+        self.status.setStyleSheet("")
+        self.content_worker = Worker(cfg, mode="file_blame")
+        self.content_worker.hooks.connect(lambda text, p=path: self._show_blame(p, text))
+        self.content_worker.done.connect(self.on_view_done)
+        self.content_worker.start()
+
+    def _show_blame(self, path, text):
+        dlg = TextViewDialog(self, f"Blame — {self.repo_name}:{path}", text or "（空檔案）")
+        dlg.exec()
 
 
 # ============================================================
