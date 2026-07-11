@@ -55,6 +55,17 @@ ARCHIVE_STALE_DAYS = 90
 # 健康檢查用：單一檔案超過這個大小（bytes）就建議改用 Git LFS，僅提醒不自動處理。
 LFS_SUGGEST_BYTES = 5 * 1024 * 1024
 
+# 新建空倉庫可選套用的 .gitignore 模板（Python 專案常見規則）。
+GITIGNORE_TEMPLATE = """__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.DS_Store
+"""
+
 # 本機操作稽核 log：這套工具做的破壞性動作（刪 repo、砍 tag、砍 SSH 金鑰、批次清封存、GC 等）
 # NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
 AUDIT_LOG_PATH = os.path.join(os.path.expanduser("~"), ".nas_git_connector", "audit.log")
@@ -1814,6 +1825,8 @@ class Worker(QThread):
         name = c.get("repo_name", "")
         branch = c.get("branch", "develop") or "develop"
         pol = c.get("ci_policy", "none")
+        add_readme = bool(c.get("add_readme"))
+        add_gitignore = bool(c.get("add_gitignore"))
         if not name.endswith(".git"):
             name += ".git"
         if not is_safe_name(name):
@@ -1822,6 +1835,32 @@ class Worker(QThread):
         if pol not in ("none", "soft", "strict"):
             pol = "none"
         self.log.emit(f"--- 在 NAS 新建空倉庫：{name} ---")
+        title = name[:-4] if name.endswith(".git") else name
+        readme_b64 = base64.b64encode(f"# {title}\n".encode("utf-8")).decode("ascii")
+        gitignore_b64 = base64.b64encode(GITIGNORE_TEMPLATE.encode("utf-8")).decode("ascii")
+        seed_lines = []
+        if add_readme or add_gitignore:
+            seed_lines = [
+                "idx=$(mktemp -u)",  # 只要路徑、不要預先建立空檔——空檔會被 git 當成損壞的 index
+                "export GIT_INDEX_FILE=\"$idx\" GIT_DIR=\"$repo\"",
+            ]
+            if add_readme:
+                seed_lines.append(
+                    f"printf '%s' '{readme_b64}' | base64 -d | git hash-object -w --stdin | "
+                    "xargs -I{} git update-index --add --cacheinfo 100644,{},README.md")
+            if add_gitignore:
+                seed_lines.append(
+                    f"printf '%s' '{gitignore_b64}' | base64 -d | git hash-object -w --stdin | "
+                    "xargs -I{} git update-index --add --cacheinfo 100644,{},.gitignore")
+            seed_lines += [
+                "tree=$(git write-tree)",
+                "seed_commit=$(GIT_AUTHOR_NAME='NAS Git Connector' GIT_AUTHOR_EMAIL='nas-git-connector@local' "
+                "GIT_COMMITTER_NAME='NAS Git Connector' GIT_COMMITTER_EMAIL='nas-git-connector@local' "
+                "git commit-tree \"$tree\" -m 'chore: 初始化 repository')",
+                "git update-ref \"refs/heads/$branch\" \"$seed_commit\"",
+                "rm -f \"$idx\"",
+                "unset GIT_INDEX_FILE GIT_DIR",
+            ]
         cmd = "\n".join([
             "echo ___BEGIN___",
             f"BASE='{root}'; name='{name}'; branch='{branch}'; pol='{pol}'",
@@ -1832,6 +1871,7 @@ class Worker(QThread):
             "[ -f \"$BASE/hooks_template/pre-receive.stub\" ] && { cp \"$BASE/hooks_template/pre-receive.stub\" \"$repo/hooks/pre-receive\"; chmod 750 \"$repo/hooks/pre-receive\"; }",
             "[ -f \"$BASE/hooks_template/post-receive\" ] && { cp \"$BASE/hooks_template/post-receive\" \"$repo/hooks/post-receive\"; chmod 750 \"$repo/hooks/post-receive\"; }",
             "git --git-dir=\"$repo\" symbolic-ref HEAD \"refs/heads/$branch\" 2>/dev/null",
+            *seed_lines,
             "mkdir -p \"$BASE/ci_policies\"",
             "if [ \"$pol\" != none ]; then printf '# %s\\nPOLICY=%s\\nPROFILE=%s\\n' \"$name\" \"$pol\" \"$pol\" > \"$BASE/ci_policies/$name.policy\"; fi",
             "chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
@@ -1848,7 +1888,10 @@ class Worker(QThread):
             self.done.emit(False, "建立失敗" + ("（git init --bare 失敗）" if fail else "（權限問題？）"))
             return
         url = f"{c['user']}@{c['host']}:{root}/{name}"
-        self.done.emit(True, f"已建立空倉庫：{name}\n預設分支 HEAD → {branch}\nCI：{pol}\nClone URL：{url}")
+        seed_note = "\n初始內容：" + "、".join(
+            n for n, on in (("README.md", add_readme), (".gitignore", add_gitignore)) if on
+        ) if (add_readme or add_gitignore) else ""
+        self.done.emit(True, f"已建立空倉庫：{name}\n預設分支 HEAD → {branch}\nCI：{pol}{seed_note}\nClone URL：{url}")
 
     # --- CI 自我測試（不用 push；用假 push 跑引擎）---
     def _run_ci_selftest(self):
@@ -2844,6 +2887,14 @@ class CreateRepoDialog(QDialog):
         gl.addWidget(self.rb_strict)
         lay.addWidget(gb)
 
+        tb = QGroupBox("初始內容模板（可選，會建立第一筆 commit）")
+        tl = QVBoxLayout(tb)
+        self.cb_readme = QCheckBox("加入 README.md（標題帶倉庫名）")
+        self.cb_gitignore = QCheckBox("加入 .gitignore（Python 常見規則）")
+        tl.addWidget(self.cb_readme)
+        tl.addWidget(self.cb_gitignore)
+        lay.addWidget(tb)
+
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._ok)
         bb.rejected.connect(self.reject)
@@ -2859,7 +2910,8 @@ class CreateRepoDialog(QDialog):
     def values(self):
         pol = "strict" if self.rb_strict.isChecked() else ("soft" if self.rb_soft.isChecked() else "none")
         return (self.name_edit.text().strip(),
-                self.branch_edit.text().strip() or "develop", pol)
+                self.branch_edit.text().strip() or "develop", pol,
+                self.cb_readme.isChecked(), self.cb_gitignore.isChecked())
 
 
 # ============================================================
@@ -4697,9 +4749,10 @@ class MainWindow(QMainWindow):
         dlg = CreateRepoDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        name, branch, pol = dlg.values()
+        name, branch, pol, add_readme, add_gitignore = dlg.values()
         cfg = dict(self.collect_identity_cfg())
-        cfg.update({"repo_name": name, "branch": branch, "ci_policy": pol})
+        cfg.update({"repo_name": name, "branch": branch, "ci_policy": pol,
+                    "add_readme": add_readme, "add_gitignore": add_gitignore})
         self.save_current_profile(silent=True)
         self.browse_status.setText(f"建立倉庫「{name}」中…")
         self.browse_status.setStyleSheet("")
