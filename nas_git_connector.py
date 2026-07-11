@@ -395,6 +395,10 @@ class Worker(QThread):
             self._run_repo_desc_get()
         elif self.mode == "repo_desc_set":
             self._run_repo_desc_set()
+        elif self.mode == "branch_protect_get":
+            self._run_branch_protect_get()
+        elif self.mode == "branch_protect_set":
+            self._run_branch_protect_set()
         elif self.mode == "repo_files":
             self._run_repo_files()
         elif self.mode == "file_content":
@@ -958,6 +962,61 @@ class Worker(QThread):
             self.done.emit(True, f"已更新「{name}」的描述。")
         else:
             self.done.emit(False, "更新描述失敗（連線或權限問題）。")
+
+    # --- 讀取分支保護設定（git 原生 receive.denyDeletes / denyNonFastForwards，與 CI 引擎彼此獨立）---
+    def _run_branch_protect_get(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"repo='{root}/{name}'",
+            "git --git-dir=\"$repo\" config --get receive.denyDeletes 2>/dev/null || echo false",
+            "git --git-dir=\"$repo\" config --get receive.denyNonFastForwards 2>/dev/null || echo false",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取分支保護設定失敗（連線或權限問題）。")
+            return
+        lines = self._between(out).splitlines()
+        deny_del = lines[0].strip() if len(lines) > 0 else "false"
+        deny_ff = lines[1].strip() if len(lines) > 1 else "false"
+        self.hooks.emit(f"denyDeletes={deny_del}\ndenyNonFastForwards={deny_ff}")
+        self.done.emit(True, "已讀取分支保護設定。")
+
+    # --- 設定分支保護（禁止刪除分支/tag、禁止強制推送）---
+    def _run_branch_protect_set(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        deny_del = "true" if c.get("deny_deletes") else "false"
+        deny_ff = "true" if c.get("deny_nonff") else "false"
+        self.log.emit(f"--- 設定分支保護：{name}（denyDeletes={deny_del}, denyNonFastForwards={deny_ff}）---")
+        cmd = "\n".join([
+            f"repo='{root}/{name}'",
+            f"git --git-dir=\"$repo\" config receive.denyDeletes {deny_del}",
+            f"git --git-dir=\"$repo\" config receive.denyNonFastForwards {deny_ff}",
+            "echo ___OK___",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0 or "___OK___" not in out:
+            self.done.emit(False, "更新分支保護失敗（連線或權限問題）。")
+            return
+        state = []
+        if deny_del == "true":
+            state.append("禁止刪除分支/tag")
+        if deny_ff == "true":
+            state.append("禁止強制推送")
+        summary = "、".join(state) if state else "已清除保護（恢復預設）"
+        self.done.emit(True, f"已更新「{name}」分支保護：{summary}")
 
     # --- 列出 repo 在預設分支下所有檔案（不用 clone）---
     def _run_repo_files(self):
@@ -2764,6 +2823,78 @@ class CreateRepoDialog(QDialog):
 
 
 # ============================================================
+# 分支保護對話框（git 原生 receive.denyDeletes / denyNonFastForwards）
+# ============================================================
+class BranchProtectDialog(QDialog):
+    def __init__(self, parent, cfg, name):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.name = name
+        self.worker = None
+        self.setWindowTitle(f"分支保護 — {name}")
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "以 git 原生設定保護此倉庫，push 端會直接被擋（與 CI policy 引擎彼此獨立、互不影響）。"))
+        self.cb_del = QCheckBox("禁止刪除分支/tag（receive.denyDeletes）")
+        self.cb_ff = QCheckBox("禁止強制推送 / 非快轉更新（receive.denyNonFastForwards）")
+        lay.addWidget(self.cb_del)
+        lay.addWidget(self.cb_ff)
+        self.status = QLabel("讀取目前設定中…")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.bb.accepted.connect(self.on_save)
+        self.bb.rejected.connect(self.reject)
+        self.bb.setEnabled(False)
+        lay.addWidget(self.bb)
+        self._load()
+
+    def _load(self):
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.name
+        self.worker = Worker(cfg, mode="branch_protect_get")
+        self.worker.hooks.connect(self._on_loaded)
+        self.worker.done.connect(self._on_load_done)
+        self.worker.start()
+
+    def _on_loaded(self, text):
+        vals = {}
+        for ln in text.splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                vals[k.strip()] = v.strip()
+        self.cb_del.setChecked(vals.get("denyDeletes", "false") == "true")
+        self.cb_ff.setChecked(vals.get("denyNonFastForwards", "false") == "true")
+
+    def _on_load_done(self, ok, msg):
+        self.bb.setEnabled(True)
+        self.status.setText("" if ok else ("❌ " + msg))
+        self.status.setStyleSheet("" if ok else "color:#b00020;")
+
+    def on_save(self):
+        self.bb.setEnabled(False)
+        self.status.setText("儲存中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.name
+        cfg["deny_deletes"] = self.cb_del.isChecked()
+        cfg["deny_nonff"] = self.cb_ff.isChecked()
+        self.worker = Worker(cfg, mode="branch_protect_set")
+        self.worker.done.connect(self._on_saved)
+        self.worker.start()
+
+    def _on_saved(self, ok, msg):
+        self.bb.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, "完成", msg)
+            self.accept()
+        else:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+
+
+# ============================================================
 # 封存區 _archived/ 管理 對話框
 # ============================================================
 class ArchiveDialog(QDialog):
@@ -3650,6 +3781,11 @@ class MainWindow(QMainWindow):
         self.desc_btn.setToolTip("讀寫此庫的 description 檔（bare repo 原生機制），用來標註這個倉庫是幹嘛的。")
         self.desc_btn.clicked.connect(self.on_edit_desc)
         danger_row.addWidget(self.desc_btn)
+        self.branch_protect_btn = QPushButton("分支保護…")
+        self.branch_protect_btn.setEnabled(False)
+        self.branch_protect_btn.setToolTip("設定 git 原生 receive.denyDeletes / denyNonFastForwards，與 CI 引擎彼此獨立。")
+        self.branch_protect_btn.clicked.connect(self.on_branch_protect)
+        danger_row.addWidget(self.branch_protect_btn)
         self.batch_ci_btn = QPushButton("批次設定 CI…")
         self.batch_ci_btn.setEnabled(False)
         self.batch_ci_btn.setToolTip("對『目前選取的多個』倉庫一次套用同一 CI 規則（可按住 Ctrl/Shift 多選）。")
@@ -4230,6 +4366,7 @@ class MainWindow(QMainWindow):
         self.detail_btn.setEnabled(has)
         self.files_btn.setEnabled(has)
         self.desc_btn.setEnabled(has)
+        self.branch_protect_btn.setEnabled(has)
         self.batch_ci_btn.setEnabled(len(self.repo_list.selectedItems()) >= 1)
         self.rename_btn.setEnabled(has)
         self.clone_btn.setEnabled(has)
@@ -4668,6 +4805,16 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
             QMessageBox.warning(self, "更新失敗", msg)
+
+    def on_branch_protect(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = BranchProtectDialog(self, cfg, name)
+        dlg.exec()
 
     def on_repo_files(self):
         name = self._selected_repo_name()
