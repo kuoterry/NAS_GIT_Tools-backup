@@ -473,6 +473,8 @@ class Worker(QThread):
             self._run_ssh_keys_delete()
         elif self.mode == "prep_new_user":
             self._run_prep_new_user()
+        elif self.mode == "local_gen_ssh_key":
+            self._run_local_gen_ssh_key()
         elif self.mode == "clone":
             self._run_clone()
         elif self.mode == "create_mirror":
@@ -1569,6 +1571,33 @@ class Worker(QThread):
                 break
         self.hooks.emit(f"EXISTS={'1' if exists else '0'}\nMEMBERS={members}")
         self.done.emit(True, "查詢完成。")
+
+    # --- 本機產生新的 SSH 金鑰對（給新申請的 git_devs 帳號用）---
+    # 私鑰只留在這台機器，不會被讀出來或傳到 NAS；只把公鑰內容透過 hooks 訊號回傳給對話框。
+    def _run_local_gen_ssh_key(self):
+        path = self.cfg.get("key_path", "")
+        comment = self.cfg.get("key_comment", "")
+        if not path:
+            self.done.emit(False, "缺少金鑰儲存路徑。")
+            return
+        if os.path.exists(path) or os.path.exists(path + ".pub"):
+            self.done.emit(False, f"檔案已存在，未覆蓋：{path}（或 .pub），請換一個檔名。")
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.log.emit(f"--- 本機產生 SSH 金鑰對：{path} ---")
+        rc, out, err = self._run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", comment, "-f", path])
+        if rc != 0:
+            self.done.emit(False, "產生金鑰失敗：" + (err or out).strip())
+            return
+        pub_path = path + ".pub"
+        try:
+            with open(pub_path, encoding="utf-8") as f:
+                pubkey = f.read().strip()
+        except OSError as e:
+            self.done.emit(False, f"金鑰已產生，但讀取公鑰檔失敗：{e}")
+            return
+        self.hooks.emit(pubkey)
+        self.done.emit(True, f"已產生金鑰對：\n私鑰：{path}\n公鑰：{pub_path}")
 
     # --- 從 NAS clone 到本地（本機執行 git clone，走金鑰/plink）---
     def _run_clone(self):
@@ -3528,7 +3557,15 @@ class CreateGitDevsUserDialog(QDialog):
         g.addWidget(self.email_edit, 2, 1)
         lay.addLayout(g)
 
-        lay.addWidget(QLabel("該帳號要用來 push 的 SSH 公鑰（.pub 檔內容，由申請人自己產生、只給公鑰）："))
+        pubkey_row = QHBoxLayout()
+        pubkey_row.addWidget(QLabel("該帳號要用來 push 的 SSH 公鑰（.pub 檔內容，由申請人自己產生、只給公鑰）："), stretch=1)
+        self.gen_key_b = QPushButton("本機產生新金鑰…")
+        self.gen_key_b.setToolTip(
+            "在這台機器上跑 ssh-keygen 產生一組新的金鑰對，私鑰留在本機、只把公鑰內容帶進下面欄位。\n"
+            "如果這個帳號是要給別人用，記得把私鑰檔安全地交給對方，不要用明碼管道傳送。")
+        self.gen_key_b.clicked.connect(self.on_gen_key)
+        pubkey_row.addWidget(self.gen_key_b)
+        lay.addLayout(pubkey_row)
         self.pubkey_edit = QPlainTextEdit()
         self.pubkey_edit.setPlaceholderText("ssh-ed25519 AAAA... comment")
         self.pubkey_edit.setFixedHeight(80)
@@ -3548,6 +3585,49 @@ class CreateGitDevsUserDialog(QDialog):
 
         self.gen_b.clicked.connect(self.on_generate)
         self.close_b.clicked.connect(self.accept)
+
+    def on_gen_key(self):
+        username = self.user_edit.text().strip()
+        if not is_safe_username(username):
+            self.status.setText("請先填好帳號名稱（會拿來當金鑰檔名與 comment）。")
+            self.status.setStyleSheet("color:#b00020;")
+            return
+        default_name = f"id_ed25519_{username}"
+        name, ok = QInputDialog.getText(
+            self, "本機產生新金鑰",
+            "金鑰檔名（存到 ~/.ssh/ 底下，私鑰留在這台機器，只有公鑰內容會被帶進上面欄位）：",
+            text=default_name)
+        name = name.strip()
+        if not ok or not name:
+            return
+        ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+        path = os.path.join(ssh_dir, name)
+        if os.path.exists(path) or os.path.exists(path + ".pub"):
+            QMessageBox.warning(self, "檔案已存在", f"{path}（或 .pub）已經存在，請換一個檔名，避免覆蓋既有金鑰。")
+            return
+        self.gen_key_b.setEnabled(False)
+        self.status.setText("本機產生金鑰中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["key_path"] = path
+        cfg["key_comment"] = username
+        self.worker = Worker(cfg, mode="local_gen_ssh_key")
+        self.worker.hooks.connect(self._on_key_generated)
+        self.worker.done.connect(self._on_gen_key_done)
+        self.worker.start()
+
+    def _on_key_generated(self, pubkey):
+        self.pubkey_edit.setPlainText(pubkey)
+
+    def _on_gen_key_done(self, ok, msg):
+        self.gen_key_b.setEnabled(True)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        if ok:
+            QMessageBox.information(
+                self, "金鑰已產生",
+                msg + "\n\n如果這個帳號要給別人用，請把私鑰檔安全地交給對方（不要用 email/聊天軟體明碼傳），"
+                      "交接完成後可考慮從這台機器上刪除私鑰。")
 
     def on_generate(self):
         username = self.user_edit.text().strip()
