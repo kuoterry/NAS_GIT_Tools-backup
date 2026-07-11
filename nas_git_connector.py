@@ -2635,7 +2635,7 @@ class ArchiveDialog(QDialog):
         self.setWindowTitle("封存區 _archived/ 管理")
         self.resize(580, 440)
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("「安全下庄」搬走或打包的倉庫放這裡，可還原或永久刪除。"))
+        lay.addWidget(QLabel("「安全下庄」搬走或打包的倉庫放這裡，可還原或永久刪除。每一項前面有勾選框，可多選後批次清理。"))
         self.list = QListWidget()
         lay.addWidget(self.list, stretch=1)
         row = QHBoxLayout()
@@ -2649,6 +2649,15 @@ class ArchiveDialog(QDialog):
         row.addStretch(1)
         row.addWidget(self.close_b)
         lay.addLayout(row)
+
+        row2 = QHBoxLayout()
+        self.check_stale_b = QPushButton(f"勾選超過 {ARCHIVE_STALE_DAYS} 天的項目")
+        self.bulk_purge_b = QPushButton("清理已勾選…")
+        row2.addWidget(self.check_stale_b)
+        row2.addWidget(self.bulk_purge_b)
+        row2.addStretch(1)
+        lay.addLayout(row2)
+
         self.status = QLabel("")
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
@@ -2656,11 +2665,13 @@ class ArchiveDialog(QDialog):
         self.refresh_b.clicked.connect(self.refresh)
         self.restore_b.clicked.connect(self.on_restore)
         self.purge_b.clicked.connect(self.on_purge)
+        self.check_stale_b.clicked.connect(self.on_check_stale)
+        self.bulk_purge_b.clicked.connect(self.on_bulk_purge)
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
     def _busy(self, b):
-        for x in (self.refresh_b, self.restore_b, self.purge_b):
+        for x in (self.refresh_b, self.restore_b, self.purge_b, self.check_stale_b, self.bulk_purge_b):
             x.setEnabled(not b)
 
     def _sel(self):
@@ -2695,6 +2706,8 @@ class ArchiveDialog(QDialog):
             else:
                 label = f"{name}    [{kind}, {size}]"
             it = QListWidgetItem(label)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Unchecked)
             it.setData(Qt.ItemDataRole.UserRole, name)
             self.list.addItem(it)
 
@@ -2737,6 +2750,64 @@ class ArchiveDialog(QDialog):
         self.status.setStyleSheet("color:#b06000;" if (ok and n_stale) else ("color:#1a7f37;" if ok else "color:#b00020;"))
         if ok and self.worker and self.worker.mode in ("archive_restore", "archive_purge"):
             self.refresh()
+
+    def on_check_stale(self):
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            name = it.data(Qt.ItemDataRole.UserRole)
+            age = self._archived_age_days(name) if name else None
+            if age is not None and age >= ARCHIVE_STALE_DAYS:
+                it.setCheckState(Qt.CheckState.Checked)
+
+    def _checked_names(self):
+        names = []
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                n = it.data(Qt.ItemDataRole.UserRole)
+                if n:
+                    names.append(n)
+        return names
+
+    def on_bulk_purge(self):
+        names = self._checked_names()
+        if not names:
+            self.status.setText("請先勾選要清理的項目。")
+            return
+        r = QMessageBox.question(
+            self, "批次永久刪除",
+            f"確定永久刪除以下 {len(names)} 個封存項目？此動作無法復原：\n" + "\n".join(names))
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._purge_queue = list(names)
+        self._purge_ok = 0
+        self._purge_fail = 0
+        self._busy(True)
+        self._run_next_purge()
+
+    def _run_next_purge(self):
+        if not self._purge_queue:
+            self._busy(False)
+            msg = f"批次清理完成：成功 {self._purge_ok}、失敗 {self._purge_fail}。"
+            self.status.setText(("✔ " if self._purge_fail == 0 else "⚠ ") + msg)
+            self.status.setStyleSheet("color:#1a7f37;" if self._purge_fail == 0 else "color:#b06000;")
+            self.refresh()
+            return
+        name = self._purge_queue.pop(0)
+        self.status.setText(f"刪除中… {name}（剩 {len(self._purge_queue) + 1} 個）")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["arch_name"] = name
+        self.worker = Worker(cfg, mode="archive_purge")
+        self.worker.done.connect(self._on_bulk_purge_one_done)
+        self.worker.start()
+
+    def _on_bulk_purge_one_done(self, ok, msg):
+        if ok:
+            self._purge_ok += 1
+        else:
+            self._purge_fail += 1
+        self._run_next_purge()
 
 
 # ============================================================
