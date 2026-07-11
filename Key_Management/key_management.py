@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -813,7 +813,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"金鑰管理工具 v{__version__}")
-        self.resize(1120, 660)
+        self.setMinimumSize(1120, 660)
         self.worker = None
         self.records = []
 
@@ -1199,7 +1199,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     win = MainWindow()
-    win.show()
+    win.showMaximized()  # 自動貼合目前螢幕可用區域，不用每次自己按最大化
     sys.exit(app.exec())
 
 
