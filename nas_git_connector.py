@@ -26,6 +26,7 @@ import socket
 import shutil
 import platform
 import subprocess
+from datetime import datetime
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
 from PyQt6.QtGui import QFont
@@ -45,6 +46,9 @@ CONTAINER_ROOTS = [
     r"D:\git",
     r"D:\GIT",
 ]
+
+# 封存區保留政策提醒：項目封存超過這麼多天，就在封存區清單上標記提醒（僅提醒，不自動清除）。
+ARCHIVE_STALE_DAYS = 90
 
 # ============================================================
 # 預設身份(Profile)：第一次執行會自動建立。
@@ -2180,11 +2184,30 @@ class ArchiveDialog(QDialog):
 
     def on_entries(self, entries):
         self.list.clear()
+        self._n_stale = 0
         for name, typ, size in entries:
             kind = "tarball" if typ == "file" else "目錄"
-            it = QListWidgetItem(f"{name}    [{kind}, {size}]")
+            age = self._archived_age_days(name)
+            if age is not None and age >= ARCHIVE_STALE_DAYS:
+                self._n_stale += 1
+                label = f"⚠ {name}    [{kind}, {size}] — 已封存 {age} 天，建議檢查是否可清理"
+            else:
+                label = f"{name}    [{kind}, {size}]"
+            it = QListWidgetItem(label)
             it.setData(Qt.ItemDataRole.UserRole, name)
             self.list.addItem(it)
+
+    @staticmethod
+    def _archived_age_days(name: str):
+        """從封存名稱（*.YYYYMMDD-HHMMSS 或 *.YYYYMMDD-HHMMSS.tar.gz）解析封存天數，解析不出來回傳 None。"""
+        m = re.search(r"\.(\d{8})-(\d{6})(?:\.tar\.gz)?$", name)
+        if not m:
+            return None
+        try:
+            ts = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            return None
+        return (datetime.now() - ts).days
 
     def on_restore(self):
         n = self._sel()
@@ -2206,8 +2229,11 @@ class ArchiveDialog(QDialog):
 
     def on_done(self, ok, msg):
         self._busy(False)
+        n_stale = getattr(self, "_n_stale", 0)
+        if ok and self.worker and self.worker.mode == "archive_list" and n_stale:
+            msg += f"\n其中 {n_stale} 個已封存超過 {ARCHIVE_STALE_DAYS} 天（見 ⚠ 標記），建議檢查是否可清理。"
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
-        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        self.status.setStyleSheet("color:#b06000;" if (ok and n_stale) else ("color:#1a7f37;" if ok else "color:#b00020;"))
         if ok and self.worker and self.worker.mode in ("archive_restore", "archive_purge"):
             self.refresh()
 
