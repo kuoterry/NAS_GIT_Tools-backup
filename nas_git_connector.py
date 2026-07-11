@@ -3490,14 +3490,9 @@ class CreateGitDevsUserDialog(QDialog):
 
         lay = QVBoxLayout(self)
         note = QLabel(
-            "這個工具沒有免密碼 sudo，沒辦法自己在 NAS 上建帳號，要照下面步驟手動操作：\n"
-            "1. 填好下面欄位、按「產生設定指令」——工具會先唯讀查一下 git_devs 目前有誰、帳號是否已存在。\n"
-            "2. 把產生出來的整段指令複製，貼到一個有 sudo 權限的 SSH 視窗，一次貼上、從頭執行到底，"
-            "中間不要自己截斷、分段貼，也不要手動改寫其中任何一行。\n"
-            "3. 執行途中畫面會跳出「請輸入新密碼」——那是現場真的在問你，你要在那個當下自己打一組密碼，"
-            "不是把畫面上顯示的文字照抄下來當密碼貼上去。\n"
-            "4. 加入 git_devs 群組那一步做完，腳本會自動印出「目前 git_devs 成員」讓你核對；"
-            "如果看到 ‼️ 警告，代表有人被踢出群組了，先停下來、不要繼續做後面步驟，回來跟我說。"
+            "這個工具沒有免密碼 sudo，沒辦法自己在 NAS 上建帳號。填好欄位按「產生設定指令」，"
+            "把產生出來的整段指令複製、貼到一個有 sudo 權限的 SSH 視窗，一次執行到底就好——"
+            "全程只有一開始的 sudo 密碼要你手動輸入，其餘（含新帳號密碼）都自動處理、自動核對。"
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#666;")
@@ -3593,20 +3588,22 @@ class CreateGitDevsUserDialog(QDialog):
             "# ============================================================",
             f"# 新增 git_devs 帳號：{username}",
             "# 由 NasGitConnector 產生，這段指令不會自動執行。",
-            "# 使用方式：整段複製 → 貼到有 sudo 權限的 SSH 視窗 → 一次執行到底，不要分段貼、不要手動改寫。",
-            "# 執行途中畫面問密碼時，是現場真的在問你，直接打你要設定的密碼、按 Enter，不是照抄畫面文字。",
+            "# 整段複製、貼到有 sudo 權限的 SSH 視窗、一次執行到底即可。",
+            "# 全程唯一會問你的是最開頭的 sudo -v（問你自己的登入密碼），其餘全自動，不用手動改任何一行。",
             "# synouser 的參數順序可能因 DSM 版本略有不同，若第 1 步報錯，先跑 `synouser --help` 核對。",
             "# ============================================================",
             "",
-            "# 1) 建立 DSM 使用者（畫面會現場問密碼，不會把密碼寫死在這份腳本裡）",
+            "# 0) 先讓 sudo 記住密碼，避免整段貼下去時中途又跳密碼提示、把後面指令吃掉／打斷",
+            "sudo -v",
+            "",
+            "# 1) 建立 DSM 使用者（密碼自動隨機產生，執行完會印在畫面上，請自行保存）",
         ]
         if exists:
             lines.append(f"#    帳號 {username} 已存在，這段可能不需要，請自行判斷是否跳過：")
         lines += [
-            f'echo "===> 現在請直接用鍵盤打一組你要給 {username} 的新密碼（不是照抄上面任何文字，是你自己現場想的密碼），"',
-            'echo "     畫面不會顯示字元是正常的，打完按 Enter："',
-            "read -s NEWPW; echo",
+            "NEWPW=$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-16)",
             f'sudo synouser --add {username} "$NEWPW" "{desc}" "{email}" 0 0',
+            f'echo "{username} 的登入密碼：$NEWPW（請自行保存，畫面關掉就找不回來了）"',
             "unset NEWPW",
             "",
             "# 2) 加入 git_devs 群組",
@@ -3630,7 +3627,7 @@ class CreateGitDevsUserDialog(QDialog):
             "",
             "# 4) 設定 SSH 金鑰登入",
             'sudo mkdir -p "$HOME_DIR/.ssh"',
-            f"sudo sh -c 'cat > \"$HOME_DIR/.ssh/authorized_keys\"' <<'EOF'",
+            "sudo tee \"$HOME_DIR/.ssh/authorized_keys\" >/dev/null <<'EOF'",
             pubkey,
             "EOF",
             'sudo chmod 700 "$HOME_DIR/.ssh"',
