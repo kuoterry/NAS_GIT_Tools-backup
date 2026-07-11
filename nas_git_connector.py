@@ -110,6 +110,25 @@ def shq(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+# Unix/DSM 帳號名稱白名單：小寫英文開頭，其餘可接小寫英數字、底線、連字號。
+_SAFE_USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+
+def is_safe_username(name: str) -> bool:
+    return bool(name) and bool(_SAFE_USERNAME_RE.match(name)) and len(name) <= 32
+
+
+_SSH_PUBKEY_RE = re.compile(
+    r"^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|"
+    r"ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|"
+    r"sk-ecdsa-sha2-nistp256@openssh\.com) "
+)
+
+
+def is_ssh_pubkey(line: str) -> bool:
+    return bool(_SSH_PUBKEY_RE.match(line))
+
+
 def fmt_size_kb(kb: int) -> str:
     """把 du -sk 回傳的 KB 數字格式化成人類可讀大小（K/M/G）。"""
     v = float(kb)
@@ -400,6 +419,8 @@ class Worker(QThread):
             self._run_ssh_keys_add()
         elif self.mode == "ssh_keys_delete":
             self._run_ssh_keys_delete()
+        elif self.mode == "prep_new_user":
+            self._run_prep_new_user()
         elif self.mode == "clone":
             self._run_clone()
         elif self.mode == "create_mirror":
@@ -1303,9 +1324,7 @@ class Worker(QThread):
     # --- 新增一把公鑰到 authorized_keys ---
     def _run_ssh_keys_add(self):
         key_line = " ".join(self.cfg.get("key_line", "").split())
-        if not re.match(r"^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|"
-                         r"ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|"
-                         r"sk-ecdsa-sha2-nistp256@openssh\.com) ", key_line):
+        if not is_ssh_pubkey(key_line):
             self.done.emit(False, "看起來不是合法的 SSH 公鑰格式（應以 ssh-rsa / ssh-ed25519 等開頭）。")
             return
         self.log.emit("--- 新增 SSH 授權金鑰 ---")
@@ -1355,6 +1374,36 @@ class Worker(QThread):
             self.done.emit(True, "已刪除該授權金鑰（原檔已備份 .bak-時間戳）。")
         else:
             self.done.emit(False, "刪除失敗（連線或權限問題，或找不到 authorized_keys）。")
+
+    # --- 查詢 git_devs 現況（帳號是否已存在、目前成員名單），供產生新增帳號指令用 ---
+    # 唯讀查詢，不會建立帳號、不會改群組——實際建帳號指令由使用者自行以特權身份執行。
+    def _run_prep_new_user(self):
+        name = self.cfg.get("new_user", "")
+        if not is_safe_username(name):
+            self.done.emit(False, f"帳號名稱不合規（僅允許小寫英文開頭、接小寫英數字/底線/連字號）：{name!r}")
+            return
+        self.log.emit(f"--- 查詢 git_devs 現況（供新增帳號 {name} 用）---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"name={shq(name)}",
+            "id \"$name\" >/dev/null 2>&1 && echo EXISTS:YES || echo EXISTS:NO",
+            "echo \"MEMBERS:$(getent group git_devs | cut -d: -f4)\"",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "查詢失敗（連線或權限問題）。")
+            return
+        body = self._between(out)
+        exists = "EXISTS:YES" in body
+        members = ""
+        for ln in body.splitlines():
+            if ln.startswith("MEMBERS:"):
+                members = ln[len("MEMBERS:"):].strip()
+                break
+        self.hooks.emit(f"EXISTS={'1' if exists else '0'}\nMEMBERS={members}")
+        self.done.emit(True, "查詢完成。")
 
     # --- 從 NAS clone 到本地（本機執行 git clone，走金鑰/plink）---
     def _run_clone(self):
@@ -3027,6 +3076,156 @@ class SshKeysDialog(QDialog):
 
 
 # ============================================================
+# 新增 git_devs 帳號：查詢現況 + 產生指令（工具本身不執行，需使用者自行以特權身份貼上跑）
+# ============================================================
+class CreateGitDevsUserDialog(QDialog):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.worker = None
+        self.setWindowTitle("新增 git_devs 帳號")
+        self.setMinimumWidth(520)
+
+        lay = QVBoxLayout(self)
+        note = QLabel(
+            "這個工具沒有免密碼 sudo，沒辦法自己在 NAS 上建帳號。填好下面欄位後按「產生設定指令」，"
+            "工具會先唯讀查一下 git_devs 目前的成員名單與帳號是否已存在，組出完整指令給你複製，"
+            "貼到一個有 sudo 權限的 SSH 視窗執行。"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#666;")
+        lay.addWidget(note)
+
+        g = QGridLayout()
+        g.addWidget(QLabel("帳號名稱："), 0, 0)
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("小寫英文開頭，例如 alice（將加入 git_devs 群組）")
+        g.addWidget(self.user_edit, 0, 1)
+        g.addWidget(QLabel("描述（可留空）："), 1, 0)
+        self.desc_edit = QLineEdit()
+        g.addWidget(self.desc_edit, 1, 1)
+        g.addWidget(QLabel("Email（可留空）："), 2, 0)
+        self.email_edit = QLineEdit()
+        g.addWidget(self.email_edit, 2, 1)
+        lay.addLayout(g)
+
+        lay.addWidget(QLabel("該帳號要用來 push 的 SSH 公鑰（.pub 檔內容，由申請人自己產生、只給公鑰）："))
+        self.pubkey_edit = QPlainTextEdit()
+        self.pubkey_edit.setPlaceholderText("ssh-ed25519 AAAA... comment")
+        self.pubkey_edit.setFixedHeight(80)
+        lay.addWidget(self.pubkey_edit)
+
+        row = QHBoxLayout()
+        self.gen_b = QPushButton("產生設定指令")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.gen_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.gen_b.clicked.connect(self.on_generate)
+        self.close_b.clicked.connect(self.accept)
+
+    def on_generate(self):
+        username = self.user_edit.text().strip()
+        if not is_safe_username(username):
+            self.status.setText("帳號名稱不合規：僅允許小寫英文開頭，接小寫英數字/底線/連字號。")
+            self.status.setStyleSheet("color:#b00020;")
+            return
+        pubkey = " ".join(self.pubkey_edit.toPlainText().split())
+        if not is_ssh_pubkey(pubkey):
+            self.status.setText("公鑰格式看起來不對，應以 ssh-rsa / ssh-ed25519 等開頭。")
+            self.status.setStyleSheet("color:#b00020;")
+            return
+        self.gen_b.setEnabled(False)
+        self.status.setText("查詢 git_devs 現況中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["new_user"] = username
+        self.worker = Worker(cfg, mode="prep_new_user")
+        self.worker.hooks.connect(lambda text: self._on_queried(username, pubkey, text))
+        self.worker.done.connect(self.on_query_done)
+        self.worker.start()
+
+    def on_query_done(self, ok, msg):
+        self.gen_b.setEnabled(True)
+        if not ok:
+            self.status.setText("❌ " + msg.replace("\n", "　"))
+            self.status.setStyleSheet("color:#b00020;")
+
+    def _on_queried(self, username, pubkey, text):
+        exists = False
+        members = ""
+        for ln in text.splitlines():
+            if ln.startswith("EXISTS="):
+                exists = ln[len("EXISTS="):].strip() == "1"
+            elif ln.startswith("MEMBERS="):
+                members = ln[len("MEMBERS="):].strip()
+        if exists:
+            self.status.setText(f"⚠ 帳號「{username}」已經存在，以下指令仍會產生，但建帳號那段請自行判斷是否跳過。")
+            self.status.setStyleSheet("color:#b06000;")
+        else:
+            self.status.setText(f"✔ 查詢完成，「{username}」目前不存在，可以建立。")
+            self.status.setStyleSheet("color:#1a7f37;")
+        member_list = [m for m in members.split(",") if m]
+        script = self._build_script(username, pubkey, member_list, exists)
+        dlg = TextViewDialog(self, f"新增 git_devs 帳號 — 待執行指令（{username}）", script)
+        dlg.exec()
+
+    def _build_script(self, username, pubkey, member_list, exists):
+        desc = self.desc_edit.text().strip() or username
+        email = self.email_edit.text().strip()
+        root = self.cfg.get("remote_root", "/volume1/Git_Server")
+        new_members = " ".join(member_list + [username])
+        lines = [
+            "# ============================================================",
+            f"# 新增 git_devs 帳號：{username}",
+            "# 由 NasGitConnector 產生，這段指令不會自動執行，請貼到有 sudo 權限的 SSH 視窗手動執行。",
+            "# synouser 的參數順序可能因 DSM 版本略有不同，若第 1 步報錯，先跑 `synouser --help` 核對。",
+            "# ============================================================",
+            "",
+            "# 1) 建立 DSM 使用者（自行把 <請設定密碼> 換成實際密碼，不要用明碼存這份指令）",
+        ]
+        if exists:
+            lines.append(f"#    帳號 {username} 已存在，這行可能不需要，請自行判斷是否跳過：")
+        lines.append(
+            f"sudo synouser --add {username} '<請設定密碼>' \"{desc}\" \"{email}\" 0 0"
+        )
+        lines += [
+            "",
+            "# 2) 加入 git_devs 群組",
+            "#    注意：synogroup --member 是「整批覆蓋」不是「附加」！",
+            f"#    以下已經把查詢到的既有成員（{', '.join(member_list) or '（目前查不到既有成員，請自行確認）'}）都列進去，",
+            "#    執行前務必再核對一次目前成員名單（getent group git_devs），漏打會把其他人踢出群組。",
+            f"sudo synogroup --member git_devs {new_members}",
+            "",
+            "# 3) 確認實際 home 目錄（不同 DSM 設定可能不是 /var/services/homes/<帳號>）",
+            f"getent passwd {username}",
+            "",
+            "# 4) 設定 SSH 金鑰登入（HOME 請依上一步實際查到的路徑調整）",
+            f"HOME_DIR=/var/services/homes/{username}",
+            'sudo mkdir -p "$HOME_DIR/.ssh"',
+            f"sudo sh -c 'cat > \"$HOME_DIR/.ssh/authorized_keys\"' <<'EOF'",
+            pubkey,
+            "EOF",
+            'sudo chmod 700 "$HOME_DIR/.ssh"',
+            'sudo chmod 600 "$HOME_DIR/.ssh/authorized_keys"',
+            f'sudo chown -R {username}:users "$HOME_DIR/.ssh"',
+            "",
+            "# 5) 同步既有倉庫權限，讓新帳號一開始就能直接 push（跟修 kuoterry/Git_User1 那次同一件事）",
+            f"sudo chmod -R g+rwX {root}",
+            f"sudo find {root} -maxdepth 1 -type d -name '*.git' -exec chmod g+s {{}} \\;",
+            "",
+            "# 6) 完成後回這套工具按「一鍵修復…」，把 core.sharedRepository=group 補到每個既有倉庫。",
+        ]
+        return "\n".join(lines)
+
+
+# ============================================================
 # 跨庫搜尋結果對話框（雙擊直接開啟檔案並跳到該行）
 # ============================================================
 class GrepResultsDialog(QDialog):
@@ -3488,8 +3687,12 @@ class MainWindow(QMainWindow):
         self.repair_btn = QPushButton("一鍵修復…")
         self.repair_btn.setToolTip("對所有 repo 套用 template hook（pre/post-receive）並修正 git_devs 群組與權限。")
         self.repair_btn.clicked.connect(self.on_repair)
+        self.new_user_btn = QPushButton("新增 git_devs 帳號…")
+        self.new_user_btn.setToolTip("查詢 git_devs 現況並產生新增帳號的完整指令，需自行貼到有 sudo 權限的 SSH 視窗執行。")
+        self.new_user_btn.clicked.connect(self.on_create_git_devs_user)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
+        og.addWidget(self.new_user_btn, 0, 2)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視（最後 200 筆）")
@@ -3784,7 +3987,7 @@ class MainWindow(QMainWindow):
         self.search_all_btn.setEnabled(not busy)
         self.activity_btn.setEnabled(not busy)
         self.ssh_keys_btn.setEnabled(not busy)
-        for b in (self.hc_btn, self.repair_btn, self.push_log_btn,
+        for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.push_log_btn,
                   self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
@@ -4213,6 +4416,12 @@ class MainWindow(QMainWindow):
         if r != QMessageBox.StandardButton.Yes:
             return
         self._start_maint("repair", "一鍵修復")
+
+    def on_create_git_devs_user(self):
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = CreateGitDevsUserDialog(self, cfg)
+        dlg.exec()
 
     def on_view_log(self, logfile, title):
         self._start_maint("log", title, extra={"logfile": logfile, "log_lines": 200})
