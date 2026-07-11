@@ -1067,36 +1067,44 @@ class Worker(QThread):
         root = self.cfg["remote_root"]
         pattern = self.cfg.get("pattern", "")
         if not pattern:
+            self.repos.emit([])
             self.done.emit(False, "請輸入搜尋字串。")
             return
         self.log.emit(f"--- 跨庫搜尋：{pattern} ---")
         cmd = "\n".join([
             "echo ___BEGIN___",
             f"BASE='{root}'; PATTERN={shq(pattern)}",
-            "hit=0",
             "for repo in \"$BASE\"/*.git; do",
             "  [ -d \"$repo\" ] || continue",
             "  name=$(basename \"$repo\")",
             "  base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
             "  [ -z \"$base\" ] && continue",
-            "  out=$(git --git-dir=\"$repo\" grep -n -I -e \"$PATTERN\" \"$base\" 2>/dev/null)",
-            "  if [ -n \"$out\" ]; then",
-            "    hit=1",
-            "    echo \"== $name ($base) ==\"",
-            "    echo \"$out\" | sed 's/^/  /'",
-            "    echo",
-            "  fi",
+            "  git --git-dir=\"$repo\" grep -n -I -e \"$PATTERN\" \"$base\" 2>/dev/null | "
+            "sed \"s/^/HIT\\t$name\\t/\"",
             "done",
-            "[ \"$hit\" = 0 ] && echo \"（沒有找到符合的內容）\"",
             "echo ___END___",
             "true",
         ])
         rc, out, _ = self._ssh(cmd)
         if rc != 0:
+            self.repos.emit([])
             self.done.emit(False, "搜尋失敗（連線或權限問題）。")
             return
-        self.hooks.emit(self._between(out))
-        self.done.emit(True, f"搜尋「{pattern}」完成。")
+        hits = []
+        for ln in self._between(out).splitlines():
+            if not ln.startswith("HIT\t"):
+                continue
+            parts = ln[4:].split("\t", 1)
+            if len(parts) != 2:
+                continue
+            repo_name, grepline = parts
+            gparts = grepline.split(":", 3)
+            if len(gparts) < 4:
+                continue
+            _tree, path, lineno, content = gparts
+            hits.append((repo_name, path, lineno, content))
+        self.repos.emit(hits)
+        self.done.emit(True, f"搜尋「{pattern}」完成，共 {len(hits)} 筆符合。")
 
     # --- 比較同倉庫內兩個分支/commit ---
     def _run_repo_diff(self):
@@ -1971,7 +1979,7 @@ class DeleteRepoDialog(QDialog):
 # 通用文字檢視對話框（用於顯示 CI hook 內容）
 # ============================================================
 class TextViewDialog(QDialog):
-    def __init__(self, parent, title, text, markdown=False):
+    def __init__(self, parent, title, text, markdown=False, goto_line=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(720, 560)
@@ -1989,6 +1997,16 @@ class TextViewDialog(QDialog):
             view.setFont(QFont("NSimSun", 10))
             view.setPlainText(text)
             view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            if goto_line:
+                try:
+                    n = int(goto_line)
+                    block = view.document().findBlockByNumber(max(0, n - 1))
+                    cur = view.textCursor()
+                    cur.setPosition(block.position())
+                    view.setTextCursor(cur)
+                    view.centerCursor()
+                except (ValueError, TypeError):
+                    pass
         lay.addWidget(view, stretch=1)
 
         row = QHBoxLayout()
@@ -2892,6 +2910,106 @@ class SshKeysDialog(QDialog):
         self.on_done(ok, msg)
         if ok:
             self.refresh()
+
+
+# ============================================================
+# 跨庫搜尋結果對話框（雙擊直接開啟檔案並跳到該行）
+# ============================================================
+class GrepResultsDialog(QDialog):
+    def __init__(self, parent, cfg, pattern):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.pattern = pattern
+        self.worker = None
+        self.content_worker = None
+        self.setWindowTitle(f"跨庫搜尋結果 — {pattern}")
+        self.resize(780, 540)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(f"搜尋「{pattern}」（各庫預設分支）。雙擊或按「開啟檔案」可直接預覽並跳到該行。"))
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(self.on_open)
+        lay.addWidget(self.list, stretch=1)
+
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新搜尋")
+        self.open_b = QPushButton("開啟檔案")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.refresh_b)
+        row.addWidget(self.open_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.refresh_b.clicked.connect(self.refresh)
+        self.open_b.clicked.connect(self.on_open)
+        self.close_b.clicked.connect(self.accept)
+        self.refresh()
+
+    def _busy(self, b):
+        for x in (self.refresh_b, self.open_b):
+            x.setEnabled(not b)
+
+    def refresh(self):
+        self.list.clear()
+        self._busy(True)
+        self.status.setText("搜尋中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["pattern"] = self.pattern
+        self.worker = Worker(cfg, mode="grep_all")
+        self.worker.repos.connect(self.on_entries)
+        self.worker.done.connect(self.on_done)
+        self.worker.start()
+
+    def on_entries(self, hits):
+        self.list.clear()
+        for repo, path, lineno, content in hits:
+            it = QListWidgetItem(f"{repo}  {path}:{lineno}   {content.strip()}")
+            it.setData(Qt.ItemDataRole.UserRole, (repo, path, lineno))
+            self.list.addItem(it)
+        if not hits:
+            self.list.addItem(QListWidgetItem("（沒有找到符合的內容）"))
+
+    def on_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+    def on_open(self):
+        it = self.list.currentItem()
+        if not it:
+            self.status.setText("請先選一筆結果。")
+            return
+        data = it.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        repo, path, lineno = data
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = repo
+        cfg["file_path"] = path
+        self._busy(True)
+        self.status.setText(f"讀取「{repo}:{path}」中…")
+        self.status.setStyleSheet("")
+        self.content_worker = Worker(cfg, mode="file_content")
+        self.content_worker.hooks.connect(lambda text, r=repo, p=path, ln=lineno: self._show(r, p, ln, text))
+        self.content_worker.done.connect(self.on_open_done)
+        self.content_worker.start()
+
+    def _show(self, repo, path, lineno, text):
+        is_md = path.lower().endswith((".md", ".markdown"))
+        dlg = TextViewDialog(self, f"{repo}:{path}", text or "（空檔案）",
+                              markdown=is_md, goto_line=None if is_md else lineno)
+        dlg.exec()
+
+    def on_open_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
 
 
 # ============================================================
@@ -4191,17 +4309,9 @@ class MainWindow(QMainWindow):
         if not ok or not term:
             return
         cfg = dict(self.collect_identity_cfg())
-        cfg["pattern"] = term
         self.save_current_profile(silent=True)
-        self._ci_title = f"跨庫搜尋結果 — {term}"
-        self.browse_status.setText(f"搜尋「{term}」中…")
-        self.browse_status.setStyleSheet("")
-        self.set_busy(True)
-        self.worker = Worker(cfg, mode="grep_all")
-        self.worker.log.connect(self.append_log)
-        self.worker.hooks.connect(self.on_ci_result)
-        self.worker.done.connect(self.on_ci_done)
-        self.worker.start()
+        dlg = GrepResultsDialog(self, cfg, term)
+        dlg.exec()
 
     # ---------- 從 NAS clone 到本地 ----------
     def on_clone(self):
