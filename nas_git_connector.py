@@ -131,6 +131,19 @@ def is_ssh_pubkey(line: str) -> bool:
     return bool(_SSH_PUBKEY_RE.match(line))
 
 
+def ssh_fingerprint(line: str) -> str:
+    """算 authorized_keys 一行的 SHA256 指紋（同 ssh-keygen -lf 的格式），純本機計算不用連 NAS。"""
+    parts = line.split(None, 2)
+    if len(parts) < 2:
+        return "?"
+    try:
+        raw = base64.b64decode(parts[1], validate=True)
+    except Exception:
+        return "?"
+    digest = hashlib.sha256(raw).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
 def fmt_size_kb(kb: int) -> str:
     """把 du -sk 回傳的 KB 數字格式化成人類可讀大小（K/M/G）。"""
     v = float(kb)
@@ -3232,7 +3245,8 @@ class SshKeysDialog(QDialog):
             parts = line.split(None, 2)
             ktype = parts[0] if len(parts) > 0 else "?"
             comment = parts[2] if len(parts) > 2 else "(無註解)"
-            it = QListWidgetItem(f"{ktype}  {comment}")
+            fp = ssh_fingerprint(line)
+            it = QListWidgetItem(f"{ktype}  {comment}\n    {fp}")
             it.setData(Qt.ItemDataRole.UserRole, line)
             self.list.addItem(it)
 
