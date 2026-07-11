@@ -26,6 +26,8 @@ import socket
 import shutil
 import platform
 import subprocess
+import base64
+import hashlib
 from datetime import datetime
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
@@ -52,6 +54,17 @@ ARCHIVE_STALE_DAYS = 90
 
 # 健康檢查用：單一檔案超過這個大小（bytes）就建議改用 Git LFS，僅提醒不自動處理。
 LFS_SUGGEST_BYTES = 5 * 1024 * 1024
+
+# 新建空倉庫可選套用的 .gitignore 模板（Python 專案常見規則）。
+GITIGNORE_TEMPLATE = """__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.DS_Store
+"""
 
 # 本機操作稽核 log：這套工具做的破壞性動作（刪 repo、砍 tag、砍 SSH 金鑰、批次清封存、GC 等）
 # NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
@@ -127,6 +140,19 @@ _SSH_PUBKEY_RE = re.compile(
 
 def is_ssh_pubkey(line: str) -> bool:
     return bool(_SSH_PUBKEY_RE.match(line))
+
+
+def ssh_fingerprint(line: str) -> str:
+    """算 authorized_keys 一行的 SHA256 指紋（同 ssh-keygen -lf 的格式），純本機計算不用連 NAS。"""
+    parts = line.split(None, 2)
+    if len(parts) < 2:
+        return "?"
+    try:
+        raw = base64.b64decode(parts[1], validate=True)
+    except Exception:
+        return "?"
+    digest = hashlib.sha256(raw).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
 def fmt_size_kb(kb: int) -> str:
@@ -389,6 +415,14 @@ class Worker(QThread):
             self._run_set_ci_batch()
         elif self.mode == "repo_detail":
             self._run_repo_detail()
+        elif self.mode == "repo_desc_get":
+            self._run_repo_desc_get()
+        elif self.mode == "repo_desc_set":
+            self._run_repo_desc_set()
+        elif self.mode == "branch_protect_get":
+            self._run_branch_protect_get()
+        elif self.mode == "branch_protect_set":
+            self._run_branch_protect_set()
         elif self.mode == "repo_files":
             self._run_repo_files()
         elif self.mode == "file_content":
@@ -431,6 +465,12 @@ class Worker(QThread):
             self._run_upgrade_engine()
         elif self.mode == "healthcheck":
             self._run_healthcheck()
+        elif self.mode == "disk_usage":
+            self._run_disk_usage()
+        elif self.mode == "tg_conf_get":
+            self._run_tg_conf_get()
+        elif self.mode == "tg_conf_set":
+            self._run_tg_conf_set()
         elif self.mode == "repair":
             self._run_repair()
         elif self.mode == "log":
@@ -881,6 +921,9 @@ class Worker(QThread):
             "echo \"== 倉庫明細：$name ==\"",
             "echo \"大小：$(du -sh \"$repo\" 2>/dev/null | cut -f1)\"",
             "echo \"預設分支(HEAD)：$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)\"",
+            "desc=$(cat \"$repo/description\" 2>/dev/null)",
+            "case \"$desc\" in Unnamed\\ repository*|'') desc='（未設定）';; esac",
+            "echo \"描述：$desc\"",
             "pf=\"$BASE/ci_policies/$name.policy\"; pol=none; [ -f \"$pf\" ] && pol=$(sed -n 's/^[[:space:]]*POLICY=//p' \"$pf\" | head -1)",
             "echo \"CI policy：${pol:-none}\"",
             "echo",
@@ -903,6 +946,107 @@ class Worker(QThread):
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {name} 明細。")
+
+    # --- 讀取 repo 描述（bare repo 的 description 檔）---
+    def _run_repo_desc_get(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"f='{root}/{name}/description'",
+            "if [ -f \"$f\" ]; then cat \"$f\"; fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取描述失敗（連線或權限問題）。")
+            return
+        text = self._between(out)
+        if text.startswith("Unnamed repository"):
+            text = ""
+        self.hooks.emit(text)
+        self.done.emit(True, "已讀取描述。")
+
+    # --- 寫入 repo 描述（走 base64 避免多行/引號問題）---
+    def _run_repo_desc_set(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        desc = c.get("repo_desc", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        self.log.emit(f"--- 更新描述：{name} ---")
+        b64 = base64.b64encode(desc.encode("utf-8")).decode("ascii")
+        cmd = "\n".join([
+            f"f='{root}/{name}/description'",
+            f"printf '%s' '{b64}' | base64 -d > \"$f\" && echo ___OK___",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc == 0 and "___OK___" in out:
+            self.done.emit(True, f"已更新「{name}」的描述。")
+        else:
+            self.done.emit(False, "更新描述失敗（連線或權限問題）。")
+
+    # --- 讀取分支保護設定（git 原生 receive.denyDeletes / denyNonFastForwards，與 CI 引擎彼此獨立）---
+    def _run_branch_protect_get(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"repo='{root}/{name}'",
+            "git --git-dir=\"$repo\" config --get receive.denyDeletes 2>/dev/null || echo false",
+            "git --git-dir=\"$repo\" config --get receive.denyNonFastForwards 2>/dev/null || echo false",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取分支保護設定失敗（連線或權限問題）。")
+            return
+        lines = self._between(out).splitlines()
+        deny_del = lines[0].strip() if len(lines) > 0 else "false"
+        deny_ff = lines[1].strip() if len(lines) > 1 else "false"
+        self.hooks.emit(f"denyDeletes={deny_del}\ndenyNonFastForwards={deny_ff}")
+        self.done.emit(True, "已讀取分支保護設定。")
+
+    # --- 設定分支保護（禁止刪除分支/tag、禁止強制推送）---
+    def _run_branch_protect_set(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        deny_del = "true" if c.get("deny_deletes") else "false"
+        deny_ff = "true" if c.get("deny_nonff") else "false"
+        self.log.emit(f"--- 設定分支保護：{name}（denyDeletes={deny_del}, denyNonFastForwards={deny_ff}）---")
+        cmd = "\n".join([
+            f"repo='{root}/{name}'",
+            f"git --git-dir=\"$repo\" config receive.denyDeletes {deny_del}",
+            f"git --git-dir=\"$repo\" config receive.denyNonFastForwards {deny_ff}",
+            "echo ___OK___",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0 or "___OK___" not in out:
+            self.done.emit(False, "更新分支保護失敗（連線或權限問題）。")
+            return
+        state = []
+        if deny_del == "true":
+            state.append("禁止刪除分支/tag")
+        if deny_ff == "true":
+            state.append("禁止強制推送")
+        summary = "、".join(state) if state else "已清除保護（恢復預設）"
+        self.done.emit(True, f"已更新「{name}」分支保護：{summary}")
 
     # --- 列出 repo 在預設分支下所有檔案（不用 clone）---
     def _run_repo_files(self):
@@ -1597,6 +1741,75 @@ class Worker(QThread):
         self.hooks.emit(self._between(out))
         self.done.emit(True, "健康檢查完成。")
 
+    # --- 伺服器總儲存空間總覽（檔案系統可用空間 + 總用量 + 最大的幾個 repo）---
+    def _run_disk_usage(self):
+        root = self.cfg["remote_root"]
+        self.log.emit("--- 伺服器空間總覽 ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'",
+            "echo '== 檔案系統可用空間 (df -h) =='",
+            "df -h \"$BASE\" 2>/dev/null",
+            "echo",
+            "echo '== Git_Server 總用量 =='",
+            "du -sh \"$BASE\" 2>/dev/null",
+            "echo",
+            "echo '== 各倉庫大小排行（前 10 大）=='",
+            "for d in \"$BASE\"/*.git; do [ -d \"$d\" ] || continue; du -sh \"$d\" 2>/dev/null; done | sort -rh | head -10",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取伺服器空間資訊失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out))
+        self.done.emit(True, "已讀取伺服器空間總覽。")
+
+    # --- 讀取 Telegram 通知設定（CI 引擎與鏡像同步腳本共用的 config/tg_bot.conf）---
+    def _run_tg_conf_get(self):
+        root = self.cfg["remote_root"]
+        self.log.emit("--- 讀取 Telegram 通知設定 ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"f='{root}/config/tg_bot.conf'",
+            "if [ -f \"$f\" ]; then",
+            "  echo \"TOKEN=$(sed -n 's/^[[:space:]]*BOT_TOKEN=//p' \"$f\" | head -1)\"",
+            "  echo \"CHAT=$(sed -n 's/^[[:space:]]*CHAT_ID=//p' \"$f\" | head -1)\"",
+            "else",
+            "  echo 'TOKEN='",
+            "  echo 'CHAT='",
+            "fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取 Telegram 通知設定失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out))
+        self.done.emit(True, "已讀取 Telegram 通知設定。")
+
+    # --- 寫入 Telegram 通知設定（寫前先備份舊檔）---
+    def _run_tg_conf_set(self):
+        root = self.cfg["remote_root"]
+        token = self.cfg.get("tg_token", "").strip()
+        chat = self.cfg.get("tg_chat", "").strip()
+        self.log.emit("--- 更新 Telegram 通知設定 ---")
+        cmd = "\n".join([
+            f"d='{root}/config'; f=\"$d/tg_bot.conf\"",
+            "mkdir -p \"$d\"",
+            "[ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
+            f"printf 'BOT_TOKEN=%s\\nCHAT_ID=%s\\n' {shq(token)} {shq(chat)} > \"$f\"",
+            "chmod 600 \"$f\"",
+            "echo ___OK___",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc == 0 and "___OK___" in out:
+            self.done.emit(True, "已更新 Telegram 通知設定（舊檔已備份）。")
+        else:
+            self.done.emit(False, "更新 Telegram 通知設定失敗（連線或權限問題）。")
+
     # --- 一鍵修復（套用 template hook + 修群組權限）---
     def _run_repair(self):
         root = self.cfg["remote_root"]
@@ -1660,6 +1873,8 @@ class Worker(QThread):
         name = c.get("repo_name", "")
         branch = c.get("branch", "develop") or "develop"
         pol = c.get("ci_policy", "none")
+        add_readme = bool(c.get("add_readme"))
+        add_gitignore = bool(c.get("add_gitignore"))
         if not name.endswith(".git"):
             name += ".git"
         if not is_safe_name(name):
@@ -1668,6 +1883,32 @@ class Worker(QThread):
         if pol not in ("none", "soft", "strict"):
             pol = "none"
         self.log.emit(f"--- 在 NAS 新建空倉庫：{name} ---")
+        title = name[:-4] if name.endswith(".git") else name
+        readme_b64 = base64.b64encode(f"# {title}\n".encode("utf-8")).decode("ascii")
+        gitignore_b64 = base64.b64encode(GITIGNORE_TEMPLATE.encode("utf-8")).decode("ascii")
+        seed_lines = []
+        if add_readme or add_gitignore:
+            seed_lines = [
+                "idx=$(mktemp -u)",  # 只要路徑、不要預先建立空檔——空檔會被 git 當成損壞的 index
+                "export GIT_INDEX_FILE=\"$idx\" GIT_DIR=\"$repo\"",
+            ]
+            if add_readme:
+                seed_lines.append(
+                    f"printf '%s' '{readme_b64}' | base64 -d | git hash-object -w --stdin | "
+                    "xargs -I{} git update-index --add --cacheinfo 100644,{},README.md")
+            if add_gitignore:
+                seed_lines.append(
+                    f"printf '%s' '{gitignore_b64}' | base64 -d | git hash-object -w --stdin | "
+                    "xargs -I{} git update-index --add --cacheinfo 100644,{},.gitignore")
+            seed_lines += [
+                "tree=$(git write-tree)",
+                "seed_commit=$(GIT_AUTHOR_NAME='NAS Git Connector' GIT_AUTHOR_EMAIL='nas-git-connector@local' "
+                "GIT_COMMITTER_NAME='NAS Git Connector' GIT_COMMITTER_EMAIL='nas-git-connector@local' "
+                "git commit-tree \"$tree\" -m 'chore: 初始化 repository')",
+                "git update-ref \"refs/heads/$branch\" \"$seed_commit\"",
+                "rm -f \"$idx\"",
+                "unset GIT_INDEX_FILE GIT_DIR",
+            ]
         cmd = "\n".join([
             "echo ___BEGIN___",
             f"BASE='{root}'; name='{name}'; branch='{branch}'; pol='{pol}'",
@@ -1678,6 +1919,7 @@ class Worker(QThread):
             "[ -f \"$BASE/hooks_template/pre-receive.stub\" ] && { cp \"$BASE/hooks_template/pre-receive.stub\" \"$repo/hooks/pre-receive\"; chmod 750 \"$repo/hooks/pre-receive\"; }",
             "[ -f \"$BASE/hooks_template/post-receive\" ] && { cp \"$BASE/hooks_template/post-receive\" \"$repo/hooks/post-receive\"; chmod 750 \"$repo/hooks/post-receive\"; }",
             "git --git-dir=\"$repo\" symbolic-ref HEAD \"refs/heads/$branch\" 2>/dev/null",
+            *seed_lines,
             "mkdir -p \"$BASE/ci_policies\"",
             "if [ \"$pol\" != none ]; then printf '# %s\\nPOLICY=%s\\nPROFILE=%s\\n' \"$name\" \"$pol\" \"$pol\" > \"$BASE/ci_policies/$name.policy\"; fi",
             "chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
@@ -1694,7 +1936,10 @@ class Worker(QThread):
             self.done.emit(False, "建立失敗" + ("（git init --bare 失敗）" if fail else "（權限問題？）"))
             return
         url = f"{c['user']}@{c['host']}:{root}/{name}"
-        self.done.emit(True, f"已建立空倉庫：{name}\n預設分支 HEAD → {branch}\nCI：{pol}\nClone URL：{url}")
+        seed_note = "\n初始內容：" + "、".join(
+            n for n, on in (("README.md", add_readme), (".gitignore", add_gitignore)) if on
+        ) if (add_readme or add_gitignore) else ""
+        self.done.emit(True, f"已建立空倉庫：{name}\n預設分支 HEAD → {branch}\nCI：{pol}{seed_note}\nClone URL：{url}")
 
     # --- CI 自我測試（不用 push；用假 push 跑引擎）---
     def _run_ci_selftest(self):
@@ -2690,6 +2935,14 @@ class CreateRepoDialog(QDialog):
         gl.addWidget(self.rb_strict)
         lay.addWidget(gb)
 
+        tb = QGroupBox("初始內容模板（可選，會建立第一筆 commit）")
+        tl = QVBoxLayout(tb)
+        self.cb_readme = QCheckBox("加入 README.md（標題帶倉庫名）")
+        self.cb_gitignore = QCheckBox("加入 .gitignore（Python 常見規則）")
+        tl.addWidget(self.cb_readme)
+        tl.addWidget(self.cb_gitignore)
+        lay.addWidget(tb)
+
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._ok)
         bb.rejected.connect(self.reject)
@@ -2705,7 +2958,150 @@ class CreateRepoDialog(QDialog):
     def values(self):
         pol = "strict" if self.rb_strict.isChecked() else ("soft" if self.rb_soft.isChecked() else "none")
         return (self.name_edit.text().strip(),
-                self.branch_edit.text().strip() or "develop", pol)
+                self.branch_edit.text().strip() or "develop", pol,
+                self.cb_readme.isChecked(), self.cb_gitignore.isChecked())
+
+
+# ============================================================
+# 分支保護對話框（git 原生 receive.denyDeletes / denyNonFastForwards）
+# ============================================================
+class BranchProtectDialog(QDialog):
+    def __init__(self, parent, cfg, name):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.name = name
+        self.worker = None
+        self.setWindowTitle(f"分支保護 — {name}")
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "以 git 原生設定保護此倉庫，push 端會直接被擋（與 CI policy 引擎彼此獨立、互不影響）。"))
+        self.cb_del = QCheckBox("禁止刪除分支/tag（receive.denyDeletes）")
+        self.cb_ff = QCheckBox("禁止強制推送 / 非快轉更新（receive.denyNonFastForwards）")
+        lay.addWidget(self.cb_del)
+        lay.addWidget(self.cb_ff)
+        self.status = QLabel("讀取目前設定中…")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.bb.accepted.connect(self.on_save)
+        self.bb.rejected.connect(self.reject)
+        self.bb.setEnabled(False)
+        lay.addWidget(self.bb)
+        self._load()
+
+    def _load(self):
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.name
+        self.worker = Worker(cfg, mode="branch_protect_get")
+        self.worker.hooks.connect(self._on_loaded)
+        self.worker.done.connect(self._on_load_done)
+        self.worker.start()
+
+    def _on_loaded(self, text):
+        vals = {}
+        for ln in text.splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                vals[k.strip()] = v.strip()
+        self.cb_del.setChecked(vals.get("denyDeletes", "false") == "true")
+        self.cb_ff.setChecked(vals.get("denyNonFastForwards", "false") == "true")
+
+    def _on_load_done(self, ok, msg):
+        self.bb.setEnabled(True)
+        self.status.setText("" if ok else ("❌ " + msg))
+        self.status.setStyleSheet("" if ok else "color:#b00020;")
+
+    def on_save(self):
+        self.bb.setEnabled(False)
+        self.status.setText("儲存中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.name
+        cfg["deny_deletes"] = self.cb_del.isChecked()
+        cfg["deny_nonff"] = self.cb_ff.isChecked()
+        self.worker = Worker(cfg, mode="branch_protect_set")
+        self.worker.done.connect(self._on_saved)
+        self.worker.start()
+
+    def _on_saved(self, ok, msg):
+        self.bb.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, "完成", msg)
+            self.accept()
+        else:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+
+
+# ============================================================
+# Telegram 通知設定對話框（config/tg_bot.conf，CI 引擎與鏡像同步腳本共用）
+# ============================================================
+class NotifyConfigDialog(QDialog):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.worker = None
+        self.setWindowTitle("Telegram 通知設定")
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "CI 引擎（soft/strict 警告）與 GitHub 鏡像同步腳本共用這份設定（NAS 上 config/tg_bot.conf）。留空即停用通知。"))
+        g = QGridLayout()
+        g.addWidget(QLabel("Bot Token："), 0, 0)
+        self.token_edit = QLineEdit()
+        g.addWidget(self.token_edit, 0, 1)
+        g.addWidget(QLabel("Chat ID："), 1, 0)
+        self.chat_edit = QLineEdit()
+        g.addWidget(self.chat_edit, 1, 1)
+        lay.addLayout(g)
+        self.status = QLabel("讀取中…")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.bb.accepted.connect(self.on_save)
+        self.bb.rejected.connect(self.reject)
+        self.bb.setEnabled(False)
+        lay.addWidget(self.bb)
+        self._load()
+
+    def _load(self):
+        self.worker = Worker(dict(self.cfg), mode="tg_conf_get")
+        self.worker.hooks.connect(self._on_loaded)
+        self.worker.done.connect(self._on_load_done)
+        self.worker.start()
+
+    def _on_loaded(self, text):
+        for ln in text.splitlines():
+            if ln.startswith("TOKEN="):
+                self.token_edit.setText(ln[len("TOKEN="):])
+            elif ln.startswith("CHAT="):
+                self.chat_edit.setText(ln[len("CHAT="):])
+
+    def _on_load_done(self, ok, msg):
+        self.bb.setEnabled(True)
+        self.status.setText("" if ok else ("❌ " + msg))
+        self.status.setStyleSheet("" if ok else "color:#b00020;")
+
+    def on_save(self):
+        self.bb.setEnabled(False)
+        self.status.setText("儲存中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["tg_token"] = self.token_edit.text().strip()
+        cfg["tg_chat"] = self.chat_edit.text().strip()
+        self.worker = Worker(cfg, mode="tg_conf_set")
+        self.worker.done.connect(self._on_saved)
+        self.worker.start()
+
+    def _on_saved(self, ok, msg):
+        self.bb.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, "完成", msg)
+            self.accept()
+        else:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
 
 
 # ============================================================
@@ -3019,7 +3415,8 @@ class SshKeysDialog(QDialog):
             parts = line.split(None, 2)
             ktype = parts[0] if len(parts) > 0 else "?"
             comment = parts[2] if len(parts) > 2 else "(無註解)"
-            it = QListWidgetItem(f"{ktype}  {comment}")
+            fp = ssh_fingerprint(line)
+            it = QListWidgetItem(f"{ktype}  {comment}\n    {fp}")
             it.setData(Qt.ItemDataRole.UserRole, line)
             self.list.addItem(it)
 
@@ -3590,6 +3987,16 @@ class MainWindow(QMainWindow):
         self.files_btn.setToolTip("不用 clone，直接列出此庫在預設分支下的所有檔案與大小。")
         self.files_btn.clicked.connect(self.on_repo_files)
         danger_row.addWidget(self.files_btn)
+        self.desc_btn = QPushButton("編輯描述…")
+        self.desc_btn.setEnabled(False)
+        self.desc_btn.setToolTip("讀寫此庫的 description 檔（bare repo 原生機制），用來標註這個倉庫是幹嘛的。")
+        self.desc_btn.clicked.connect(self.on_edit_desc)
+        danger_row.addWidget(self.desc_btn)
+        self.branch_protect_btn = QPushButton("分支保護…")
+        self.branch_protect_btn.setEnabled(False)
+        self.branch_protect_btn.setToolTip("設定 git 原生 receive.denyDeletes / denyNonFastForwards，與 CI 引擎彼此獨立。")
+        self.branch_protect_btn.clicked.connect(self.on_branch_protect)
+        danger_row.addWidget(self.branch_protect_btn)
         self.batch_ci_btn = QPushButton("批次設定 CI…")
         self.batch_ci_btn.setEnabled(False)
         self.batch_ci_btn.setToolTip("對『目前選取的多個』倉庫一次套用同一 CI 規則（可按住 Ctrl/Shift 多選）。")
@@ -3690,9 +4097,17 @@ class MainWindow(QMainWindow):
         self.new_user_btn = QPushButton("新增 git_devs 帳號…")
         self.new_user_btn.setToolTip("查詢 git_devs 現況並產生新增帳號的完整指令，需自行貼到有 sudo 權限的 SSH 視窗執行。")
         self.new_user_btn.clicked.connect(self.on_create_git_devs_user)
+        self.disk_btn = QPushButton("伺服器空間總覽")
+        self.disk_btn.setToolTip("df 可用空間、Git_Server 總用量、各倉庫大小排行前 10 大。")
+        self.disk_btn.clicked.connect(self.on_disk_usage)
+        self.notify_btn = QPushButton("Telegram 通知設定…")
+        self.notify_btn.setToolTip("CI 引擎與 GitHub 鏡像同步腳本共用的 config/tg_bot.conf。")
+        self.notify_btn.clicked.connect(self.on_notify_config)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
         og.addWidget(self.new_user_btn, 0, 2)
+        og.addWidget(self.disk_btn, 1, 0)
+        og.addWidget(self.notify_btn, 1, 1)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視（最後 200 筆）")
@@ -3987,8 +4402,8 @@ class MainWindow(QMainWindow):
         self.search_all_btn.setEnabled(not busy)
         self.activity_btn.setEnabled(not busy)
         self.ssh_keys_btn.setEnabled(not busy)
-        for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.push_log_btn,
-                  self.viol_log_btn, self.dbg_log_btn):
+        for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.notify_btn,
+                  self.push_log_btn, self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
         self.delete_btn.setEnabled(not busy and has_sel)
@@ -4169,6 +4584,8 @@ class MainWindow(QMainWindow):
         self.selftest_btn.setEnabled(has)
         self.detail_btn.setEnabled(has)
         self.files_btn.setEnabled(has)
+        self.desc_btn.setEnabled(has)
+        self.branch_protect_btn.setEnabled(has)
         self.batch_ci_btn.setEnabled(len(self.repo_list.selectedItems()) >= 1)
         self.rename_btn.setEnabled(has)
         self.clone_btn.setEnabled(has)
@@ -4417,6 +4834,15 @@ class MainWindow(QMainWindow):
             return
         self._start_maint("repair", "一鍵修復")
 
+    def on_disk_usage(self):
+        self._start_maint("disk_usage", "伺服器空間總覽")
+
+    def on_notify_config(self):
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = NotifyConfigDialog(self, cfg)
+        dlg.exec()
+
     def on_create_git_devs_user(self):
         cfg = dict(self.collect_identity_cfg())
         self.save_current_profile(silent=True)
@@ -4451,9 +4877,10 @@ class MainWindow(QMainWindow):
         dlg = CreateRepoDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        name, branch, pol = dlg.values()
+        name, branch, pol, add_readme, add_gitignore = dlg.values()
         cfg = dict(self.collect_identity_cfg())
-        cfg.update({"repo_name": name, "branch": branch, "ci_policy": pol})
+        cfg.update({"repo_name": name, "branch": branch, "ci_policy": pol,
+                    "add_readme": add_readme, "add_gitignore": add_gitignore})
         self.save_current_profile(silent=True)
         self.browse_status.setText(f"建立倉庫「{name}」中…")
         self.browse_status.setStyleSheet("")
@@ -4552,6 +4979,71 @@ class MainWindow(QMainWindow):
         self.worker.hooks.connect(self.on_ci_result)
         self.worker.done.connect(self.on_ci_done)
         self.worker.start()
+
+    def on_edit_desc(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_name"] = name
+        self.save_current_profile(silent=True)
+        self._desc_repo_name = name
+        self.browse_status.setText(f"讀取「{name}」描述中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="repo_desc_get")
+        self.worker.log.connect(self.append_log)
+        self.worker.hooks.connect(self._on_desc_fetched)
+        self.worker.done.connect(self._on_desc_get_done)
+        self.worker.start()
+
+    def _on_desc_get_done(self, ok: bool, msg: str):
+        self.set_busy(False)
+        if ok:
+            self.browse_status.setText("")
+        else:
+            self.browse_status.setText("❌ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#b00020;")
+            QMessageBox.warning(self, "讀取失敗", msg)
+
+    def _on_desc_fetched(self, text: str):
+        name = getattr(self, "_desc_repo_name", "")
+        new_text, ok = QInputDialog.getMultiLineText(
+            self, f"編輯描述 — {name}",
+            "此倉庫的描述（寫入 bare repo 的 description 檔，僅供人閱讀，不影響 git 行為）：", text)
+        if not ok:
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_name"] = name
+        cfg["repo_desc"] = new_text
+        self.browse_status.setText(f"更新「{name}」描述中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="repo_desc_set")
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self.on_desc_set_done)
+        self.worker.start()
+
+    def on_desc_set_done(self, ok: bool, msg: str):
+        self.set_busy(False)
+        if ok:
+            self.browse_status.setText("✔ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#1a7f37;")
+        else:
+            self.browse_status.setText("❌ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#b00020;")
+            QMessageBox.warning(self, "更新失敗", msg)
+
+    def on_branch_protect(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = BranchProtectDialog(self, cfg, name)
+        dlg.exec()
 
     def on_repo_files(self):
         name = self._selected_repo_name()
