@@ -82,6 +82,11 @@ _SAFE_NAME_RE = re.compile(r"^[^\W_][\w.-]*$", re.UNICODE)
 def is_safe_name(name: str) -> bool:
     return bool(name) and bool(_SAFE_NAME_RE.match(name)) and name not in (".", "..", "_archived")
 
+
+def shq(value: str) -> str:
+    """把任意字串包成單引號 POSIX shell 字面值，用於分支名、檔案路徑等非白名單值。"""
+    return "'" + value.replace("'", "'\\''") + "'"
+
 # 修補版 CI 引擎（pre-receive.ci）內容，base64 編碼。
 # 一鍵升級時解碼寫入 NAS 的 /volume1/Git_Server/hooks_template/pre-receive.ci。
 # 內容與隨附的 pre-receive.ci 檔一致（含 AUTO_POLICY_LOAD 自載入 policy）。
@@ -333,6 +338,8 @@ class Worker(QThread):
             self._run_repo_detail()
         elif self.mode == "repo_files":
             self._run_repo_files()
+        elif self.mode == "file_content":
+            self._run_file_content()
         elif self.mode == "clone":
             self._run_clone()
         elif self.mode == "create_mirror":
@@ -782,14 +789,11 @@ class Worker(QThread):
             f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
             "branch=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
             "if [ -z \"$branch\" ]; then",
-            "  echo \"（空庫，尚無任何分支/commit，無檔案可列）\"",
+            "  echo \"EMPTY\"",
             "else",
-            "  echo \"== 檔案列表：$name（分支：$branch）==\"",
+            "  echo \"BRANCH\t$branch\"",
             "  git --git-dir=\"$repo\" ls-tree -r -l \"$branch\" | "
-            "awk -F'\\t' '{n=split($1,a,\" \"); size=a[n]; printf \"%8s  %s\\n\", size, $2}'",
-            "  echo",
-            "  cnt=$(git --git-dir=\"$repo\" ls-tree -r --name-only \"$branch\" | wc -l)",
-            "  echo \"共 $cnt 個檔案\"",
+            "awk -F'\\t' '{n=split($1,a,\" \"); size=a[n]; printf \"FILE\\t%s\\t%s\\n\", size, $2}'",
             "fi",
             "echo ___END___",
             "true",
@@ -798,8 +802,47 @@ class Worker(QThread):
         if rc != 0:
             self.done.emit(False, "讀取檔案列表失敗（連線或權限問題）。")
             return
+        body = self._between(out)
+        branch = ""
+        items = []
+        for ln in body.splitlines():
+            p = ln.split("\t")
+            if p[0] == "BRANCH" and len(p) >= 2:
+                branch = p[1]
+            elif p[0] == "FILE" and len(p) >= 3:
+                items.append((p[1], p[2]))
+        self.repos.emit(items)
+        if not branch:
+            self.done.emit(True, f"{name} 是空庫，尚無任何分支/commit，無檔案可列。")
+        else:
+            self.done.emit(True, f"已讀取 {name} 檔案列表（分支：{branch}，共 {len(items)} 個檔案）。")
+
+    # --- 顯示某檔案在 HEAD 版本下的內容（不用 clone）---
+    def _run_file_content(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        path = c.get("file_path", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        if not path:
+            self.done.emit(False, "缺少檔案路徑。")
+            return
+        self.log.emit(f"--- 檔案內容：{name}:{path} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            f"git --git-dir=\"$repo\" show HEAD:{shq(path)} 2>&1",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取檔案內容失敗（連線或權限問題）。")
+            return
         self.hooks.emit(self._between(out))
-        self.done.emit(True, f"已讀取 {name} 檔案列表。")
+        self.done.emit(True, f"已讀取 {path}。")
 
     # --- 從 NAS clone 到本地（本機執行 git clone，走金鑰/plink）---
     def _run_clone(self):
@@ -1462,6 +1505,99 @@ class TextViewDialog(QDialog):
 
     def _copy(self):
         QApplication.clipboard().setText(self._text)
+
+
+# ============================================================
+# 檔案列表對話框（不用 clone，瀏覽 HEAD 下的檔案並可預覽內容）
+# ============================================================
+class RepoFilesDialog(QDialog):
+    def __init__(self, parent, cfg, repo_name):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.repo_name = repo_name
+        self.worker = None
+        self.content_worker = None
+        self.setWindowTitle(f"檔案列表 — {repo_name}")
+        self.resize(560, 480)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("此庫在預設分支（HEAD）下的所有檔案；雙擊或按「檢視內容」可直接預覽，不用 clone。"))
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(self.on_view)
+        lay.addWidget(self.list, stretch=1)
+
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新整理")
+        self.view_b = QPushButton("檢視內容")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.refresh_b)
+        row.addWidget(self.view_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.refresh_b.clicked.connect(self.refresh)
+        self.view_b.clicked.connect(self.on_view)
+        self.close_b.clicked.connect(self.accept)
+        self.refresh()
+
+    def _busy(self, b):
+        for x in (self.refresh_b, self.view_b):
+            x.setEnabled(not b)
+
+    def refresh(self):
+        self.list.clear()
+        self._busy(True)
+        self.status.setText("讀取中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        self.worker = Worker(cfg, mode="repo_files")
+        self.worker.repos.connect(self.on_entries)
+        self.worker.done.connect(self.on_list_done)
+        self.worker.start()
+
+    def on_entries(self, entries):
+        self.list.clear()
+        for size, path in entries:
+            it = QListWidgetItem(f"{size:>10}  {path}")
+            it.setData(Qt.ItemDataRole.UserRole, path)
+            self.list.addItem(it)
+
+    def on_list_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+    def on_view(self):
+        it = self.list.currentItem()
+        if not it:
+            self.status.setText("請先選一個檔案。")
+            return
+        path = it.data(Qt.ItemDataRole.UserRole)
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        cfg["file_path"] = path
+        self._busy(True)
+        self.status.setText(f"讀取「{path}」中…")
+        self.status.setStyleSheet("")
+        self.content_worker = Worker(cfg, mode="file_content")
+        self.content_worker.hooks.connect(lambda text, p=path: self._show_content(p, text))
+        self.content_worker.done.connect(self.on_view_done)
+        self.content_worker.start()
+
+    def _show_content(self, path, text):
+        dlg = TextViewDialog(self, f"{self.repo_name}:{path}", text or "（空檔案）")
+        dlg.exec()
+
+    def on_view_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
 
 
 # ============================================================
@@ -2758,17 +2894,9 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("請先在清單選一個倉庫。")
             return
         cfg = dict(self.collect_identity_cfg())
-        cfg["repo_name"] = name
         self.save_current_profile(silent=True)
-        self._ci_title = f"檔案列表 — {name}"
-        self.browse_status.setText(f"讀取「{name}」檔案列表中…")
-        self.browse_status.setStyleSheet("")
-        self.set_busy(True)
-        self.worker = Worker(cfg, mode="repo_files")
-        self.worker.log.connect(self.append_log)
-        self.worker.hooks.connect(self.on_ci_result)
-        self.worker.done.connect(self.on_ci_done)
-        self.worker.start()
+        dlg = RepoFilesDialog(self, cfg, name)
+        dlg.exec()
 
     # ---------- 從 NAS clone 到本地 ----------
     def on_clone(self):
