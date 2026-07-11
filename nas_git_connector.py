@@ -1429,6 +1429,8 @@ class Worker(QThread):
             "  [ -f \"$repo/hooks/pre-receive\" ] || { msg=\"$msg 缺pre-receive\"; bad=1; }",
             "  g=$(stat -c %G \"$repo\" 2>/dev/null)",
             "  [ \"$g\" = git_devs ] || { msg=\"$msg group=$g\"; bad=1; }",
+            "  sr=$(git --git-dir=\"$repo\" config --get core.sharedRepository 2>/dev/null)",
+            "  [ \"$sr\" = group ] || { msg=\"$msg 未設core.sharedRepository=group（多身份交錯 push 可能卡權限，跑一鍵修復或手動 chmod -R g+rwX 排除）\"; bad=1; }",
             "  [ -n \"$msg\" ] && echo \"[!!] $n:$msg\"",
             "done",
             "[ \"$bad\" = 0 ] && echo '[OK] 所有 repo 的 hook 與群組正常'",
@@ -1461,7 +1463,8 @@ class Worker(QThread):
             "  mkdir -p \"$repo/hooks\"",
             "  [ -f \"$PRE\" ] && { cp \"$PRE\" \"$repo/hooks/pre-receive\"; chmod 750 \"$repo/hooks/pre-receive\"; }",
             "  [ -f \"$POST\" ] && { cp \"$POST\" \"$repo/hooks/post-receive\"; chmod 750 \"$repo/hooks/post-receive\"; }",
-            "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null",
+            "  git --git-dir=\"$repo\" config core.sharedRepository group 2>/dev/null",
+            "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
             "  echo \"[FIX] $n\"",
             "  fixed=$((fixed+1))",
             "done",
@@ -1521,12 +1524,13 @@ class Worker(QThread):
             "repo=\"$BASE/$name\"",
             "if [ -e \"$repo\" ]; then echo EXISTS; echo ___END___; exit 0; fi",
             "git init --bare \"$repo\" >/dev/null 2>&1 || { echo INIT_FAIL; echo ___END___; exit 0; }",
+            "git --git-dir=\"$repo\" config core.sharedRepository group",
             "[ -f \"$BASE/hooks_template/pre-receive.stub\" ] && { cp \"$BASE/hooks_template/pre-receive.stub\" \"$repo/hooks/pre-receive\"; chmod 750 \"$repo/hooks/pre-receive\"; }",
             "[ -f \"$BASE/hooks_template/post-receive\" ] && { cp \"$BASE/hooks_template/post-receive\" \"$repo/hooks/post-receive\"; chmod 750 \"$repo/hooks/post-receive\"; }",
             "git --git-dir=\"$repo\" symbolic-ref HEAD \"refs/heads/$branch\" 2>/dev/null",
             "mkdir -p \"$BASE/ci_policies\"",
             "if [ \"$pol\" != none ]; then printf '# %s\\nPOLICY=%s\\nPROFILE=%s\\n' \"$name\" \"$pol\" \"$pol\" > \"$BASE/ci_policies/$name.policy\"; fi",
-            "chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null",
+            "chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
             "echo ___OK___",
             "echo ___END___",
             "true",
@@ -1729,6 +1733,8 @@ class Worker(QThread):
             if rc != 0:
                 self.done.emit(False, "NAS repo 建立失敗（git init --bare）。")
                 return
+            # 讓 git 之後自己建立的物件檔就是群組可寫，避免不同身份交錯 push 時互卡權限
+            self._ssh(f"git --git-dir='{remote_repo_path}' config core.sharedRepository group")
             # 權限：sudo -n（免密碼）盡力而為，失敗不中斷
             perm_cmd = (
                 f"sudo -n chown -R {user}:git_devs '{remote_repo_path}' 2>/dev/null && "

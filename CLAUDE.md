@@ -36,6 +36,10 @@ The NAS runs a shared `pre-receive.ci` hook engine (one copy for all repos) that
 
 `sync_github_mirrors.sh` is a standalone server-side script (not run from the GUI) meant to be deployed to the NAS at `/volume1/Git_Server/tools/` and scheduled via DSM 任務排程表. It loops all `*.git` repos, skips any without `remote.origin.mirror=true`, and runs `git remote update --prune` on the rest, logging to `logs/mirror_sync.log` and optionally notifying Telegram (reads token/chat id from `config/tg_bot.conf` on the NAS — never hardcode credentials in this script). It's the scheduled counterpart to the GUI's on-demand "同步鏡像" button (`sync_mirrors` Worker mode), which runs the same `remote update --prune` logic over SSH instead of a local cron job.
 
+### Multi-identity push permissions
+
+Repos are pushed to from multiple SSH identities (e.g. 家中/kuoterry and 公司/Git_User1), each a different Unix user sharing the `git_devs` group. Git's default loose-object permissions are owner-only-write, so a bare repo touched by two different users can end up with subdirectories (`objects/xx/`) that one identity can't write into even though both are in `git_devs` — group membership doesn't let you `chmod`/`chown` files you don't own, only root or the owner can. `_run_create_repo` and `_run_connect` set `core.sharedRepository=group` right after `git init --bare` so all objects git creates from then on are group-writable; `_run_repair` re-applies that config to every existing repo, and `_run_healthcheck` flags any repo missing it. None of this retroactively fixes directories that already exist with the wrong mode — that still needs a one-time privileged `chmod -R g+rwX` (as root, or as the original owning identity) on the affected repo.
+
 ### Safety mechanisms baked into the code
 
 - `CONTAINER_ROOTS` (`D:\git`, `D:\GIT`) and disk roots are hard-blocked from being connected as a "project" (`is_container_root`) — prevents accidentally git-initing an entire drive/container folder.
