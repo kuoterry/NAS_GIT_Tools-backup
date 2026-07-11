@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import os
 import sys
@@ -4191,7 +4191,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"NAS Git 專案串接工具 v{__version__}")
-        self.resize(760, 640)
+        self.setMinimumSize(760, 640)
         self.settings = QSettings("TerryTools", "NasGitConnector")
         self._seed_default_profiles()
         self.worker = None
@@ -5668,7 +5668,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     win = MainWindow()
-    win.show()
+    win.showMaximized()  # 自動貼合目前螢幕可用區域，不用每次自己按最大化
     sys.exit(app.exec())
 
 
