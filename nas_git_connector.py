@@ -1533,7 +1533,10 @@ class Worker(QThread):
             "echo ___BEGIN___",
             f"name={shq(name)}",
             "id \"$name\" >/dev/null 2>&1 && echo EXISTS:YES || echo EXISTS:NO",
-            "echo \"MEMBERS:$(getent group git_devs | cut -d: -f4)\"",
+            # 這裡故意不用 getent：部分 DSM 的 SSH 遠端指令環境 PATH 沒收錄 getent，
+            # 會靜默查到空字串，讓後面產生的 synogroup --member 誤把其他人踢出群組。
+            # 直接讀 /etc/group 比較可靠，跟工具其他地方一樣走 grep/cut。
+            "echo \"MEMBERS:$(grep '^git_devs:' /etc/group | cut -d: -f4)\"",
             "echo ___END___",
             "true",
         ])
@@ -3488,8 +3491,10 @@ class CreateGitDevsUserDialog(QDialog):
         lay = QVBoxLayout(self)
         note = QLabel(
             "這個工具沒有免密碼 sudo，沒辦法自己在 NAS 上建帳號。填好下面欄位後按「產生設定指令」，"
-            "工具會先唯讀查一下 git_devs 目前的成員名單與帳號是否已存在，組出完整指令給你複製，"
-            "貼到一個有 sudo 權限的 SSH 視窗執行。"
+            "工具會先唯讀查一下 git_devs 目前的成員名單與帳號是否已存在，組出完整指令給你複製。\n"
+            "拿到指令後請整段一次貼到有 sudo 權限的 SSH 視窗、執行到底，不要自己拆開分段貼或手動改寫其中一行——"
+            "密碼會在執行過程中現場詢問（畫面不顯示字元），不會寫死在指令裡；"
+            "加入 git_devs 群組那一步做完也會自動回讀名單、確認沒有人被誤刪。"
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#666;")
@@ -3579,34 +3584,46 @@ class CreateGitDevsUserDialog(QDialog):
         desc = self.desc_edit.text().strip() or username
         email = self.email_edit.text().strip()
         root = self.cfg.get("remote_root", "/volume1/Git_Server")
-        new_members = " ".join(member_list + [username])
+        all_members = member_list + [username]
+        new_members = " ".join(all_members)
         lines = [
             "# ============================================================",
             f"# 新增 git_devs 帳號：{username}",
-            "# 由 NasGitConnector 產生，這段指令不會自動執行，請貼到有 sudo 權限的 SSH 視窗手動執行。",
+            "# 由 NasGitConnector 產生，這段指令不會自動執行，請整段一次複製貼上到有 sudo 權限的",
+            "# SSH 視窗執行到底（過程中畫面要求輸入密碼時直接打字，Enter 送出，不會顯示字元）。",
             "# synouser 的參數順序可能因 DSM 版本略有不同，若第 1 步報錯，先跑 `synouser --help` 核對。",
             "# ============================================================",
             "",
-            "# 1) 建立 DSM 使用者（自行把 <請設定密碼> 換成實際密碼，不要用明碼存這份指令）",
+            "# 1) 建立 DSM 使用者（畫面會現場問密碼，不會把密碼寫死在這份腳本裡）",
         ]
         if exists:
-            lines.append(f"#    帳號 {username} 已存在，這行可能不需要，請自行判斷是否跳過：")
-        lines.append(
-            f"sudo synouser --add {username} '<請設定密碼>' \"{desc}\" \"{email}\" 0 0"
-        )
+            lines.append(f"#    帳號 {username} 已存在，這段可能不需要，請自行判斷是否跳過：")
         lines += [
+            f'echo "請輸入 {username} 的新密碼（不會顯示字元，輸入完按 Enter）："',
+            "read -s NEWPW; echo",
+            f'sudo synouser --add {username} "$NEWPW" "{desc}" "{email}" 0 0',
+            "unset NEWPW",
             "",
             "# 2) 加入 git_devs 群組",
             "#    注意：synogroup --member 是「整批覆蓋」不是「附加」！",
-            f"#    以下已經把查詢到的既有成員（{', '.join(member_list) or '（目前查不到既有成員，請自行確認）'}）都列進去，",
-            "#    執行前務必再核對一次目前成員名單（getent group git_devs），漏打會把其他人踢出群組。",
+            f"#    以下已經把產生指令當下查到的既有成員（{', '.join(member_list) or '（查不到既有成員——如果你知道應該有人，先手動核對 /etc/group 再繼續，不要照跑下一行）'}）都列進去。",
             f"sudo synogroup --member git_devs {new_members}",
+            "#    執行完立刻回讀名單自我檢查，任何一個原本該在的人不見了就大聲警告：",
+            "AFTER_MEMBERS=$(grep '^git_devs:' /etc/group | cut -d: -f4)",
+            f"for m in {new_members}; do",
+            '  case ",$AFTER_MEMBERS," in',
+            '    *",$m,"*) ;;',
+            '    *) echo "‼️  警告：$m 不在更新後的 git_devs 名單裡（目前：$AFTER_MEMBERS），可能被踢出，請立刻人工確認並補回！" ;;',
+            "  esac",
+            "done",
+            'echo "目前 git_devs 成員：$AFTER_MEMBERS"',
             "",
             "# 3) 確認實際 home 目錄（不同 DSM 設定可能不是 /var/services/homes/<帳號>）",
-            f"getent passwd {username}",
+            f"HOME_DIR=$(grep \"^{username}:\" /etc/passwd | cut -d: -f6)",
+            f'[ -z "$HOME_DIR" ] && HOME_DIR=/var/services/homes/{username}',
+            'echo "偵測到的 home 目錄：$HOME_DIR"',
             "",
-            "# 4) 設定 SSH 金鑰登入（HOME 請依上一步實際查到的路徑調整）",
-            f"HOME_DIR=/var/services/homes/{username}",
+            "# 4) 設定 SSH 金鑰登入",
             'sudo mkdir -p "$HOME_DIR/.ssh"',
             f"sudo sh -c 'cat > \"$HOME_DIR/.ssh/authorized_keys\"' <<'EOF'",
             pubkey,
