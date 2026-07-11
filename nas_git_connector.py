@@ -26,6 +26,8 @@ import socket
 import shutil
 import platform
 import subprocess
+import base64
+import hashlib
 from datetime import datetime
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
@@ -389,6 +391,10 @@ class Worker(QThread):
             self._run_set_ci_batch()
         elif self.mode == "repo_detail":
             self._run_repo_detail()
+        elif self.mode == "repo_desc_get":
+            self._run_repo_desc_get()
+        elif self.mode == "repo_desc_set":
+            self._run_repo_desc_set()
         elif self.mode == "repo_files":
             self._run_repo_files()
         elif self.mode == "file_content":
@@ -881,6 +887,9 @@ class Worker(QThread):
             "echo \"== 倉庫明細：$name ==\"",
             "echo \"大小：$(du -sh \"$repo\" 2>/dev/null | cut -f1)\"",
             "echo \"預設分支(HEAD)：$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)\"",
+            "desc=$(cat \"$repo/description\" 2>/dev/null)",
+            "case \"$desc\" in Unnamed\\ repository*|'') desc='（未設定）';; esac",
+            "echo \"描述：$desc\"",
             "pf=\"$BASE/ci_policies/$name.policy\"; pol=none; [ -f \"$pf\" ] && pol=$(sed -n 's/^[[:space:]]*POLICY=//p' \"$pf\" | head -1)",
             "echo \"CI policy：${pol:-none}\"",
             "echo",
@@ -903,6 +912,52 @@ class Worker(QThread):
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {name} 明細。")
+
+    # --- 讀取 repo 描述（bare repo 的 description 檔）---
+    def _run_repo_desc_get(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"f='{root}/{name}/description'",
+            "if [ -f \"$f\" ]; then cat \"$f\"; fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取描述失敗（連線或權限問題）。")
+            return
+        text = self._between(out)
+        if text.startswith("Unnamed repository"):
+            text = ""
+        self.hooks.emit(text)
+        self.done.emit(True, "已讀取描述。")
+
+    # --- 寫入 repo 描述（走 base64 避免多行/引號問題）---
+    def _run_repo_desc_set(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        desc = c.get("repo_desc", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        self.log.emit(f"--- 更新描述：{name} ---")
+        b64 = base64.b64encode(desc.encode("utf-8")).decode("ascii")
+        cmd = "\n".join([
+            f"f='{root}/{name}/description'",
+            f"printf '%s' '{b64}' | base64 -d > \"$f\" && echo ___OK___",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc == 0 and "___OK___" in out:
+            self.done.emit(True, f"已更新「{name}」的描述。")
+        else:
+            self.done.emit(False, "更新描述失敗（連線或權限問題）。")
 
     # --- 列出 repo 在預設分支下所有檔案（不用 clone）---
     def _run_repo_files(self):
@@ -3590,6 +3645,11 @@ class MainWindow(QMainWindow):
         self.files_btn.setToolTip("不用 clone，直接列出此庫在預設分支下的所有檔案與大小。")
         self.files_btn.clicked.connect(self.on_repo_files)
         danger_row.addWidget(self.files_btn)
+        self.desc_btn = QPushButton("編輯描述…")
+        self.desc_btn.setEnabled(False)
+        self.desc_btn.setToolTip("讀寫此庫的 description 檔（bare repo 原生機制），用來標註這個倉庫是幹嘛的。")
+        self.desc_btn.clicked.connect(self.on_edit_desc)
+        danger_row.addWidget(self.desc_btn)
         self.batch_ci_btn = QPushButton("批次設定 CI…")
         self.batch_ci_btn.setEnabled(False)
         self.batch_ci_btn.setToolTip("對『目前選取的多個』倉庫一次套用同一 CI 規則（可按住 Ctrl/Shift 多選）。")
@@ -4169,6 +4229,7 @@ class MainWindow(QMainWindow):
         self.selftest_btn.setEnabled(has)
         self.detail_btn.setEnabled(has)
         self.files_btn.setEnabled(has)
+        self.desc_btn.setEnabled(has)
         self.batch_ci_btn.setEnabled(len(self.repo_list.selectedItems()) >= 1)
         self.rename_btn.setEnabled(has)
         self.clone_btn.setEnabled(has)
@@ -4552,6 +4613,61 @@ class MainWindow(QMainWindow):
         self.worker.hooks.connect(self.on_ci_result)
         self.worker.done.connect(self.on_ci_done)
         self.worker.start()
+
+    def on_edit_desc(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_name"] = name
+        self.save_current_profile(silent=True)
+        self._desc_repo_name = name
+        self.browse_status.setText(f"讀取「{name}」描述中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="repo_desc_get")
+        self.worker.log.connect(self.append_log)
+        self.worker.hooks.connect(self._on_desc_fetched)
+        self.worker.done.connect(self._on_desc_get_done)
+        self.worker.start()
+
+    def _on_desc_get_done(self, ok: bool, msg: str):
+        self.set_busy(False)
+        if ok:
+            self.browse_status.setText("")
+        else:
+            self.browse_status.setText("❌ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#b00020;")
+            QMessageBox.warning(self, "讀取失敗", msg)
+
+    def _on_desc_fetched(self, text: str):
+        name = getattr(self, "_desc_repo_name", "")
+        new_text, ok = QInputDialog.getMultiLineText(
+            self, f"編輯描述 — {name}",
+            "此倉庫的描述（寫入 bare repo 的 description 檔，僅供人閱讀，不影響 git 行為）：", text)
+        if not ok:
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_name"] = name
+        cfg["repo_desc"] = new_text
+        self.browse_status.setText(f"更新「{name}」描述中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="repo_desc_set")
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self.on_desc_set_done)
+        self.worker.start()
+
+    def on_desc_set_done(self, ok: bool, msg: str):
+        self.set_busy(False)
+        if ok:
+            self.browse_status.setText("✔ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#1a7f37;")
+        else:
+            self.browse_status.setText("❌ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#b00020;")
+            QMessageBox.warning(self, "更新失敗", msg)
 
     def on_repo_files(self):
         name = self._selected_repo_name()
