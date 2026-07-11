@@ -91,6 +91,16 @@ def shq(value: str) -> str:
     """把任意字串包成單引號 POSIX shell 字面值，用於分支名、檔案路徑等非白名單值。"""
     return "'" + value.replace("'", "'\\''") + "'"
 
+
+def fmt_size_kb(kb: int) -> str:
+    """把 du -sk 回傳的 KB 數字格式化成人類可讀大小（K/M/G）。"""
+    v = float(kb)
+    for unit in ("K", "M", "G", "T"):
+        if v < 1024 or unit == "T":
+            return f"{v:.0f}{unit}" if unit == "K" else f"{v:.1f}{unit}"
+        v /= 1024
+    return f"{v:.1f}T"
+
 # 修補版 CI 引擎（pre-receive.ci）內容，base64 編碼。
 # 一鍵升級時解碼寫入 NAS 的 /volume1/Git_Server/hooks_template/pre-receive.ci。
 # 內容與隨附的 pre-receive.ci 檔一致（含 AUTO_POLICY_LOAD 自載入 policy）。
@@ -330,6 +340,8 @@ class Worker(QThread):
             self._run_list()
         elif self.mode == "delete":
             self._run_delete()
+        elif self.mode == "rename_repo":
+            self._run_rename_repo()
         elif self.mode == "hooks":
             self._run_hooks()
         elif self.mode == "ci_status":
@@ -435,11 +447,12 @@ class Worker(QThread):
             "  [ -z \"$pol\" ] && pol=none",
             "  mu=''",
             "  [ \"$(git --git-dir=\"$d\" config --get remote.origin.mirror 2>/dev/null)\" = true ] && mu=$(git --git-dir=\"$d\" config --get remote.origin.url 2>/dev/null)",
+            "  sz=$(du -sk \"$d\" 2>/dev/null | cut -f1); [ -z \"$sz\" ] && sz=0",
             "  if [ -z \"$info\" ]; then",
-            "    printf '%s\\t%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\" \"$mu\"",
+            "    printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\" \"$mu\" \"$sz\"",
             "  else",
             "    dt=${info%%|*}; br=${info#*|}",
-            "    printf '%s\\t%s (%s)\\t%s\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\" \"$mu\"",
+            "    printf '%s\\t%s (%s)\\t%s\\t%s\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\" \"$mu\" \"$sz\"",
             "  fi",
             "done",
             "echo ___END___",
@@ -468,7 +481,11 @@ class Worker(QThread):
             status = parts[1].strip() if len(parts) > 1 else ""
             pol = parts[2].strip() if len(parts) > 2 else "none"
             mirror = parts[3].strip() if len(parts) > 3 else ""
-            items.append((name, status, pol, mirror))
+            try:
+                size_kb = int(parts[4].strip()) if len(parts) > 4 else 0
+            except ValueError:
+                size_kb = 0
+            items.append((name, status, pol, mirror, size_kb))
         items.sort(key=lambda t: t[0].lower())
         self.repos.emit(items)
         n_empty = sum(1 for t in items if t[1].startswith("空庫"))
@@ -518,6 +535,49 @@ class Worker(QThread):
             self.done.emit(True, okmsg)
         else:
             self.done.emit(False, f"處理失敗（可能是權限或磁碟空間問題）：{name}")
+
+    # --- 重新命名倉庫（含同步改 ci_policies/<repo>.policy 檔名）---
+    def _run_rename_repo(self):
+        c = self.cfg
+        root = c["remote_root"]
+        old_name = c.get("repo_name", "")
+        new_name = c.get("new_name", "")
+        if not new_name.endswith(".git"):
+            new_name += ".git"
+        if not is_safe_name(old_name):
+            self.done.emit(False, f"倉庫名稱不合規：{old_name!r}")
+            return
+        if not is_safe_name(new_name):
+            self.done.emit(False, f"新名稱不合規（僅允許中英數字與 . _ -，須以中英數開頭）：{new_name!r}")
+            return
+        if old_name == new_name:
+            self.done.emit(False, "新舊名稱相同，未執行。")
+            return
+        old_path = f"{root}/{old_name}"
+        new_path = f"{root}/{new_name}"
+        self.log.emit(f"--- 重新命名：{old_name} → {new_name} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"old='{old_path}'; new='{new_path}'",
+            "[ -e \"$old/HEAD\" ] || { echo NOTREPO; echo ___END___; exit 0; }",
+            "[ -e \"$new\" ] && { echo TARGET_EXISTS; echo ___END___; exit 0; }",
+            "mv \"$old\" \"$new\" && echo MOVED",
+            f"oldpf='{root}/ci_policies/{old_name}.policy'; newpf='{root}/ci_policies/{new_name}.policy'",
+            "[ -f \"$oldpf\" ] && mv \"$oldpf\" \"$newpf\"",
+            "echo ___OK___",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        body = self._between(out)
+        if rc == 0 and "___OK___" in body:
+            self.done.emit(True, f"已重新命名：{old_name} → {new_name}")
+        elif "TARGET_EXISTS" in body:
+            self.done.emit(False, f"重新命名失敗：目標名稱已存在（{new_name}）。")
+        elif "NOTREPO" in body:
+            self.done.emit(False, f"找不到、或不是有效的裸倉庫：{old_name}")
+        else:
+            self.done.emit(False, "重新命名失敗（連線或權限問題）。")
 
     # --- 讀取該庫的 CI 規則（server-side hook 內容）---
     def _run_hooks(self):
@@ -3042,6 +3102,9 @@ class MainWindow(QMainWindow):
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("輸入關鍵字即時篩選…")
         self.filter_edit.textChanged.connect(self.apply_repo_filter)
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["排序：名稱", "排序：大小（大到小）", "排序：最近活動"])
+        self.sort_combo.currentIndexChanged.connect(lambda _=None: self.apply_repo_filter(self.filter_edit.text()))
         self.mirror_reg_btn = QPushButton("註冊鏡像…")
         self.mirror_reg_btn.setToolTip("讓 NAS 直接對應一個 GitHub 倉庫（git clone --mirror）。")
         self.mirror_reg_btn.clicked.connect(self.on_create_mirror)
@@ -3053,6 +3116,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.ci_status_btn)
         top_row.addWidget(self.upgrade_btn)
         top_row.addWidget(self.filter_edit, stretch=1)
+        top_row.addWidget(self.sort_combo)
         bp.addLayout(top_row)
 
         top_row2 = QHBoxLayout()
@@ -3100,6 +3164,11 @@ class MainWindow(QMainWindow):
         self.batch_ci_btn.setToolTip("對『目前選取的多個』倉庫一次套用同一 CI 規則（可按住 Ctrl/Shift 多選）。")
         self.batch_ci_btn.clicked.connect(self.on_set_ci_batch)
         danger_row.addWidget(self.batch_ci_btn)
+        self.rename_btn = QPushButton("重新命名…")
+        self.rename_btn.setEnabled(False)
+        self.rename_btn.setToolTip("真正 rename 這個倉庫（含同步改 ci_policies/<repo>.policy 檔名），不是封存再重建。")
+        self.rename_btn.clicked.connect(self.on_rename_repo)
+        danger_row.addWidget(self.rename_btn)
         danger_row.addStretch(1)
         self.delete_btn = QPushButton("安全下庄 / 刪除此倉庫…")
         self.delete_btn.setEnabled(False)
@@ -3490,6 +3559,7 @@ class MainWindow(QMainWindow):
         self.detail_btn.setEnabled(not busy and has_sel)
         self.files_btn.setEnabled(not busy and has_sel)
         self.batch_ci_btn.setEnabled(not busy and has_sel)
+        self.rename_btn.setEnabled(not busy and has_sel)
         self.clone_btn.setEnabled(not busy and has_sel)
         self.log_btn.setEnabled(not busy and has_sel)
         self.merged_btn.setEnabled(not busy and has_sel)
@@ -3560,7 +3630,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_repos(self, items: list):
-        # items: (name, status, policy, mirror_url)；容錯舊格式
+        # items: (name, status, policy, mirror_url, size_kb)；容錯舊格式
         norm = []
         for it in items:
             if isinstance(it, (list, tuple)):
@@ -3568,9 +3638,13 @@ class MainWindow(QMainWindow):
                 status = str(it[1]) if len(it) > 1 else ""
                 pol = str(it[2]) if len(it) > 2 else "none"
                 mirror = str(it[3]) if len(it) > 3 else ""
-                norm.append((name, status, pol, mirror))
+                try:
+                    size_kb = int(it[4]) if len(it) > 4 else 0
+                except (TypeError, ValueError):
+                    size_kb = 0
+                norm.append((name, status, pol, mirror, size_kb))
             else:
-                norm.append((str(it), "", "none", ""))
+                norm.append((str(it), "", "none", "", 0))
         self._all_repos = norm
         self.apply_repo_filter(self.filter_edit.text())
 
@@ -3586,15 +3660,25 @@ class MainWindow(QMainWindow):
 
     def apply_repo_filter(self, text: str):
         text = (text or "").strip().lower()
+        rows = [r for r in self._all_repos if not text or text in r[0].lower()]
+        sort_idx = self.sort_combo.currentIndex() if hasattr(self, "sort_combo") else 0
+        if sort_idx == 1:  # 大小（大到小）
+            rows.sort(key=lambda r: r[4], reverse=True)
+        elif sort_idx == 2:  # 最近活動（依 status 裡的日期，新到舊；空庫排最後）
+            def activity_key(r):
+                m = re.match(r"^(\d{4}-\d{2}-\d{2})", r[1])
+                return (0, m.group(1)) if m else (1, "")
+            rows.sort(key=activity_key, reverse=True)
+        else:  # 名稱
+            rows.sort(key=lambda r: r[0].lower())
         self.repo_list.clear()
-        for name, status, pol, mirror in self._all_repos:
-            if text and text not in name.lower():
-                continue
+        for name, status, pol, mirror, size_kb in rows:
             ci = {"soft": "CI:soft", "strict": "CI:strict"}.get(pol, "CI:—")
             parts = [name]
             if status:
                 parts.append(status)
             parts.append(ci)
+            parts.append(fmt_size_kb(size_kb))
             if mirror:
                 parts.append("↺鏡像")
             it = QListWidgetItem("    ·    ".join(parts))
@@ -3647,6 +3731,7 @@ class MainWindow(QMainWindow):
         self.detail_btn.setEnabled(has)
         self.files_btn.setEnabled(has)
         self.batch_ci_btn.setEnabled(len(self.repo_list.selectedItems()) >= 1)
+        self.rename_btn.setEnabled(has)
         self.clone_btn.setEnabled(has)
         self.log_btn.setEnabled(has)
         self.merged_btn.setEnabled(has)
@@ -3706,6 +3791,40 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
             QMessageBox.warning(self, "未完成", msg)
+
+    # ---------- 重新命名倉庫 ----------
+    def on_rename_repo(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        current = name[:-4] if name.endswith(".git") else name
+        new_name, ok = QInputDialog.getText(self, "重新命名倉庫", f"「{current}」的新名稱：", text=current)
+        new_name = new_name.strip()
+        if not ok or not new_name or new_name == current:
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_name"] = name
+        cfg["new_name"] = new_name
+        self.save_current_profile(silent=True)
+        self.browse_status.setText(f"重新命名「{name}」中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="rename_repo")
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self.on_rename_done)
+        self.worker.start()
+
+    def on_rename_done(self, ok: bool, msg: str):
+        self.set_busy(False)
+        if ok:
+            self.browse_status.setText("✔ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#1a7f37;")
+            self.on_refresh()
+        else:
+            self.browse_status.setText("❌ " + msg.replace("\n", "　"))
+            self.browse_status.setStyleSheet("color:#b00020;")
+            QMessageBox.warning(self, "重新命名失敗", msg)
 
     # ---------- 檢視 CI 規則 / Hook ----------
     def on_view_ci(self):
