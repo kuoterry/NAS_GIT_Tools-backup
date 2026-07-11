@@ -50,6 +50,21 @@ CONTAINER_ROOTS = [
 # 封存區保留政策提醒：項目封存超過這麼多天，就在封存區清單上標記提醒（僅提醒，不自動清除）。
 ARCHIVE_STALE_DAYS = 90
 
+# 本機操作稽核 log：這套工具做的破壞性動作（刪 repo、砍 tag、砍 SSH 金鑰、批次清封存、GC 等）
+# NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
+AUDIT_LOG_PATH = os.path.join(os.path.expanduser("~"), ".nas_git_connector", "audit.log")
+DESTRUCTIVE_MODES = {"delete", "rename_repo", "repo_gc", "tag_delete", "ssh_keys_delete", "archive_purge"}
+
+
+def audit_log(user: str, host: str, action: str, detail: str):
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{ts}\t{user}@{host}\t{action}\t{detail}\n")
+    except OSError:
+        pass
+
 # ============================================================
 # 預設身份(Profile)：第一次執行會自動建立。
 # 每個身份各自記住自己的 SSH 使用者 / 主機 / 根目錄。
@@ -2510,6 +2525,8 @@ class TagDialog(QDialog):
     def _on_delete_done(self, ok, msg):
         self.on_done(ok, msg)
         if ok:
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "tag_delete",
+                      f"{self.repo_name}: {msg}".replace("\n", " "))
             self.refresh()
 
 
@@ -2748,6 +2765,8 @@ class ArchiveDialog(QDialog):
             msg += f"\n其中 {n_stale} 個已封存超過 {ARCHIVE_STALE_DAYS} 天（見 ⚠ 標記），建議檢查是否可清理。"
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#b06000;" if (ok and n_stale) else ("color:#1a7f37;" if ok else "color:#b00020;"))
+        if ok and self.worker and self.worker.mode == "archive_purge":
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "archive_purge", msg.replace("\n", " "))
         if ok and self.worker and self.worker.mode in ("archive_restore", "archive_purge"):
             self.refresh()
 
@@ -2794,6 +2813,7 @@ class ArchiveDialog(QDialog):
             self.refresh()
             return
         name = self._purge_queue.pop(0)
+        self._purging_name = name
         self.status.setText(f"刪除中… {name}（剩 {len(self._purge_queue) + 1} 個）")
         self.status.setStyleSheet("")
         cfg = dict(self.cfg)
@@ -2805,6 +2825,8 @@ class ArchiveDialog(QDialog):
     def _on_bulk_purge_one_done(self, ok, msg):
         if ok:
             self._purge_ok += 1
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "archive_purge",
+                      getattr(self, "_purging_name", "").replace("\n", " ") + " (批次清理)")
         else:
             self._purge_fail += 1
         self._run_next_purge()
@@ -2970,6 +2992,7 @@ class SshKeysDialog(QDialog):
             return
         cfg = dict(self.cfg)
         cfg["key_line"] = line
+        self._deleting_line = line
         self._busy(True)
         self.status.setText("刪除中…")
         self.status.setStyleSheet("")
@@ -2980,6 +3003,8 @@ class SshKeysDialog(QDialog):
     def _on_delete_done(self, ok, msg):
         self.on_done(ok, msg)
         if ok:
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "ssh_keys_delete",
+                      getattr(self, "_deleting_line", "").replace("\n", " "))
             self.refresh()
 
 
@@ -3457,9 +3482,13 @@ class MainWindow(QMainWindow):
         self.viol_log_btn.clicked.connect(lambda: self.on_view_log("ci_violation.log", "CI 違規日誌"))
         self.dbg_log_btn = QPushButton("post-receive 除錯日誌")
         self.dbg_log_btn.clicked.connect(lambda: self.on_view_log("post_receive_debug.log", "post-receive 除錯日誌"))
+        self.audit_log_btn = QPushButton("本機操作稽核紀錄")
+        self.audit_log_btn.setToolTip("這套工具在本機做過的刪除/砍 tag/砍金鑰/GC/批次清封存等破壞性動作紀錄。")
+        self.audit_log_btn.clicked.connect(self.on_view_audit_log)
         lg.addWidget(self.push_log_btn, 0, 0)
         lg.addWidget(self.viol_log_btn, 0, 1)
         lg.addWidget(self.dbg_log_btn, 0, 2)
+        lg.addWidget(self.audit_log_btn, 1, 0)
         mp.addWidget(log_box)
 
         self.maint_status = QLabel("維運動作都會走目前選定的身份（金鑰/plink）。")
@@ -3974,6 +4003,8 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
+            c = self.collect_identity_cfg()
+            audit_log(c.get("user", ""), c.get("host", ""), "delete", msg.replace("\n", " "))
             QMessageBox.information(self, "完成", msg)
             self.on_refresh()  # 重新列出，讓清單即時更新
         else:
@@ -4009,6 +4040,8 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
+            c = self.collect_identity_cfg()
+            audit_log(c.get("user", ""), c.get("host", ""), "rename_repo", msg.replace("\n", " "))
             self.on_refresh()
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
@@ -4057,6 +4090,9 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
+            if self.worker and self.worker.mode in DESTRUCTIVE_MODES:
+                c = self.collect_identity_cfg()
+                audit_log(c.get("user", ""), c.get("host", ""), self.worker.mode, msg.replace("\n", " "))
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
@@ -4162,6 +4198,16 @@ class MainWindow(QMainWindow):
 
     def on_view_log(self, logfile, title):
         self._start_maint("log", title, extra={"logfile": logfile, "log_lines": 200})
+
+    def on_view_audit_log(self):
+        try:
+            with open(AUDIT_LOG_PATH, encoding="utf-8") as f:
+                text = f.read().strip()
+        except OSError:
+            text = ""
+        dlg = TextViewDialog(self, "本機操作稽核紀錄",
+                              text or f"（目前沒有紀錄，檔案：{AUDIT_LOG_PATH}）")
+        dlg.exec()
 
     def on_maint_done(self, ok: bool, msg: str):
         self.set_busy(False)
