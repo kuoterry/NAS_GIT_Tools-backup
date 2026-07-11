@@ -441,6 +441,8 @@ class Worker(QThread):
             self._run_upgrade_engine()
         elif self.mode == "healthcheck":
             self._run_healthcheck()
+        elif self.mode == "disk_usage":
+            self._run_disk_usage()
         elif self.mode == "repair":
             self._run_repair()
         elif self.mode == "log":
@@ -1710,6 +1712,31 @@ class Worker(QThread):
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, "健康檢查完成。")
+
+    # --- 伺服器總儲存空間總覽（檔案系統可用空間 + 總用量 + 最大的幾個 repo）---
+    def _run_disk_usage(self):
+        root = self.cfg["remote_root"]
+        self.log.emit("--- 伺服器空間總覽 ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'",
+            "echo '== 檔案系統可用空間 (df -h) =='",
+            "df -h \"$BASE\" 2>/dev/null",
+            "echo",
+            "echo '== Git_Server 總用量 =='",
+            "du -sh \"$BASE\" 2>/dev/null",
+            "echo",
+            "echo '== 各倉庫大小排行（前 10 大）=='",
+            "for d in \"$BASE\"/*.git; do [ -d \"$d\" ] || continue; du -sh \"$d\" 2>/dev/null; done | sort -rh | head -10",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取伺服器空間資訊失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out))
+        self.done.emit(True, "已讀取伺服器空間總覽。")
 
     # --- 一鍵修復（套用 template hook + 修群組權限）---
     def _run_repair(self):
@@ -3886,9 +3913,13 @@ class MainWindow(QMainWindow):
         self.new_user_btn = QPushButton("新增 git_devs 帳號…")
         self.new_user_btn.setToolTip("查詢 git_devs 現況並產生新增帳號的完整指令，需自行貼到有 sudo 權限的 SSH 視窗執行。")
         self.new_user_btn.clicked.connect(self.on_create_git_devs_user)
+        self.disk_btn = QPushButton("伺服器空間總覽")
+        self.disk_btn.setToolTip("df 可用空間、Git_Server 總用量、各倉庫大小排行前 10 大。")
+        self.disk_btn.clicked.connect(self.on_disk_usage)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
         og.addWidget(self.new_user_btn, 0, 2)
+        og.addWidget(self.disk_btn, 1, 0)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視（最後 200 筆）")
@@ -4183,7 +4214,7 @@ class MainWindow(QMainWindow):
         self.search_all_btn.setEnabled(not busy)
         self.activity_btn.setEnabled(not busy)
         self.ssh_keys_btn.setEnabled(not busy)
-        for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.push_log_btn,
+        for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.push_log_btn,
                   self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
@@ -4614,6 +4645,9 @@ class MainWindow(QMainWindow):
         if r != QMessageBox.StandardButton.Yes:
             return
         self._start_maint("repair", "一鍵修復")
+
+    def on_disk_usage(self):
+        self._start_maint("disk_usage", "伺服器空間總覽")
 
     def on_create_git_devs_user(self):
         cfg = dict(self.collect_identity_cfg())
