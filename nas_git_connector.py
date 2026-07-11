@@ -475,6 +475,8 @@ class Worker(QThread):
             self._run_prep_new_user()
         elif self.mode == "local_gen_ssh_key":
             self._run_local_gen_ssh_key()
+        elif self.mode == "list_git_devs_users":
+            self._run_list_git_devs_users()
         elif self.mode == "clone":
             self._run_clone()
         elif self.mode == "create_mirror":
@@ -1598,6 +1600,39 @@ class Worker(QThread):
             return
         self.hooks.emit(pubkey)
         self.done.emit(True, f"已產生金鑰對：\n私鑰：{path}\n公鑰：{pub_path}")
+
+    # --- 列出 git_devs 群組目前所有成員（含 uid/home/金鑰數，唯讀）---
+    def _run_list_git_devs_users(self):
+        self.log.emit("--- 查詢 git_devs 帳號清單 ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            "members=$(grep '^git_devs:' /etc/group | cut -d: -f4)",
+            "old_ifs=$IFS; IFS=','",
+            "for u in $members; do",
+            "  [ -z \"$u\" ] && continue",
+            "  line=$(grep \"^$u:\" /etc/passwd)",
+            "  uid=$(echo \"$line\" | cut -d: -f3)",
+            "  home=$(echo \"$line\" | cut -d: -f6)",
+            "  nkeys=$( [ -f \"$home/.ssh/authorized_keys\" ] && grep -vE '^#|^$' \"$home/.ssh/authorized_keys\" 2>/dev/null | wc -l )",
+            "  printf '%s\\t%s\\t%s\\t%s\\n' \"$u\" \"${uid:-?}\" \"${home:-?}\" \"${nkeys:-0}\"",
+            "done",
+            "IFS=$old_ifs",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.repos.emit([])
+            self.done.emit(False, "查詢失敗（連線或權限問題）。")
+            return
+        body = self._between(out)
+        items = []
+        for ln in body.splitlines():
+            parts = ln.split("\t")
+            if len(parts) >= 4:
+                items.append((parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()))
+        self.repos.emit(items)
+        self.done.emit(True, f"共 {len(items)} 個 git_devs 帳號。")
 
     # --- 從 NAS clone 到本地（本機執行 git clone，走金鑰/plink）---
     def _run_clone(self):
@@ -3745,6 +3780,259 @@ class CreateGitDevsUserDialog(QDialog):
 
 
 # ============================================================
+# git_devs 帳號清單檢視（唯讀）+ 移除帳號入口
+# ============================================================
+class GitDevsUsersDialog(QDialog):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.worker = None
+        self.setWindowTitle("git_devs 帳號清單")
+        self.resize(580, 420)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("目前 git_devs 群組的所有成員（含 home 目錄與 authorized_keys 金鑰數）。選一個可以移除。"))
+        self.list = QListWidget()
+        lay.addWidget(self.list, stretch=1)
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新整理")
+        self.remove_b = QPushButton("移除選取帳號…")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.refresh_b)
+        row.addWidget(self.remove_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.refresh_b.clicked.connect(self.refresh)
+        self.remove_b.clicked.connect(self.on_remove)
+        self.close_b.clicked.connect(self.accept)
+        self.refresh()
+
+    def _busy(self, b):
+        for x in (self.refresh_b, self.remove_b):
+            x.setEnabled(not b)
+
+    def refresh(self):
+        self.list.clear()
+        self._busy(True)
+        self.status.setText("讀取中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        self.worker = Worker(cfg, mode="list_git_devs_users")
+        self.worker.repos.connect(self.on_entries)
+        self.worker.done.connect(self.on_done)
+        self.worker.start()
+
+    def on_entries(self, entries):
+        self.list.clear()
+        for username, uid, home, nkeys in entries:
+            it = QListWidgetItem(f"{username}    uid={uid}    home={home}    金鑰數={nkeys}")
+            it.setData(Qt.ItemDataRole.UserRole, username)
+            self.list.addItem(it)
+
+    def on_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+    def on_remove(self):
+        it = self.list.currentItem()
+        if not it:
+            self.status.setText("請先在清單選一個帳號。")
+            return
+        username = it.data(Qt.ItemDataRole.UserRole)
+        dlg = RemoveGitDevsUserDialog(self, self.cfg, username)
+        dlg.exec()
+        self.refresh()
+
+
+# ============================================================
+# 移除 git_devs 帳號：查詢現況 + 產生指令（做法比照新增，工具本身不執行）
+# ============================================================
+class RemoveGitDevsUserDialog(QDialog):
+    def __init__(self, parent, cfg, username):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.username = username
+        self.worker = None
+        self.setWindowTitle(f"移除 git_devs 帳號 — {username}")
+        self.setMinimumWidth(520)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "跟新增帳號一樣，這套工具不會自動執行——會先唯讀查詢目前 git_devs 名單，"
+            "組出移除指令給你複製，貼到有 sudo 權限的 SSH 視窗一次執行到底。\n"
+            "注意：移除 git_devs 只會收回這個帳號 push 倉庫的權限，帳號本身如果沒勾下面選項，"
+            "還是可以用同一把 SSH 金鑰登入 NAS shell——真的要徹底切斷存取，要連帳號一起刪。"))
+        self.cb_delete_account = QCheckBox("同時刪除 DSM 帳號本身（synouser --del，不可逆）")
+        self.cb_delete_account.setToolTip("不勾的話只是把帳號踢出 git_devs、收回 push 權限，帳號本身還在，比較容易復原。")
+        lay.addWidget(self.cb_delete_account)
+        row = QHBoxLayout()
+        self.gen_b = QPushButton("產生設定指令")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.gen_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.gen_b.clicked.connect(self.on_generate)
+        self.close_b.clicked.connect(self.accept)
+
+    def on_generate(self):
+        if self.username in ("kuoterry", "Git_User1"):
+            r = QMessageBox.question(
+                self, "確認",
+                f"「{self.username}」是這套工具預設身份使用的帳號之一，移除後這個身份會失去 push 權限。"
+                "確定要繼續嗎？")
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        self.gen_b.setEnabled(False)
+        self.status.setText("查詢 git_devs 現況中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["new_user"] = self.username
+        self.worker = Worker(cfg, mode="prep_new_user")
+        self.worker.hooks.connect(self._on_queried)
+        self.worker.done.connect(self.on_query_done)
+        self.worker.start()
+
+    def on_query_done(self, ok, msg):
+        self.gen_b.setEnabled(True)
+        if not ok:
+            self.status.setText("❌ " + msg.replace("\n", "　"))
+            self.status.setStyleSheet("color:#b00020;")
+
+    def _on_queried(self, text):
+        exists = False
+        members = ""
+        for ln in text.splitlines():
+            if ln.startswith("EXISTS="):
+                exists = ln[len("EXISTS="):].strip() == "1"
+            elif ln.startswith("MEMBERS="):
+                members = ln[len("MEMBERS="):].strip()
+        member_list = [m for m in members.split(",") if m]
+        if self.username not in member_list:
+            self.status.setText(f"⚠ 「{self.username}」目前不在 git_devs 名單裡，可能已經被移除了。")
+            self.status.setStyleSheet("color:#b06000;")
+        else:
+            self.status.setText("✔ 查詢完成。")
+            self.status.setStyleSheet("color:#1a7f37;")
+        remaining = [m for m in member_list if m != self.username]
+        if not remaining:
+            QMessageBox.warning(
+                self, "無法產生",
+                "移除後 git_devs 會變成空群組，這風險太大，工具不會自動產生這種指令，請先確認清單，必要時手動處理。")
+            return
+        script = self._build_script(remaining, exists)
+        dlg = TextViewDialog(self, f"移除 git_devs 帳號 — 待執行指令（{self.username}）", script)
+        dlg.exec()
+
+    def _build_script(self, remaining, exists):
+        delete_account = self.cb_delete_account.isChecked()
+        new_members = " ".join(remaining)
+        lines = [
+            "# ============================================================",
+            f"# 移除 git_devs 帳號：{self.username}",
+            "# 由 NasGitConnector 產生，這段指令不會自動執行。",
+            "# 整段複製、貼到有 sudo 權限的 SSH 視窗、一次執行到底即可。",
+            "# 全程唯一會問你的是最開頭的 sudo -v（問你自己的登入密碼），其餘全自動，不用手動改任何一行。",
+            "# ============================================================",
+            "",
+            "# 0) 先讓 sudo 記住密碼，避免整段貼下去時中途又跳密碼提示、把後面指令吃掉／打斷",
+            "sudo -v",
+            "",
+            f"# 1) 把 {self.username} 從 git_devs 移除",
+            "#    注意：synogroup --member 是「整批覆蓋」不是「移除單一個」，這裡刻意不包含要移除的帳號。",
+            f"sudo synogroup --member git_devs {new_members}",
+            "#    執行完立刻回讀名單自我檢查：剩下的人都還在、要移除的人真的不見了，異常就大聲警告",
+            "AFTER_MEMBERS=$(grep '^git_devs:' /etc/group | cut -d: -f4)",
+            f"for m in {new_members}; do",
+            '  case ",$AFTER_MEMBERS," in',
+            '    *",$m,"*) ;;',
+            '    *) echo "‼️  警告：$m 不在更新後的 git_devs 名單裡（目前：$AFTER_MEMBERS），可能被誤刪，請立刻人工確認並補回！" ;;',
+            "  esac",
+            "done",
+            f'case ",$AFTER_MEMBERS," in',
+            f'  *",{self.username},"*) echo "‼️  警告：{self.username} 還在名單裡，移除沒有成功！" ;;',
+            f'  *) echo "✔ {self.username} 已從 git_devs 移除" ;;',
+            "esac",
+            'echo "目前 git_devs 成員：$AFTER_MEMBERS"',
+            "",
+        ]
+        if delete_account:
+            lines += [
+                "# 2) 同時刪除 DSM 帳號本身（不可逆！執行前請確認真的要刪帳號，而不只是收回 git 權限）",
+                f"sudo synouser --del {self.username}",
+            ]
+        else:
+            lines += [
+                f"# 2) 沒有勾選刪除 DSM 帳號，{self.username} 帳號本身還在（只是已經不在 git_devs、無法再 push 任何 repo，",
+                "#    但仍可用同一把 SSH 金鑰登入 NAS shell）。之後若要徹底刪除，可自行執行：",
+                f"#    sudo synouser --del {self.username}",
+            ]
+        return "\n".join(lines)
+
+
+# ============================================================
+# git_devs 密碼留底紀錄檢視（本機明碼檔案，可清除）
+# ============================================================
+class GitDevsCredLogDialog(QDialog):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setWindowTitle("git_devs 密碼留底紀錄")
+        self.resize(640, 420)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            f"本機明碼紀錄檔：{GIT_DEVS_CRED_LOG_PATH}\n"
+            "每次用「新增 git_devs 帳號」產生密碼都會留一筆在這裡，請自行妥善保護、不需要的紀錄記得清理。"))
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setFont(QFont("Consolas", 10))
+        lay.addWidget(self.text, stretch=1)
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新整理")
+        self.clear_b = QPushButton("清除全部紀錄…")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.refresh_b)
+        row.addWidget(self.clear_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+        self.refresh_b.clicked.connect(self.refresh)
+        self.clear_b.clicked.connect(self.on_clear)
+        self.close_b.clicked.connect(self.accept)
+        self.refresh()
+
+    def refresh(self):
+        try:
+            with open(GIT_DEVS_CRED_LOG_PATH, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        self.text.setPlainText(text or f"（目前沒有紀錄，檔案：{GIT_DEVS_CRED_LOG_PATH}）")
+
+    def on_clear(self):
+        r = QMessageBox.question(
+            self, "清除全部紀錄",
+            "確定清除本機所有 git_devs 密碼留底紀錄？此動作無法復原（清掉的只是這份本機檔案紀錄，"
+            "不會影響 NAS 上帳號本身的密碼）。")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            os.remove(GIT_DEVS_CRED_LOG_PATH)
+        except OSError:
+            pass
+        audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""),
+                  "clear_git_devs_creds", "清除本機 git_devs 密碼留底紀錄")
+        self.refresh()
+
+
+# ============================================================
 # 跨庫搜尋結果對話框（雙擊直接開啟檔案並跳到該行）
 # ============================================================
 class GrepResultsDialog(QDialog):
@@ -4225,11 +4513,19 @@ class MainWindow(QMainWindow):
         self.notify_btn = QPushButton("Telegram 通知設定…")
         self.notify_btn.setToolTip("CI 引擎與 GitHub 鏡像同步腳本共用的 config/tg_bot.conf。")
         self.notify_btn.clicked.connect(self.on_notify_config)
+        self.git_devs_list_btn = QPushButton("git_devs 帳號清單…")
+        self.git_devs_list_btn.setToolTip("唯讀列出 git_devs 群組所有成員，可從清單直接產生移除某帳號的指令。")
+        self.git_devs_list_btn.clicked.connect(self.on_git_devs_users)
+        self.git_devs_cred_btn = QPushButton("git_devs 密碼留底紀錄…")
+        self.git_devs_cred_btn.setToolTip("查看/清除本機留底的 git_devs 新帳號密碼紀錄（明碼檔案）。")
+        self.git_devs_cred_btn.clicked.connect(self.on_view_git_devs_creds)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
         og.addWidget(self.new_user_btn, 0, 2)
         og.addWidget(self.disk_btn, 1, 0)
         og.addWidget(self.notify_btn, 1, 1)
+        og.addWidget(self.git_devs_list_btn, 1, 2)
+        og.addWidget(self.git_devs_cred_btn, 2, 0)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視（最後 200 筆）")
@@ -4525,6 +4821,7 @@ class MainWindow(QMainWindow):
         self.activity_btn.setEnabled(not busy)
         self.ssh_keys_btn.setEnabled(not busy)
         for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.notify_btn,
+                  self.git_devs_list_btn, self.git_devs_cred_btn,
                   self.push_log_btn, self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
@@ -4969,6 +5266,17 @@ class MainWindow(QMainWindow):
         cfg = dict(self.collect_identity_cfg())
         self.save_current_profile(silent=True)
         dlg = CreateGitDevsUserDialog(self, cfg)
+        dlg.exec()
+
+    def on_git_devs_users(self):
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = GitDevsUsersDialog(self, cfg)
+        dlg.exec()
+
+    def on_view_git_devs_creds(self):
+        cfg = dict(self.collect_identity_cfg())
+        dlg = GitDevsCredLogDialog(self, cfg)
         dlg.exec()
 
     def on_view_log(self, logfile, title):
