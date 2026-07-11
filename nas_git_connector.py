@@ -467,6 +467,10 @@ class Worker(QThread):
             self._run_healthcheck()
         elif self.mode == "disk_usage":
             self._run_disk_usage()
+        elif self.mode == "tg_conf_get":
+            self._run_tg_conf_get()
+        elif self.mode == "tg_conf_set":
+            self._run_tg_conf_set()
         elif self.mode == "repair":
             self._run_repair()
         elif self.mode == "log":
@@ -1762,6 +1766,50 @@ class Worker(QThread):
         self.hooks.emit(self._between(out))
         self.done.emit(True, "已讀取伺服器空間總覽。")
 
+    # --- 讀取 Telegram 通知設定（CI 引擎與鏡像同步腳本共用的 config/tg_bot.conf）---
+    def _run_tg_conf_get(self):
+        root = self.cfg["remote_root"]
+        self.log.emit("--- 讀取 Telegram 通知設定 ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"f='{root}/config/tg_bot.conf'",
+            "if [ -f \"$f\" ]; then",
+            "  echo \"TOKEN=$(sed -n 's/^[[:space:]]*BOT_TOKEN=//p' \"$f\" | head -1)\"",
+            "  echo \"CHAT=$(sed -n 's/^[[:space:]]*CHAT_ID=//p' \"$f\" | head -1)\"",
+            "else",
+            "  echo 'TOKEN='",
+            "  echo 'CHAT='",
+            "fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取 Telegram 通知設定失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out))
+        self.done.emit(True, "已讀取 Telegram 通知設定。")
+
+    # --- 寫入 Telegram 通知設定（寫前先備份舊檔）---
+    def _run_tg_conf_set(self):
+        root = self.cfg["remote_root"]
+        token = self.cfg.get("tg_token", "").strip()
+        chat = self.cfg.get("tg_chat", "").strip()
+        self.log.emit("--- 更新 Telegram 通知設定 ---")
+        cmd = "\n".join([
+            f"d='{root}/config'; f=\"$d/tg_bot.conf\"",
+            "mkdir -p \"$d\"",
+            "[ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
+            f"printf 'BOT_TOKEN=%s\\nCHAT_ID=%s\\n' {shq(token)} {shq(chat)} > \"$f\"",
+            "chmod 600 \"$f\"",
+            "echo ___OK___",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc == 0 and "___OK___" in out:
+            self.done.emit(True, "已更新 Telegram 通知設定（舊檔已備份）。")
+        else:
+            self.done.emit(False, "更新 Telegram 通知設定失敗（連線或權限問題）。")
+
     # --- 一鍵修復（套用 template hook + 修群組權限）---
     def _run_repair(self):
         root = self.cfg["remote_root"]
@@ -2987,6 +3035,76 @@ class BranchProtectDialog(QDialog):
 
 
 # ============================================================
+# Telegram 通知設定對話框（config/tg_bot.conf，CI 引擎與鏡像同步腳本共用）
+# ============================================================
+class NotifyConfigDialog(QDialog):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.worker = None
+        self.setWindowTitle("Telegram 通知設定")
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "CI 引擎（soft/strict 警告）與 GitHub 鏡像同步腳本共用這份設定（NAS 上 config/tg_bot.conf）。留空即停用通知。"))
+        g = QGridLayout()
+        g.addWidget(QLabel("Bot Token："), 0, 0)
+        self.token_edit = QLineEdit()
+        g.addWidget(self.token_edit, 0, 1)
+        g.addWidget(QLabel("Chat ID："), 1, 0)
+        self.chat_edit = QLineEdit()
+        g.addWidget(self.chat_edit, 1, 1)
+        lay.addLayout(g)
+        self.status = QLabel("讀取中…")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.bb.accepted.connect(self.on_save)
+        self.bb.rejected.connect(self.reject)
+        self.bb.setEnabled(False)
+        lay.addWidget(self.bb)
+        self._load()
+
+    def _load(self):
+        self.worker = Worker(dict(self.cfg), mode="tg_conf_get")
+        self.worker.hooks.connect(self._on_loaded)
+        self.worker.done.connect(self._on_load_done)
+        self.worker.start()
+
+    def _on_loaded(self, text):
+        for ln in text.splitlines():
+            if ln.startswith("TOKEN="):
+                self.token_edit.setText(ln[len("TOKEN="):])
+            elif ln.startswith("CHAT="):
+                self.chat_edit.setText(ln[len("CHAT="):])
+
+    def _on_load_done(self, ok, msg):
+        self.bb.setEnabled(True)
+        self.status.setText("" if ok else ("❌ " + msg))
+        self.status.setStyleSheet("" if ok else "color:#b00020;")
+
+    def on_save(self):
+        self.bb.setEnabled(False)
+        self.status.setText("儲存中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["tg_token"] = self.token_edit.text().strip()
+        cfg["tg_chat"] = self.chat_edit.text().strip()
+        self.worker = Worker(cfg, mode="tg_conf_set")
+        self.worker.done.connect(self._on_saved)
+        self.worker.start()
+
+    def _on_saved(self, ok, msg):
+        self.bb.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, "完成", msg)
+            self.accept()
+        else:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+
+
+# ============================================================
 # 封存區 _archived/ 管理 對話框
 # ============================================================
 class ArchiveDialog(QDialog):
@@ -3982,10 +4100,14 @@ class MainWindow(QMainWindow):
         self.disk_btn = QPushButton("伺服器空間總覽")
         self.disk_btn.setToolTip("df 可用空間、Git_Server 總用量、各倉庫大小排行前 10 大。")
         self.disk_btn.clicked.connect(self.on_disk_usage)
+        self.notify_btn = QPushButton("Telegram 通知設定…")
+        self.notify_btn.setToolTip("CI 引擎與 GitHub 鏡像同步腳本共用的 config/tg_bot.conf。")
+        self.notify_btn.clicked.connect(self.on_notify_config)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
         og.addWidget(self.new_user_btn, 0, 2)
         og.addWidget(self.disk_btn, 1, 0)
+        og.addWidget(self.notify_btn, 1, 1)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視（最後 200 筆）")
@@ -4280,8 +4402,8 @@ class MainWindow(QMainWindow):
         self.search_all_btn.setEnabled(not busy)
         self.activity_btn.setEnabled(not busy)
         self.ssh_keys_btn.setEnabled(not busy)
-        for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.push_log_btn,
-                  self.viol_log_btn, self.dbg_log_btn):
+        for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.notify_btn,
+                  self.push_log_btn, self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
         self.delete_btn.setEnabled(not busy and has_sel)
@@ -4714,6 +4836,12 @@ class MainWindow(QMainWindow):
 
     def on_disk_usage(self):
         self._start_maint("disk_usage", "伺服器空間總覽")
+
+    def on_notify_config(self):
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = NotifyConfigDialog(self, cfg)
+        dlg.exec()
 
     def on_create_git_devs_user(self):
         cfg = dict(self.collect_identity_cfg())
