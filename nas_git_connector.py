@@ -50,6 +50,9 @@ CONTAINER_ROOTS = [
 # 封存區保留政策提醒：項目封存超過這麼多天，就在封存區清單上標記提醒（僅提醒，不自動清除）。
 ARCHIVE_STALE_DAYS = 90
 
+# 健康檢查用：單一檔案超過這個大小（bytes）就建議改用 Git LFS，僅提醒不自動處理。
+LFS_SUGGEST_BYTES = 5 * 1024 * 1024
+
 # 本機操作稽核 log：這套工具做的破壞性動作（刪 repo、砍 tag、砍 SSH 金鑰、批次清封存、GC 等）
 # NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
 AUDIT_LOG_PATH = os.path.join(os.path.expanduser("~"), ".nas_git_connector", "audit.log")
@@ -1517,6 +1520,21 @@ class Worker(QThread):
             "  [ -n \"$msg\" ] && echo \"[!!] $n:$msg\"",
             "done",
             "[ \"$bad\" = 0 ] && echo '[OK] 所有 repo 的 hook 與群組正常'",
+            "echo",
+            "echo '== LFS 使用建議 =='",
+            "lfs_hits=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  n=$(basename \"$repo\")",
+            "  base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
+            "  [ -z \"$base\" ] && continue",
+            f"  big=$(git --git-dir=\"$repo\" ls-tree -r -l \"$base\" 2>/dev/null | awk '$4+0 > {LFS_SUGGEST_BYTES} {{c++}} END{{print c+0}}')",
+            "  if [ \"${big:-0}\" -gt 0 ] 2>/dev/null; then",
+            f"    echo \"[  ] $n：有 $big 個檔案超過 {LFS_SUGGEST_BYTES // (1024*1024)}MB，考慮改用 Git LFS 存放大型二進位檔\"",
+            "    lfs_hits=$((lfs_hits+1))",
+            "  fi",
+            "done",
+            "[ \"$lfs_hits\" = 0 ] && echo '[OK] 沒有偵測到明顯需要上 LFS 的大型檔案'",
             "echo",
             "echo '== 日誌 =='",
             "[ -d \"$BASE/logs\" ] && echo '[OK] logs 目錄存在' || echo '[  ] 無 logs 目錄'",
