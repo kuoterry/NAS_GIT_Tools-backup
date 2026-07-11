@@ -30,6 +30,8 @@ import platform
 import subprocess
 import base64
 import hashlib
+import secrets
+import string
 from datetime import datetime
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
@@ -72,6 +74,20 @@ dist/
 # NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
 AUDIT_LOG_PATH = os.path.join(os.path.expanduser("~"), ".nas_git_connector", "audit.log")
 DESTRUCTIVE_MODES = {"delete", "rename_repo", "repo_gc", "tag_delete", "ssh_keys_delete", "archive_purge"}
+
+# 新增 git_devs 帳號時自動產生的 DSM 登入密碼留底檔——明碼存放，僅供應急查回密碼用；
+# 這個檔案本身就是機密，請自行限制存取（例如搬到有加密的資料夾）並定期清理不再需要的紀錄。
+GIT_DEVS_CRED_LOG_PATH = os.path.join(os.path.expanduser("~"), ".nas_git_connector", "git_devs_credentials.log")
+
+
+def save_git_devs_credential(admin_user: str, host: str, new_username: str, password: str):
+    try:
+        os.makedirs(os.path.dirname(GIT_DEVS_CRED_LOG_PATH), exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(GIT_DEVS_CRED_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{ts}\t建立者={admin_user}@{host}\t帳號={new_username}\t密碼={password}\n")
+    except OSError:
+        pass
 
 
 def audit_log(user: str, host: str, action: str, detail: str):
@@ -3490,14 +3506,10 @@ class CreateGitDevsUserDialog(QDialog):
 
         lay = QVBoxLayout(self)
         note = QLabel(
-            "這個工具沒有免密碼 sudo，沒辦法自己在 NAS 上建帳號，要照下面步驟手動操作：\n"
-            "1. 填好下面欄位、按「產生設定指令」——工具會先唯讀查一下 git_devs 目前有誰、帳號是否已存在。\n"
-            "2. 把產生出來的整段指令複製，貼到一個有 sudo 權限的 SSH 視窗，一次貼上、從頭執行到底，"
-            "中間不要自己截斷、分段貼，也不要手動改寫其中任何一行。\n"
-            "3. 執行途中畫面會跳出「請輸入新密碼」——那是現場真的在問你，你要在那個當下自己打一組密碼，"
-            "不是把畫面上顯示的文字照抄下來當密碼貼上去。\n"
-            "4. 加入 git_devs 群組那一步做完，腳本會自動印出「目前 git_devs 成員」讓你核對；"
-            "如果看到 ‼️ 警告，代表有人被踢出群組了，先停下來、不要繼續做後面步驟，回來跟我說。"
+            "這個工具沒有免密碼 sudo，沒辦法自己在 NAS 上建帳號。填好欄位按「產生設定指令」，"
+            "把產生出來的整段指令複製、貼到一個有 sudo 權限的 SSH 視窗，一次執行到底就好——"
+            "全程只有一開始的 sudo 密碼要你手動輸入，其餘都自動處理、自動核對。"
+            f"新帳號密碼會自動產生並留底到本機 {GIT_DEVS_CRED_LOG_PATH}（明碼檔案，請自行妥善保護）。"
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#666;")
@@ -3579,11 +3591,18 @@ class CreateGitDevsUserDialog(QDialog):
             self.status.setText(f"✔ 查詢完成，「{username}」目前不存在，可以建立。")
             self.status.setStyleSheet("color:#1a7f37;")
         member_list = [m for m in members.split(",") if m]
-        script = self._build_script(username, pubkey, member_list, exists)
+        alphabet = string.ascii_letters + string.digits
+        password = "".join(secrets.choice(alphabet) for _ in range(16))
+        save_git_devs_credential(self.cfg.get("user", ""), self.cfg.get("host", ""), username, password)
+        QMessageBox.information(
+            self, "密碼已留底",
+            f"「{username}」的登入密碼已寫入本機檔案：\n{GIT_DEVS_CRED_LOG_PATH}\n\n"
+            "這是明碼檔案，請自行妥善保護（例如搬到有加密的資料夾），不需要的紀錄記得定期清理。")
+        script = self._build_script(username, pubkey, member_list, exists, password)
         dlg = TextViewDialog(self, f"新增 git_devs 帳號 — 待執行指令（{username}）", script)
         dlg.exec()
 
-    def _build_script(self, username, pubkey, member_list, exists):
+    def _build_script(self, username, pubkey, member_list, exists, password):
         desc = self.desc_edit.text().strip() or username
         email = self.email_edit.text().strip()
         root = self.cfg.get("remote_root", "/volume1/Git_Server")
@@ -3593,21 +3612,20 @@ class CreateGitDevsUserDialog(QDialog):
             "# ============================================================",
             f"# 新增 git_devs 帳號：{username}",
             "# 由 NasGitConnector 產生，這段指令不會自動執行。",
-            "# 使用方式：整段複製 → 貼到有 sudo 權限的 SSH 視窗 → 一次執行到底，不要分段貼、不要手動改寫。",
-            "# 執行途中畫面問密碼時，是現場真的在問你，直接打你要設定的密碼、按 Enter，不是照抄畫面文字。",
+            "# 整段複製、貼到有 sudo 權限的 SSH 視窗、一次執行到底即可。",
+            "# 全程唯一會問你的是最開頭的 sudo -v（問你自己的登入密碼），其餘全自動，不用手動改任何一行。",
             "# synouser 的參數順序可能因 DSM 版本略有不同，若第 1 步報錯，先跑 `synouser --help` 核對。",
             "# ============================================================",
             "",
-            "# 1) 建立 DSM 使用者（畫面會現場問密碼，不會把密碼寫死在這份腳本裡）",
+            "# 0) 先讓 sudo 記住密碼，避免整段貼下去時中途又跳密碼提示、把後面指令吃掉／打斷",
+            "sudo -v",
+            "",
+            f"# 1) 建立 DSM 使用者（密碼已由 NasGitConnector 產生並存到本機 {GIT_DEVS_CRED_LOG_PATH}）",
         ]
         if exists:
             lines.append(f"#    帳號 {username} 已存在，這段可能不需要，請自行判斷是否跳過：")
         lines += [
-            f'echo "===> 現在請直接用鍵盤打一組你要給 {username} 的新密碼（不是照抄上面任何文字，是你自己現場想的密碼），"',
-            'echo "     畫面不會顯示字元是正常的，打完按 Enter："',
-            "read -s NEWPW; echo",
-            f'sudo synouser --add {username} "$NEWPW" "{desc}" "{email}" 0 0',
-            "unset NEWPW",
+            f"sudo synouser --add {username} '{password}' \"{desc}\" \"{email}\" 0 0",
             "",
             "# 2) 加入 git_devs 群組",
             "#    注意：synogroup --member 是「整批覆蓋」不是「附加」！",
@@ -3630,7 +3648,7 @@ class CreateGitDevsUserDialog(QDialog):
             "",
             "# 4) 設定 SSH 金鑰登入",
             'sudo mkdir -p "$HOME_DIR/.ssh"',
-            f"sudo sh -c 'cat > \"$HOME_DIR/.ssh/authorized_keys\"' <<'EOF'",
+            "sudo tee \"$HOME_DIR/.ssh/authorized_keys\" >/dev/null <<'EOF'",
             pubkey,
             "EOF",
             'sudo chmod 700 "$HOME_DIR/.ssh"',
