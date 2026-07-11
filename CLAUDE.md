@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Single-file PyQt6 GUI tool (`nas_git_connector.py`, ~2800 lines) that connects a local project folder to a Synology NAS Git server (`kcc3713.synology.me`, bare repos under `/volume1/Git_Server`). It also manages that Git server: browsing repos, per-repo CI policy, archive/restore, health checks, log viewing, GitHub mirror registration/sync. Written for a single user's home/office dual-machine workflow.
 
+This repo also contains `Key_Management/`, a completely separate PyQt6 tool (own `CLAUDE.md`, own `requirements.txt`) for scanning/managing local SSH keys — unrelated to the NAS connector, no shared code or imports either direction.
+
 ## Commands
 
 ```
