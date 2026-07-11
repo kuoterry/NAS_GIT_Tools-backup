@@ -356,6 +356,20 @@ class Worker(QThread):
             self._run_grep_all()
         elif self.mode == "repo_diff":
             self._run_repo_diff()
+        elif self.mode == "tag_list":
+            self._run_tag_list()
+        elif self.mode == "tag_create":
+            self._run_tag_create()
+        elif self.mode == "tag_delete":
+            self._run_tag_delete()
+        elif self.mode == "file_blame":
+            self._run_file_blame()
+        elif self.mode == "ssh_keys_list":
+            self._run_ssh_keys_list()
+        elif self.mode == "ssh_keys_add":
+            self._run_ssh_keys_add()
+        elif self.mode == "ssh_keys_delete":
+            self._run_ssh_keys_delete()
         elif self.mode == "clone":
             self._run_clone()
         elif self.mode == "create_mirror":
@@ -1054,6 +1068,207 @@ class Worker(QThread):
         body = self._between(out)
         self.hooks.emit(body or "（沒有差異）")
         self.done.emit(True, f"已比較 {ref_a}..{ref_b}。")
+
+    # --- 列出此庫的所有 tag（annotated tag 當簡易 Release 標記）---
+    def _run_tag_list(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.repos.emit([])
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            "git --git-dir=\"$repo\" for-each-ref --sort=-creatordate "
+            "--format='%(refname:short)|%(creatordate:short)|%(taggername)|%(contents:subject)' "
+            "refs/tags 2>/dev/null",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.repos.emit([])
+            self.done.emit(False, "讀取 tag 清單失敗（連線或權限問題）。")
+            return
+        items = []
+        for ln in self._between(out).splitlines():
+            p = ln.split("|")
+            if p and p[0].strip():
+                items.append((p[0].strip(),
+                              p[1].strip() if len(p) > 1 else "",
+                              p[2].strip() if len(p) > 2 else "",
+                              p[3].strip() if len(p) > 3 else ""))
+        self.repos.emit(items)
+        self.done.emit(True, f"共 {len(items)} 個 tag。")
+
+    # --- 新增 annotated tag（當作簡易 Release 標記）---
+    def _run_tag_create(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        tag = c.get("tag_name", "")
+        ref = c.get("tag_ref", "")
+        message = c.get("tag_message", "") or tag
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        if not tag or not ref:
+            self.done.emit(False, "請指定 tag 名稱與要標記的分支/commit。")
+            return
+        self.log.emit(f"--- 新增 tag：{name} {tag} @ {ref} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            f"git --git-dir=\"$repo\" tag -a {shq(tag)} {shq(ref)} -m {shq(message)} 2>&1 && echo ___OK___",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        body = self._between(out)
+        if rc == 0 and "___OK___" in body:
+            self.done.emit(True, f"已建立 tag：{tag} @ {ref}")
+        else:
+            self.done.emit(False, f"建立 tag 失敗：{body.replace('___OK___', '').strip() or '未知錯誤'}")
+
+    # --- 刪除 tag ---
+    def _run_tag_delete(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        tag = c.get("tag_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        if not tag:
+            self.done.emit(False, "缺少 tag 名稱。")
+            return
+        self.log.emit(f"--- 刪除 tag：{name} {tag} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            f"git --git-dir=\"$repo\" tag -d {shq(tag)} 2>&1 && echo ___OK___",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        body = self._between(out)
+        if rc == 0 and "___OK___" in body:
+            self.done.emit(True, f"已刪除 tag：{tag}")
+        else:
+            self.done.emit(False, f"刪除 tag 失敗：{body.replace('___OK___', '').strip() or '未知錯誤'}")
+
+    # --- git blame 某檔案（HEAD 版本）---
+    def _run_file_blame(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        path = c.get("file_path", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        if not path:
+            self.done.emit(False, "缺少檔案路徑。")
+            return
+        self.log.emit(f"--- Blame：{name}:{path} ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'; repo=\"$BASE/$name\"",
+            f"git --git-dir=\"$repo\" blame --date=short HEAD -- {shq(path)} 2>&1",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取 blame 失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out))
+        self.done.emit(True, f"已讀取 {path} 的 blame。")
+
+    # --- 列出目前 profile 帳號自己的 authorized_keys ---
+    def _run_ssh_keys_list(self):
+        self.log.emit("--- 讀取 SSH 授權金鑰（authorized_keys）---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            "f=\"$HOME/.ssh/authorized_keys\"",
+            "if [ -f \"$f\" ]; then",
+            "  while IFS= read -r line || [ -n \"$line\" ]; do",
+            "    [ -z \"$line\" ] && continue",
+            "    case \"$line\" in \"#\"*) continue;; esac",
+            "    printf 'KEY\\t%s\\n' \"$line\"",
+            "  done < \"$f\"",
+            "else",
+            "  echo NOFILE",
+            "fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.repos.emit([])
+            self.done.emit(False, "讀取 authorized_keys 失敗（連線或權限問題）。")
+            return
+        body = self._between(out)
+        keys = [ln[4:] for ln in body.splitlines() if ln.startswith("KEY\t")]
+        self.repos.emit(keys)
+        self.done.emit(True, f"共 {len(keys)} 把已授權的金鑰。")
+
+    # --- 新增一把公鑰到 authorized_keys ---
+    def _run_ssh_keys_add(self):
+        key_line = " ".join(self.cfg.get("key_line", "").split())
+        if not re.match(r"^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|"
+                         r"ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|"
+                         r"sk-ecdsa-sha2-nistp256@openssh\.com) ", key_line):
+            self.done.emit(False, "看起來不是合法的 SSH 公鑰格式（應以 ssh-rsa / ssh-ed25519 等開頭）。")
+            return
+        self.log.emit("--- 新增 SSH 授權金鑰 ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            "mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\"",
+            "f=\"$HOME/.ssh/authorized_keys\"",
+            "touch \"$f\" && chmod 600 \"$f\"",
+            f"line={shq(key_line)}",
+            "if grep -qxF \"$line\" \"$f\" 2>/dev/null; then",
+            "  echo DUP",
+            "else",
+            "  printf '%s\\n' \"$line\" >> \"$f\" && echo ___OK___",
+            "fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        body = self._between(out)
+        if "DUP" in body:
+            self.done.emit(False, "這把金鑰已經在 authorized_keys 裡了。")
+        elif rc == 0 and "___OK___" in body:
+            self.done.emit(True, "已新增授權金鑰。")
+        else:
+            self.done.emit(False, "新增失敗（連線或權限問題）。")
+
+    # --- 從 authorized_keys 移除一把公鑰（先備份原檔）---
+    def _run_ssh_keys_delete(self):
+        key_line = self.cfg.get("key_line", "")
+        if not key_line:
+            self.done.emit(False, "缺少要刪除的金鑰內容。")
+            return
+        self.log.emit("--- 刪除 SSH 授權金鑰 ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            "f=\"$HOME/.ssh/authorized_keys\"",
+            "if [ ! -f \"$f\" ]; then echo NOFILE; echo ___END___; exit 0; fi",
+            f"line={shq(key_line)}",
+            "cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
+            "grep -vxF \"$line\" \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\" && chmod 600 \"$f\" && echo ___OK___",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        body = self._between(out)
+        if rc == 0 and "___OK___" in body:
+            self.done.emit(True, "已刪除該授權金鑰（原檔已備份 .bak-時間戳）。")
+        else:
+            self.done.emit(False, "刪除失敗（連線或權限問題，或找不到 authorized_keys）。")
 
     # --- 從 NAS clone 到本地（本機執行 git clone，走金鑰/plink）---
     def _run_clone(self):
@@ -2020,6 +2235,177 @@ class RepoDiffDialog(QDialog):
 
 
 # ============================================================
+# 新增 Tag / Release 子對話框
+# ============================================================
+class CreateTagDialog(QDialog):
+    def __init__(self, parent, branches):
+        super().__init__(parent)
+        self.setWindowTitle("新增 Tag / Release")
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        g = QGridLayout()
+        g.addWidget(QLabel("Tag 名稱："), 0, 0)
+        self.tag_edit = QLineEdit()
+        self.tag_edit.setPlaceholderText("例如 v1.2.0")
+        g.addWidget(self.tag_edit, 0, 1)
+        g.addWidget(QLabel("標記於（分支/commit）："), 1, 0)
+        self.ref_combo = QComboBox()
+        self.ref_combo.setEditable(True)
+        self.ref_combo.addItems(branches)
+        g.addWidget(self.ref_combo, 1, 1)
+        lay.addLayout(g)
+        lay.addWidget(QLabel("Release 說明（tag message，可留空）："))
+        self.msg_edit = QPlainTextEdit()
+        self.msg_edit.setFixedHeight(100)
+        lay.addWidget(self.msg_edit)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._ok)
+        bb.rejected.connect(self.reject)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("建立")
+        lay.addWidget(bb)
+
+    def _ok(self):
+        if not self.tag_edit.text().strip() or not self.ref_combo.currentText().strip():
+            QMessageBox.information(self, "缺欄位", "請輸入 tag 名稱與要標記的分支/commit。")
+            return
+        self.accept()
+
+    def values(self):
+        return (self.tag_edit.text().strip(),
+                self.ref_combo.currentText().strip(),
+                self.msg_edit.toPlainText().strip())
+
+
+# ============================================================
+# Tag / Release 管理對話框（annotated tag 當簡易 Release）
+# ============================================================
+class TagDialog(QDialog):
+    def __init__(self, parent, cfg, repo_name):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.repo_name = repo_name
+        self.worker = None
+        self.branch_worker = None
+        self._branches = []
+        self.setWindowTitle(f"Tag / Release — {repo_name}")
+        self.resize(640, 460)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("此庫的 annotated tag（可當作簡易 Release 標記；不含檔案下載/HTML 頁面）。"))
+        self.list = QListWidget()
+        lay.addWidget(self.list, stretch=1)
+
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新整理")
+        self.create_b = QPushButton("新增 Tag…")
+        self.delete_b = QPushButton("刪除")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.refresh_b)
+        row.addWidget(self.create_b)
+        row.addWidget(self.delete_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.refresh_b.clicked.connect(self.refresh)
+        self.create_b.clicked.connect(self.on_create)
+        self.delete_b.clicked.connect(self.on_delete)
+        self.close_b.clicked.connect(self.accept)
+
+        self._load_branches()
+        self.refresh()
+
+    def _busy(self, b):
+        for x in (self.refresh_b, self.create_b, self.delete_b):
+            x.setEnabled(not b)
+
+    def _load_branches(self):
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        self.branch_worker = Worker(cfg, mode="repo_branches")
+        self.branch_worker.repos.connect(self._on_branches)
+        self.branch_worker.start()
+
+    def _on_branches(self, names):
+        self._branches = names
+
+    def refresh(self):
+        self.list.clear()
+        self._busy(True)
+        self.status.setText("讀取中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        self.worker = Worker(cfg, mode="tag_list")
+        self.worker.repos.connect(self.on_entries)
+        self.worker.done.connect(self.on_done)
+        self.worker.start()
+
+    def on_entries(self, entries):
+        self.list.clear()
+        for tag, date, tagger, subject in entries:
+            label = f"{tag}    {date}"
+            if tagger:
+                label += f"  by {tagger}"
+            if subject:
+                label += f"  — {subject}"
+            it = QListWidgetItem(label)
+            it.setData(Qt.ItemDataRole.UserRole, tag)
+            self.list.addItem(it)
+
+    def on_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+    def on_create(self):
+        dlg = CreateTagDialog(self, self._branches)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        tag, ref, msg = dlg.values()
+        cfg = dict(self.cfg)
+        cfg.update({"repo_name": self.repo_name, "tag_name": tag, "tag_ref": ref, "tag_message": msg})
+        self._busy(True)
+        self.status.setText(f"建立 tag「{tag}」中…")
+        self.status.setStyleSheet("")
+        self.worker = Worker(cfg, mode="tag_create")
+        self.worker.done.connect(self._on_create_done)
+        self.worker.start()
+
+    def _on_create_done(self, ok, msg):
+        self.on_done(ok, msg)
+        if ok:
+            self.refresh()
+
+    def on_delete(self):
+        it = self.list.currentItem()
+        if not it:
+            self.status.setText("請先選一個 tag。")
+            return
+        tag = it.data(Qt.ItemDataRole.UserRole)
+        r = QMessageBox.question(self, "刪除 tag", f"確定刪除 tag「{tag}」？此動作無法復原。")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        cfg = dict(self.cfg)
+        cfg.update({"repo_name": self.repo_name, "tag_name": tag})
+        self._busy(True)
+        self.status.setText(f"刪除 tag「{tag}」中…")
+        self.status.setStyleSheet("")
+        self.worker = Worker(cfg, mode="tag_delete")
+        self.worker.done.connect(self._on_delete_done)
+        self.worker.start()
+
+    def _on_delete_done(self, ok, msg):
+        self.on_done(ok, msg)
+        if ok:
+            self.refresh()
+
+
+# ============================================================
 # 設定 CI 對話框（每個 repo 獨立）
 # ============================================================
 class SetCiDialog(QDialog):
@@ -2242,6 +2628,179 @@ class ArchiveDialog(QDialog):
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#b06000;" if (ok and n_stale) else ("color:#1a7f37;" if ok else "color:#b00020;"))
         if ok and self.worker and self.worker.mode in ("archive_restore", "archive_purge"):
+            self.refresh()
+
+
+# ============================================================
+# 活動總覽對話框（所有倉庫依最後 commit 時間排序）
+# ============================================================
+class ActivityDialog(QDialog):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.worker = None
+        self.setWindowTitle("活動總覽 — 依最近 push 排序")
+        self.resize(620, 480)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("所有倉庫依最後一次 commit 時間排序（新到舊），空庫排最後。"))
+        self.list = QListWidget()
+        lay.addWidget(self.list, stretch=1)
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新整理")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.refresh_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.refresh_b.clicked.connect(self.refresh)
+        self.close_b.clicked.connect(self.accept)
+        self.refresh()
+
+    def refresh(self):
+        self.list.clear()
+        self.refresh_b.setEnabled(False)
+        self.status.setText("讀取中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        self.worker = Worker(cfg, mode="list")
+        self.worker.repos.connect(self.on_entries)
+        self.worker.done.connect(self.on_done)
+        self.worker.start()
+
+    def on_entries(self, entries):
+        self.list.clear()
+        dated = []
+        empty = []
+        for item in entries:
+            name = item[0]
+            status = item[1] if len(item) > 1 else ""
+            m = re.match(r"^(\d{4}-\d{2}-\d{2})\s*\((.+)\)$", status)
+            if m:
+                dated.append((m.group(1), m.group(2), name))
+            else:
+                empty.append(name)
+        dated.sort(key=lambda t: t[0], reverse=True)
+        for date, branch, name in dated:
+            self.list.addItem(QListWidgetItem(f"{date}  {name}  ({branch})"))
+        for name in empty:
+            self.list.addItem(QListWidgetItem(f"—           {name}  （空庫）"))
+
+    def on_done(self, ok, msg):
+        self.refresh_b.setEnabled(True)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+
+# ============================================================
+# SSH 授權金鑰管理對話框（僅限目前身份自己這個帳號的 authorized_keys）
+# ============================================================
+class SshKeysDialog(QDialog):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.worker = None
+        self.setWindowTitle(f"SSH 金鑰管理 — {cfg.get('user', '')}@{cfg.get('host', '')}")
+        self.resize(680, 440)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("目前身份這個 SSH 帳號自己的 authorized_keys（只影響這一個帳號，不動其他人）。"))
+        self.list = QListWidget()
+        lay.addWidget(self.list, stretch=1)
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新整理")
+        self.add_b = QPushButton("新增金鑰…")
+        self.delete_b = QPushButton("刪除")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.refresh_b)
+        row.addWidget(self.add_b)
+        row.addWidget(self.delete_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.refresh_b.clicked.connect(self.refresh)
+        self.add_b.clicked.connect(self.on_add)
+        self.delete_b.clicked.connect(self.on_delete)
+        self.close_b.clicked.connect(self.accept)
+        self.refresh()
+
+    def _busy(self, b):
+        for x in (self.refresh_b, self.add_b, self.delete_b):
+            x.setEnabled(not b)
+
+    def refresh(self):
+        self.list.clear()
+        self._busy(True)
+        self.status.setText("讀取中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        self.worker = Worker(cfg, mode="ssh_keys_list")
+        self.worker.repos.connect(self.on_entries)
+        self.worker.done.connect(self.on_done)
+        self.worker.start()
+
+    def on_entries(self, keys):
+        self.list.clear()
+        for line in keys:
+            parts = line.split(None, 2)
+            ktype = parts[0] if len(parts) > 0 else "?"
+            comment = parts[2] if len(parts) > 2 else "(無註解)"
+            it = QListWidgetItem(f"{ktype}  {comment}")
+            it.setData(Qt.ItemDataRole.UserRole, line)
+            self.list.addItem(it)
+
+    def on_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+    def on_add(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self, "新增授權金鑰", "貼上公鑰內容（例如 id_ed25519.pub 的內容，單行）：")
+        text = text.strip()
+        if not ok or not text:
+            return
+        cfg = dict(self.cfg)
+        cfg["key_line"] = text
+        self._busy(True)
+        self.status.setText("新增中…")
+        self.status.setStyleSheet("")
+        self.worker = Worker(cfg, mode="ssh_keys_add")
+        self.worker.done.connect(self._on_add_done)
+        self.worker.start()
+
+    def _on_add_done(self, ok, msg):
+        self.on_done(ok, msg)
+        if ok:
+            self.refresh()
+
+    def on_delete(self):
+        it = self.list.currentItem()
+        if not it:
+            self.status.setText("請先選一把金鑰。")
+            return
+        line = it.data(Qt.ItemDataRole.UserRole)
+        r = QMessageBox.question(self, "刪除授權金鑰", "確定移除這把金鑰？原檔會先備份。\n\n" + it.text())
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        cfg = dict(self.cfg)
+        cfg["key_line"] = line
+        self._busy(True)
+        self.status.setText("刪除中…")
+        self.status.setStyleSheet("")
+        self.worker = Worker(cfg, mode="ssh_keys_delete")
+        self.worker.done.connect(self._on_delete_done)
+        self.worker.start()
+
+    def _on_delete_done(self, ok, msg):
+        self.on_done(ok, msg)
+        if ok:
             self.refresh()
 
 
@@ -2539,10 +3098,23 @@ class MainWindow(QMainWindow):
         self.gc_btn.setToolTip("對選取的倉庫執行 git gc，回收空間、整理 pack（可多選）。")
         self.gc_btn.clicked.connect(self.on_repo_gc)
         tools_row.addWidget(self.gc_btn)
+        self.tag_btn = QPushButton("Tag / Release…")
+        self.tag_btn.setEnabled(False)
+        self.tag_btn.setToolTip("列出/新增/刪除此庫的 annotated tag（可當簡易 Release 標記）。")
+        self.tag_btn.clicked.connect(self.on_tag_dialog)
+        tools_row.addWidget(self.tag_btn)
         self.search_all_btn = QPushButton("搜尋所有倉庫…")
         self.search_all_btn.setToolTip("在所有倉庫的預設分支下做全文搜尋（git grep），不用逐一 clone。")
         self.search_all_btn.clicked.connect(self.on_grep_all)
         tools_row.addWidget(self.search_all_btn)
+        self.activity_btn = QPushButton("活動總覽…")
+        self.activity_btn.setToolTip("依最後 push 時間排序，一次看所有倉庫最近有沒有動靜。")
+        self.activity_btn.clicked.connect(self.on_activity_dashboard)
+        tools_row.addWidget(self.activity_btn)
+        self.ssh_keys_btn = QPushButton("SSH 金鑰管理…")
+        self.ssh_keys_btn.setToolTip("管理目前身份這個 SSH 帳號自己的 authorized_keys（新增/刪除授權金鑰）。")
+        self.ssh_keys_btn.clicked.connect(self.on_ssh_keys)
+        tools_row.addWidget(self.ssh_keys_btn)
         tools_row.addStretch(1)
         bp.addLayout(danger_row)
         bp.addLayout(tools_row)
@@ -2875,6 +3447,8 @@ class MainWindow(QMainWindow):
         self.mirror_reg_btn.setEnabled(not busy)
         self.mirror_sync_btn.setEnabled(not busy)
         self.search_all_btn.setEnabled(not busy)
+        self.activity_btn.setEnabled(not busy)
+        self.ssh_keys_btn.setEnabled(not busy)
         for b in (self.hc_btn, self.repair_btn, self.push_log_btn,
                   self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
@@ -2891,6 +3465,7 @@ class MainWindow(QMainWindow):
         self.merged_btn.setEnabled(not busy and has_sel)
         self.diff_btn.setEnabled(not busy and has_sel)
         self.gc_btn.setEnabled(not busy and has_sel)
+        self.tag_btn.setEnabled(not busy and has_sel)
         if busy:
             self.run_btn.setText("執行中…")
         else:
@@ -3047,6 +3622,7 @@ class MainWindow(QMainWindow):
         self.merged_btn.setEnabled(has)
         self.diff_btn.setEnabled(has)
         self.gc_btn.setEnabled(has)
+        self.tag_btn.setEnabled(has)
 
     def copy_clone_url(self):
         url = self.clone_edit.text().strip()
@@ -3394,6 +3970,28 @@ class MainWindow(QMainWindow):
         cfg = dict(self.collect_identity_cfg())
         self.save_current_profile(silent=True)
         dlg = RepoDiffDialog(self, cfg, name)
+        dlg.exec()
+
+    def on_tag_dialog(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = TagDialog(self, cfg, name)
+        dlg.exec()
+
+    def on_activity_dashboard(self):
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = ActivityDialog(self, cfg)
+        dlg.exec()
+
+    def on_ssh_keys(self):
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = SshKeysDialog(self, cfg)
         dlg.exec()
 
     def on_merged_branches(self):
