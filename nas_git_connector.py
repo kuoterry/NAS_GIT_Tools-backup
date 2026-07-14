@@ -216,35 +216,6 @@ PATCHED_ENGINE_B64 = (
     "KCRjKSIKICAgIGRvbmUKZG9uZQoKZXhpdCAwCg=="
 )
 
-# NAS 登入通知轉發腳本（notify_login.sh）內容，base64 編碼。
-# 部署到 NAS 的 tools/notify_login.sh，供 DSM「使用者定義的手機簡訊供應商」呼叫，
-# 把登入通知（DSM 登入 / SSH、Telnet 登入）轉發到 Telegram，沿用 config/tg_bot.conf。
-LOGIN_NOTIFY_SH_B64 = (
-    "IyEvYmluL2Jhc2gKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQojIG5vdGlm"
-    "eV9sb2dpbi5zaAojICAg57WmIFN5bm9sb2d5IERTTeOAjOS9v+eUqOiAheWumue+qeeahOaJi+apn+ewoeioiuS+m+aHieWVhuOA"
-    "jeWRvOWPq+eahOi9ieeZvOiFs+acrOOAggojICAgRFNNIOWcqOeZu+WFpemAmuefpe+8iOaOp+WItuWPsCDihpIg6YCa55+lIOKG"
-    "kiDpgLLpmo4g4oaSIERTTSDnmbvlhaUgLyBTU0jjgIFUZWxuZXQg55m75YWl77yJCiMgICDop7jnmbzmmYLmnIPlkbzlj6vmnKzo"
-    "hbPmnKzvvIzmhaPkvovkuIrlgrPlhaXvvJokMT3nsKHoqIrmlLbku7bkurrpm7voqbHomZ/norzvvIjlj6/lv73nlaXvvInjgIEK"
-    "IyAgICQyPemAmuefpeWFp+WuueaWh+Wtl+OAguacrOiFs+acrOaKiiAkMiDovYnnmbzliLAgVGVsZWdyYW3vvIzmsr/nlKggQ0kg"
-    "5byV5pOO6IiHCiMgICBHaXRIdWIg6Y+h5YOP5ZCM5q2l6IWz5pys5YWx55So55qEIGNvbmZpZy90Z19ib3QuY29uZu+8iEJPVF9U"
-    "T0tFTj0vQ0hBVF9JRD3vvInjgIIKIwojICAg6YOo572y5L2N572u77yaL3ZvbHVtZTEvR2l0X1NlcnZlci90b29scy9ub3RpZnlf"
-    "bG9naW4uc2gKIyAgIOioreWumuS9jee9ru+8mkRTTSDmjqfliLblj7Ag4oaSIOmAmuefpSDihpIg57Ch6KiKIOKGkiDkvb/nlKjo"
-    "gIXlrprnvqnnmoTmiYvmqZ/nsKHoqIrkvpvmh4nllYYKIwojICAg5rOo5oSP77yaRFNNIOWRvOWPq+iHquioguewoeioiuS+m+aH"
-    "ieWVhuiFs+acrOeahOWvpumam+WPg+aVuOmghuW6j+WboOeJiOacrOiAjOeVsO+8jOacquWcqAojICAg5a+m6ZqbIE5BUyDkuIrp"
-    "qZforYnpgY7jgILoi6Xpg6jnvbLlvozmlLbkuI3liLDpgJrnn6XvvIzlhYjnorroqo0gJDEvJDIg5a+m6Zqb5YWn5a65CiMgICDv"
-    "vIjlj6/mmqvmmYLlnKjkuIvpnaLliqDkuIDooYwgZWNobyAiJChkYXRlKSBBUkdTOiAkMSB8ICQyIiA+PiAvdG1wL25vdGlmeV9s"
-    "b2dpbl9kZWJ1Zy5sb2cg6Zmk6Yyv77yJ77yMCiMgICDlho3kvp3lr6bpmpvni4Dms4Hoqr/mlbQgTVNHIOWPlueUqOWTquWAi+WP"
-    "g+aVuOOAggojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CgpleHBvcnQgUEFU"
-    "SD0vdXNyL3NiaW46L3Vzci9iaW46L3NiaW46L2JpbgoKQkFTRT0iL3ZvbHVtZTEvR2l0X1NlcnZlciIKQ09ORj0iJEJBU0UvY29u"
-    "ZmlnL3RnX2JvdC5jb25mIgoKQk9UX1RPS0VOPSIiOyBDSEFUX0lEPSIiClsgLWYgIiRDT05GIiBdICYmIC4gIiRDT05GIgoKIyDm"
-    "spLoqK3lrpogVGVsZWdyYW0g5bCx5a6J6Z2c57WQ5p2f77yM5LiN5pOLIERTTSDpgJrnn6XmtYHnqIsKWyAteiAiJEJPVF9UT0tF"
-    "TiIgXSAmJiBleGl0IDAKWyAteiAiJENIQVRfSUQiIF0gJiYgZXhpdCAwCgpNU0c9IiQyIgpbIC16ICIkTVNHIiBdICYmIE1TRz0i"
-    "77yIRFNNIOacquaPkOS+m+ioiuaBr+WFp+Wuue+8jOiri+eiuuiqjeWRvOWPq+WPg+aVuO+8iSIKCmN1cmwgLXMgLVggUE9TVCAi"
-    "aHR0cHM6Ly9hcGkudGVsZWdyYW0ub3JnL2JvdCRCT1RfVE9LRU4vc2VuZE1lc3NhZ2UiIFwKICAgIC0tZGF0YS11cmxlbmNvZGUg"
-    "ImNoYXRfaWQ9JENIQVRfSUQiIFwKICAgIC0tZGF0YS11cmxlbmNvZGUgInRleHQ98J+UkCBOQVMg55m75YWl6YCa55+l77yaJE1T"
-    "RyIgPi9kZXYvbnVsbCAyPiYxCgpleGl0IDAK"
-)
-
 # 通用 .gitignore（Keil MDK / Python / ESP-IDF）
 GITIGNORE_TEXT = """\
 # ============================================
@@ -530,8 +501,6 @@ class Worker(QThread):
             self._run_tg_conf_get()
         elif self.mode == "tg_conf_set":
             self._run_tg_conf_set()
-        elif self.mode == "deploy_login_notify":
-            self._run_deploy_login_notify()
         elif self.mode == "repair":
             self._run_repair()
         elif self.mode == "log":
@@ -1942,47 +1911,6 @@ class Worker(QThread):
         backed = "（已備份舊檔為 pre-receive.ci.bak-時間戳）" if "BACKUP_DONE" in out else "（原本無舊檔）"
         self.done.emit(True, "CI 引擎已升級為自載入 policy 版本。\n" + backed +
                              "\n之後各 repo 的 CI 會依 ci_policies/<repo>.policy 生效。")
-
-    # --- 部署 NAS 登入通知轉發腳本（notify_login.sh）---
-    def _run_deploy_login_notify(self):
-        c = self.cfg
-        root = c["remote_root"]
-        b64 = LOGIN_NOTIFY_SH_B64
-        self.log.emit("--- 部署登入通知腳本 tools/notify_login.sh（自動備份 + 換檔）---")
-        cmd = "\n".join([
-            f"BASE='{root}'",
-            "dst=\"$BASE/tools/notify_login.sh\"",
-            "mkdir -p \"$BASE/tools\"",
-            f"printf '%s' '{b64}' | base64 -d > \"$dst.new\" || {{ echo DECODE_FAIL; exit 0; }}",
-            "if ! grep -q sendMessage \"$dst.new\"; then echo BAD_CONTENT; rm -f \"$dst.new\"; exit 0; fi",
-            "if [ ! -s \"$dst.new\" ]; then echo EMPTY; rm -f \"$dst.new\"; exit 0; fi",
-            "if [ -f \"$dst\" ]; then cp \"$dst\" \"$dst.bak-$(date +%Y%m%d-%H%M%S)\"; echo \"BACKUP_DONE\"; fi",
-            "mv \"$dst.new\" \"$dst\"",
-            "chmod 755 \"$dst\"",
-            "chgrp git_devs \"$dst\" 2>/dev/null",
-            "echo ___OK___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd)
-        if rc != 0 or "___OK___" not in out:
-            reason = ""
-            for tag in ("DECODE_FAIL", "BAD_CONTENT", "EMPTY"):
-                if tag in out:
-                    reason = f"（{tag}）"
-                    break
-            self.done.emit(False, f"部署失敗{reason}。請檢查連線與 tools 目錄權限。")
-            return
-        backed = "（已備份舊檔）" if "BACKUP_DONE" in out else "（原本無舊檔）"
-        path = f"{root}/tools/notify_login.sh"
-        self.done.emit(True,
-            f"notify_login.sh 已部署到 {path}{backed}。\n\n"
-            "還差最後一步，需自行到 DSM 網頁完成（無法用 SSH 自動化）：\n"
-            "1. 控制台 → 通知 → 簡訊 → 使用者定義的手機簡訊供應商，\n"
-            f"   填入腳本路徑：{path}\n"
-            "2. 控制台 → 通知 → 進階 → 本機使用者登入時傳送簡訊通知，\n"
-            "   勾選「DSM 登入」與「SSH、Telnet 登入」兩項。\n\n"
-            "注意：DSM 呼叫此腳本的參數慣例（$1=電話、$2=訊息）未在此 NAS 上實際\n"
-            "驗證過，若部署後收不到 Telegram 通知，請先確認 DSM 實際傳入的參數再調整腳本。")
 
     # --- Git Server 健康檢查（唯讀）---
     def _run_healthcheck(self):
@@ -4828,9 +4756,6 @@ class MainWindow(QMainWindow):
         self.git_devs_cred_btn = QPushButton("git_devs 密碼留底紀錄…")
         self.git_devs_cred_btn.setToolTip("查看/清除本機留底的 git_devs 新帳號密碼紀錄（明碼檔案）。")
         self.git_devs_cred_btn.clicked.connect(self.on_view_git_devs_creds)
-        self.login_notify_btn = QPushButton("部署登入通知腳本…")
-        self.login_notify_btn.setToolTip("部署 notify_login.sh 到 NAS，供 DSM 簡訊供應商呼叫，把登入通知轉發到 Telegram；仍需自行到 DSM 網頁完成兩個手動設定。")
-        self.login_notify_btn.clicked.connect(self.on_deploy_login_notify)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
         og.addWidget(self.new_user_btn, 0, 2)
@@ -4838,7 +4763,6 @@ class MainWindow(QMainWindow):
         og.addWidget(self.notify_btn, 1, 1)
         og.addWidget(self.git_devs_list_btn, 1, 2)
         og.addWidget(self.git_devs_cred_btn, 2, 0)
-        og.addWidget(self.login_notify_btn, 2, 1)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視（最後 200 筆）")
@@ -5135,7 +5059,7 @@ class MainWindow(QMainWindow):
         self.activity_btn.setEnabled(not busy)
         self.ssh_keys_btn.setEnabled(not busy)
         for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.notify_btn,
-                  self.git_devs_list_btn, self.git_devs_cred_btn, self.login_notify_btn,
+                  self.git_devs_list_btn, self.git_devs_cred_btn,
                   self.push_log_btn, self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
@@ -5542,42 +5466,6 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
             QMessageBox.warning(self, "升級失敗", msg)
-
-    # ---------- 部署 NAS 登入通知腳本 ----------
-    def on_deploy_login_notify(self):
-        c = self.collect_identity_cfg()
-        dst = f"{c['remote_root']}/tools/notify_login.sh"
-        r = QMessageBox.question(
-            self, "部署登入通知腳本",
-            "將把 notify_login.sh 部署到 NAS 的：\n"
-            f"  {dst}\n"
-            "（會先自動備份成 .bak-時間戳）。\n\n"
-            "此腳本會在 DSM 呼叫時把登入通知（DSM 登入 / SSH、Telnet 登入）轉發到\n"
-            "Telegram，沿用共用的 config/tg_bot.conf。\n\n"
-            "部署完成後仍需自行到 DSM 網頁完成兩個手動設定（無法用 SSH 自動化）。\n\n"
-            "確定要部署嗎？",
-        )
-        if r != QMessageBox.StandardButton.Yes:
-            return
-        self.save_current_profile(silent=True)
-        self.maint_status.setText("部署登入通知腳本中…")
-        self.maint_status.setStyleSheet("")
-        self.set_busy(True)
-        self.worker = Worker(dict(c), mode="deploy_login_notify")
-        self.worker.log.connect(self.append_log)
-        self.worker.done.connect(self.on_login_notify_done)
-        self.worker.start()
-
-    def on_login_notify_done(self, ok: bool, msg: str):
-        self.set_busy(False)
-        if ok:
-            self.maint_status.setText("✔ " + msg.replace("\n", "　"))
-            self.maint_status.setStyleSheet("color:#1a7f37;")
-            QMessageBox.information(self, "完成", msg)
-        else:
-            self.maint_status.setText("❌ " + msg.replace("\n", "　"))
-            self.maint_status.setStyleSheet("color:#b00020;")
-            QMessageBox.warning(self, "部署失敗", msg)
 
     # ---------- 維運 / 日誌 ----------
     def _start_maint(self, mode, title, extra=None):
