@@ -476,6 +476,8 @@ class Worker(QThread):
             self._run_file_content()
         elif self.mode == "repo_gc":
             self._run_repo_gc()
+        elif self.mode == "repo_fsck":
+            self._run_repo_fsck()
         elif self.mode == "repo_log":
             self._run_repo_log()
         elif self.mode == "repo_branches":
@@ -512,6 +514,12 @@ class Worker(QThread):
             self._run_create_mirror()
         elif self.mode == "sync_mirrors":
             self._run_sync_mirrors()
+        elif self.mode == "get_backup_remote":
+            self._run_get_backup_remote()
+        elif self.mode == "set_backup_remote":
+            self._run_set_backup_remote()
+        elif self.mode == "backup_sync":
+            self._run_backup_sync()
         elif self.mode == "upgrade_engine":
             self._run_upgrade_engine()
         elif self.mode == "healthcheck":
@@ -1208,6 +1216,47 @@ class Worker(QThread):
         nok = body.count("[OK]")
         self.done.emit(nfail == 0, f"GC 完成：成功 {nok}、失敗 {nfail}。")
 
+    # --- 完整性檢查（git fsck，唯讀）---
+    def _run_repo_fsck(self):
+        c = self.cfg
+        root = c["remote_root"]
+        names = [n for n in c.get("repo_names", []) if is_safe_name(n)]
+        if not names:
+            self.done.emit(False, "沒有選取任何倉庫。")
+            return
+        flt = "".join(" " + n + " " for n in names)
+        self.log.emit(f"--- 完整性檢查 git fsck（{len(names)} 個倉庫）---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; FILTER='{flt}'",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  name=$(basename \"$repo\")",
+            "  case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac",
+            "  out=$(git --git-dir=\"$repo\" fsck --full 2>&1)",
+            "  if echo \"$out\" | grep -Eiq 'error|missing|corrupt|fatal'; then",
+            "    echo \"[FAIL] $name：發現損毀/遺失物件\"",
+            "    echo \"$out\" | sed 's/^/       /'",
+            "  elif [ -n \"$out\" ]; then",
+            "    n=$(echo \"$out\" | wc -l)",
+            "    echo \"[OK]   $name（$n 筆 dangling/unreachable 物件，屬正常現象非損毀）\"",
+            "  else",
+            "    echo \"[OK]   $name（完全乾淨）\"",
+            "  fi",
+            "done",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "完整性檢查失敗（連線或權限問題）。")
+            return
+        body = self._between(out)
+        self.hooks.emit(body)
+        nfail = body.count("[FAIL]")
+        nok = body.count("[OK]")
+        self.done.emit(nfail == 0, f"完整性檢查完成：正常 {nok}、發現問題 {nfail}。")
+
     # --- 讀取某分支的完整 commit log（非只最後一筆）---
     def _run_repo_log(self):
         c = self.cfg
@@ -1765,6 +1814,98 @@ class Worker(QThread):
         nfail = body.count("[FAIL]")
         nok = body.count("[OK]")
         self.done.emit(nfail == 0, f"鏡像同步完成：成功 {nok}、失敗 {nfail}。")
+
+    # --- 讀取離站備份目的地 URL（唯讀）---
+    def _run_get_backup_remote(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規：{name!r}")
+            return
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; name='{name}'",
+            "git --git-dir=\"$BASE/$name\" config --get remote.offsite-backup.url 2>/dev/null",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取失敗（連線或權限問題）。")
+            return
+        body = self._between(out).strip()
+        self.hooks.emit(body)
+        self.done.emit(True, "已讀取離站備份設定。" if body else "尚未設定離站備份。")
+
+    # --- 設定/移除離站備份目的地（git remote add/remove offsite-backup）---
+    def _run_set_backup_remote(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        url = (c.get("backup_url", "") or "").strip()
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規：{name!r}")
+            return
+        if url and not re.match(r"^(https://|http://|git@|ssh://|file://)[A-Za-z0-9@._:/~?=&%+\-]+$", url):
+            self.done.emit(False, "備份目的地 URL 格式不合規（僅允許 https:// / git@ / ssh:// / file:// 開頭的正常網址）。")
+            return
+        self.log.emit(f"--- 設定離站備份：{name} → {url or '(移除設定)'} ---")
+        steps = [
+            f"BASE='{root}'; name='{name}'",
+            "repo=\"$BASE/$name\"",
+            "git --git-dir=\"$repo\" remote remove offsite-backup >/dev/null 2>&1",
+        ]
+        if url:
+            steps.append(f"url='{url}'")
+            steps.append("git --git-dir=\"$repo\" remote add offsite-backup \"$url\" 2>&1")
+        steps.append("echo ___OK___")
+        steps.append("true")
+        rc, out, _ = self._ssh("\n".join(steps))
+        if rc != 0 or "___OK___" not in out:
+            self.done.emit(False, "設定失敗（連線或權限問題）。")
+            return
+        if url:
+            self.done.emit(True, f"已設定「{name}」的離站備份目的地：\n{url}")
+        else:
+            self.done.emit(True, f"已移除「{name}」的離站備份設定。")
+
+    # --- 同步離站備份（git push --mirror offsite-backup）；names 空則同步全部已設定的 ---
+    def _run_backup_sync(self):
+        root = self.cfg["remote_root"]
+        names = [n for n in self.cfg.get("backup_repo_names", []) if is_safe_name(n)]
+        flt = ("".join(" " + n + " " for n in names)) if names else ""
+        self.log.emit(f"--- 同步離站備份（{'選取 ' + str(len(names)) + ' 個' if names else '全部已設定'}）---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"BASE='{root}'; FILTER='{flt}'",
+            "n=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  name=$(basename \"$repo\")",
+            "  url=$(git --git-dir=\"$repo\" config --get remote.offsite-backup.url 2>/dev/null)",
+            "  [ -n \"$url\" ] || continue",
+            "  if [ -n \"$FILTER\" ]; then case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac; fi",
+            "  n=$((n+1))",
+            "  if git --git-dir=\"$repo\" push --mirror offsite-backup >/dev/null 2>&1; then",
+            "    echo \"[OK]   $name\"",
+            "  else",
+            "    echo \"[FAIL] $name\"",
+            "  fi",
+            "done",
+            "[ \"$n\" = 0 ] && echo '（沒有設定離站備份的倉庫）'",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "同步失敗（連線或權限問題）。")
+            return
+        body = self._between(out)
+        self.hooks.emit(body)
+        nfail = body.count("[FAIL]")
+        nok = body.count("[OK]")
+        self.done.emit(nfail == 0, f"離站備份同步完成：成功 {nok}、失敗 {nfail}。")
 
     # --- 一鍵升級 NAS 上的 CI 引擎（自動備份 + 換檔）---
     def _run_upgrade_engine(self):
@@ -3185,6 +3326,8 @@ class BranchProtectDialog(QDialog):
         self.bb.setEnabled(True)
         if ok:
             QMessageBox.information(self, "完成", msg)
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "branch_protect_set",
+                      f"repo={self.name} denyDeletes={self.cb_del.isChecked()} denyNonFastForwards={self.cb_ff.isChecked()}")
             self.accept()
         else:
             self.status.setText("❌ " + msg)
@@ -3255,6 +3398,9 @@ class NotifyConfigDialog(QDialog):
         self.bb.setEnabled(True)
         if ok:
             QMessageBox.information(self, "完成", msg)
+            # 不記錄 token 內容本身，只記錄「有沒有設定」，避免密鑰進本機稽核紀錄
+            detail = f"token={'(已設定)' if self.token_edit.text().strip() else '(空)'} chat_id={'(已設定)' if self.chat_edit.text().strip() else '(空)'}"
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "tg_conf_set", detail)
             self.accept()
         else:
             self.status.setText("❌ " + msg)
@@ -4257,6 +4403,83 @@ class MirrorDialog(QDialog):
 
 
 # ============================================================
+# 離站備份設定 對話框（此庫 → 外部 Git 端點，例如 GitHub 私有庫，作為 disaster recovery）
+# ============================================================
+class BackupDialog(QDialog):
+    def __init__(self, parent, cfg, name):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.name = name
+        self.worker = None
+        self.setWindowTitle(f"離站備份設定 — {name}")
+        self.setMinimumWidth(520)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "設定後，可用「同步離站備份」把這個庫整份推到外部 Git 端點（例如 GitHub 私有庫），"
+            "作為 NAS 本機以外的備份，避免 NAS 硬碟損壞時連封存區一起沒了。"))
+        g = QGridLayout()
+        g.addWidget(QLabel("備份目的地 URL："), 0, 0)
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://github.com/作者/repo-backup.git（留空並儲存 = 移除備份設定）")
+        g.addWidget(self.url_edit, 0, 1)
+        lay.addLayout(g)
+        note = QLabel(
+            "注意：同步時執行的是 git push --mirror，會讓目的地完全比照這個庫，"
+            "包含刪除目的地上、這個庫沒有的分支/tag。請指向一個專用的空白備份倉庫，"
+            "不要指向還在使用中的其他倉庫。私有庫需先在 NAS 端設好 GitHub 金鑰/token。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#666;")
+        lay.addWidget(note)
+        self.status = QLabel("讀取中…")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.bb.accepted.connect(self.on_save)
+        self.bb.rejected.connect(self.reject)
+        self.bb.setEnabled(False)
+        lay.addWidget(self.bb)
+        self._load()
+
+    def _load(self):
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.name
+        self.worker = Worker(cfg, mode="get_backup_remote")
+        self.worker.hooks.connect(self._on_loaded)
+        self.worker.done.connect(self._on_load_done)
+        self.worker.start()
+
+    def _on_loaded(self, text):
+        self.url_edit.setText(text.strip())
+
+    def _on_load_done(self, ok, msg):
+        self.bb.setEnabled(True)
+        self.status.setText("" if ok else ("❌ " + msg))
+        self.status.setStyleSheet("" if ok else "color:#b00020;")
+
+    def on_save(self):
+        self.bb.setEnabled(False)
+        self.status.setText("儲存中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.name
+        cfg["backup_url"] = self.url_edit.text().strip()
+        self.worker = Worker(cfg, mode="set_backup_remote")
+        self.worker.done.connect(self._on_saved)
+        self.worker.start()
+
+    def _on_saved(self, ok, msg):
+        self.bb.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, "完成", msg)
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "set_backup_remote",
+                      f"repo={self.name} url={self.url_edit.text().strip() or '(移除)'}")
+            self.accept()
+        else:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+
+
+# ============================================================
 # 主視窗
 # ============================================================
 class MainWindow(QMainWindow):
@@ -4421,6 +4644,9 @@ class MainWindow(QMainWindow):
         self.mirror_sync_btn = QPushButton("同步鏡像")
         self.mirror_sync_btn.setToolTip("對選取的鏡像庫執行 remote update；沒選就同步全部鏡像。")
         self.mirror_sync_btn.clicked.connect(self.on_sync_mirrors)
+        self.backup_sync_btn = QPushButton("同步離站備份")
+        self.backup_sync_btn.setToolTip("對選取的倉庫執行 push --mirror 到其離站備份目的地；沒選就同步全部已設定備份的倉庫。")
+        self.backup_sync_btn.clicked.connect(self.on_backup_sync)
 
         top_row.addWidget(self.refresh_btn)
         top_row.addWidget(self.ci_status_btn)
@@ -4434,6 +4660,7 @@ class MainWindow(QMainWindow):
         top_row2.addWidget(self.archive_btn)
         top_row2.addWidget(self.mirror_reg_btn)
         top_row2.addWidget(self.mirror_sync_btn)
+        top_row2.addWidget(self.backup_sync_btn)
         top_row2.addStretch(1)
         bp.addLayout(top_row2)
 
@@ -4479,6 +4706,11 @@ class MainWindow(QMainWindow):
         self.branch_protect_btn.setToolTip("設定 git 原生 receive.denyDeletes / denyNonFastForwards，與 CI 引擎彼此獨立。")
         self.branch_protect_btn.clicked.connect(self.on_branch_protect)
         danger_row.addWidget(self.branch_protect_btn)
+        self.backup_btn = QPushButton("離站備份…")
+        self.backup_btn.setEnabled(False)
+        self.backup_btn.setToolTip("設定此庫的離站備份目的地（外部 Git 端點，例如 GitHub 私有庫）。")
+        self.backup_btn.clicked.connect(self.on_backup_dialog)
+        danger_row.addWidget(self.backup_btn)
         self.batch_ci_btn = QPushButton("批次設定 CI…")
         self.batch_ci_btn.setEnabled(False)
         self.batch_ci_btn.setToolTip("對『目前選取的多個』倉庫一次套用同一 CI 規則（可按住 Ctrl/Shift 多選）。")
@@ -4517,6 +4749,11 @@ class MainWindow(QMainWindow):
         self.gc_btn.setToolTip("對選取的倉庫執行 git gc，回收空間、整理 pack（可多選）。")
         self.gc_btn.clicked.connect(self.on_repo_gc)
         tools_row.addWidget(self.gc_btn)
+        self.fsck_btn = QPushButton("完整性檢查…")
+        self.fsck_btn.setEnabled(False)
+        self.fsck_btn.setToolTip("對選取的倉庫執行 git fsck --full，檢查是否有損毀/遺失物件（可多選，唯讀不修改）。")
+        self.fsck_btn.clicked.connect(self.on_repo_fsck)
+        tools_row.addWidget(self.fsck_btn)
         self.tag_btn = QPushButton("Tag / Release…")
         self.tag_btn.setEnabled(False)
         self.tag_btn.setToolTip("列出/新增/刪除此庫的 annotated tag（可當簡易 Release 標記）。")
@@ -4893,11 +5130,12 @@ class MainWindow(QMainWindow):
         self.archive_btn.setEnabled(not busy)
         self.mirror_reg_btn.setEnabled(not busy)
         self.mirror_sync_btn.setEnabled(not busy)
+        self.backup_sync_btn.setEnabled(not busy)
         self.search_all_btn.setEnabled(not busy)
         self.activity_btn.setEnabled(not busy)
         self.ssh_keys_btn.setEnabled(not busy)
         for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.notify_btn,
-                  self.git_devs_list_btn, self.git_devs_cred_btn,
+                  self.git_devs_list_btn, self.git_devs_cred_btn, self.login_notify_btn,
                   self.push_log_btn, self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
@@ -4914,6 +5152,7 @@ class MainWindow(QMainWindow):
         self.merged_btn.setEnabled(not busy and has_sel)
         self.diff_btn.setEnabled(not busy and has_sel)
         self.gc_btn.setEnabled(not busy and has_sel)
+        self.fsck_btn.setEnabled(not busy and has_sel)
         self.tag_btn.setEnabled(not busy and has_sel)
         if busy:
             self.run_btn.setText("執行中…")
@@ -5081,6 +5320,7 @@ class MainWindow(QMainWindow):
         self.files_btn.setEnabled(has)
         self.desc_btn.setEnabled(has)
         self.branch_protect_btn.setEnabled(has)
+        self.backup_btn.setEnabled(has)
         self.batch_ci_btn.setEnabled(len(self.repo_list.selectedItems()) >= 1)
         self.rename_btn.setEnabled(has)
         self.clone_btn.setEnabled(has)
@@ -5088,6 +5328,7 @@ class MainWindow(QMainWindow):
         self.merged_btn.setEnabled(has)
         self.diff_btn.setEnabled(has)
         self.gc_btn.setEnabled(has)
+        self.fsck_btn.setEnabled(has)
         self.tag_btn.setEnabled(has)
 
     def copy_clone_url(self):
@@ -5258,6 +5499,10 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
             QMessageBox.information(self, "完成", msg)
+            if self.worker:
+                c = self.collect_identity_cfg()
+                detail = f"repo={self.worker.cfg.get('repo_name', '')} policy={self.worker.cfg.get('ci_policy', '')}"
+                audit_log(c.get("user", ""), c.get("host", ""), "set_ci", detail)
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
@@ -5498,6 +5743,11 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
             self.on_refresh()  # 重整讓清單 CI 欄更新
+            if self.worker:
+                c = self.collect_identity_cfg()
+                names = ",".join(self.worker.cfg.get("repo_names", []))
+                detail = f"repos={names} policy={self.worker.cfg.get('ci_policy', '')}"
+                audit_log(c.get("user", ""), c.get("host", ""), "set_ci_batch", detail)
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
@@ -5572,6 +5822,10 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
+            if self.worker:
+                c = self.collect_identity_cfg()
+                audit_log(c.get("user", ""), c.get("host", ""), "repo_desc_set",
+                          f"repo={self.worker.cfg.get('repo_name', '')}")
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
@@ -5681,6 +5935,24 @@ class MainWindow(QMainWindow):
         self.worker.done.connect(self.on_ci_done)
         self.worker.start()
 
+    def on_repo_fsck(self):
+        names = self._selected_repo_names()
+        if not names:
+            self.browse_status.setText("請先在清單選一個或多個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        cfg["repo_names"] = names
+        self.save_current_profile(silent=True)
+        self._ci_title = "完整性檢查結果"
+        self.browse_status.setText(f"對 {len(names)} 個倉庫執行完整性檢查中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="repo_fsck")
+        self.worker.log.connect(self.append_log)
+        self.worker.hooks.connect(self.on_ci_result)
+        self.worker.done.connect(self.on_ci_done)
+        self.worker.start()
+
     def on_grep_all(self):
         term, ok = QInputDialog.getText(self, "搜尋所有倉庫", "輸入要搜尋的字串（在各庫預設分支下搜尋）：")
         term = term.strip()
@@ -5771,6 +6043,33 @@ class MainWindow(QMainWindow):
         self.browse_status.setStyleSheet("")
         self.set_busy(True)
         self.worker = Worker(cfg, mode="sync_mirrors")
+        self.worker.log.connect(self.append_log)
+        self.worker.hooks.connect(self.on_ci_result)
+        self.worker.done.connect(self.on_ci_done)
+        self.worker.start()
+
+    # ---------- 離站備份 ----------
+    def on_backup_dialog(self):
+        name = self._selected_repo_name()
+        if not name:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = BackupDialog(self, cfg, name)
+        dlg.exec()
+
+    def on_backup_sync(self):
+        names = self._selected_repo_names()  # 選取中的倉庫；空=同步全部已設定備份的倉庫
+        cfg = dict(self.collect_identity_cfg())
+        cfg["backup_repo_names"] = names
+        self.save_current_profile(silent=True)
+        scope = f"選取的 {len(names)} 個倉庫" if names else "全部已設定備份的倉庫"
+        self._ci_title = "離站備份同步結果"
+        self.browse_status.setText(f"同步{scope}中…")
+        self.browse_status.setStyleSheet("")
+        self.set_busy(True)
+        self.worker = Worker(cfg, mode="backup_sync")
         self.worker.log.connect(self.append_log)
         self.worker.hooks.connect(self.on_ci_result)
         self.worker.done.connect(self.on_ci_done)
