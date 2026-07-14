@@ -69,6 +69,7 @@ managed_components/
 
 # ========== Synology / Windows ==========
 @eaDir/
+\#recycle/
 Thumbs.db
 Desktop.ini
 ~$*
