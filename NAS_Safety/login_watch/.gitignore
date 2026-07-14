@@ -1,0 +1,11 @@
+# 含真實 SMTP 帳密，不可提交
+config.json
+
+# MaxMind GeoLite2 授權資料與由它建出的本機資料庫，體積大（合計約 400+ MB）
+# 且屬第三方授權資料，依 README.md 步驟自行下載/建置，不放進版控
+geoip_src/
+geoip.sqlite3
+
+# 執行期產生的狀態與紀錄檔（含真實登入者 IP/帳號），不是原始碼
+state.json
+logs/

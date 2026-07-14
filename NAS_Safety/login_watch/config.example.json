@@ -1,0 +1,16 @@
+{
+  "conn_db_path": "/var/log/synolog/.SYNOCONNDB",
+  "state_file": "state.json",
+  "log_file": "logs/login_events.jsonl",
+  "geoip_db_path": "geoip.sqlite3",
+  "smtp": {
+    "enabled": true,
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "use_tls": true,
+    "username": "your_account@example.com",
+    "password": "your_smtp_password_or_app_password",
+    "from_addr": "your_account@example.com",
+    "to_addrs": ["you@example.com"]
+  }
+}
