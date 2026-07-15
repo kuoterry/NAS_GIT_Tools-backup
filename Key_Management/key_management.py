@@ -18,6 +18,7 @@
 
 import os
 import sys
+import re
 import csv
 import json
 import base64
@@ -31,12 +32,12 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QLineEdit, QPushButton, QPlainTextEdit, QComboBox,
+    QLabel, QLineEdit, QPushButton, QPlainTextEdit, QComboBox, QCheckBox,
     QFileDialog, QMessageBox, QGroupBox, QInputDialog, QListWidget, QListWidgetItem,
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -329,6 +330,135 @@ def build_advisories(rec: dict, fingerprints_seen: dict) -> str:
     return "；".join(notes) if notes else "—"
 
 
+# ============================================================
+# SSH config（~/.ssh/config）解析：讓報表看得出「這把金鑰實際連去哪」
+# ============================================================
+SSH_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ssh", "config")
+
+
+def _norm_path(path: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.expanduser(path)))
+
+
+def parse_ssh_config(path: str = SSH_CONFIG_PATH):
+    """解析 SSH config，回傳 {normalize後的私鑰路徑: [host別名, ...]}。
+    只認 Host/Match 區塊裡的 IdentityFile，不處理 Include（一般個人用 config 很少用到，避免過度複雜）。"""
+    mapping = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except OSError:
+        return mapping
+    current_hosts = []
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split(None, 1)
+        if len(parts) < 2:
+            continue
+        key, value = parts[0].lower(), parts[1].strip().strip('"')
+        if key == "host":
+            current_hosts = [h for h in value.split() if h != "*"]
+        elif key == "match":
+            # Match Host <h> User <u> 這種寫法，把 Host 值也當別名記下來
+            m = re.search(r"\bhost\s+(\S+)", value, re.IGNORECASE)
+            current_hosts = [m.group(1)] if m else []
+        elif key == "identityfile" and current_hosts:
+            idpath = _norm_path(value)
+            for h in current_hosts:
+                mapping.setdefault(idpath, []).append(h)
+    return mapping
+
+
+def append_ssh_config_host(alias: str, hostname: str, user: str, identity_path: str):
+    """把新的 Host 區塊附加到 SSH config；別名已存在就不寫，避免覆蓋既有設定。"""
+    try:
+        if os.path.exists(SSH_CONFIG_PATH):
+            with open(SSH_CONFIG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                existing = f.read()
+        else:
+            existing = ""
+    except OSError as e:
+        return False, f"讀取 SSH config 失敗：{e}"
+    for line in existing.splitlines():
+        s = line.strip()
+        if s.lower().startswith("host "):
+            if alias in s.split(None, 1)[1].split():
+                return False, f"SSH config 裡已經有 Host「{alias}」，為避免衝突不會自動改寫，請自行手動編輯。"
+    block = f"\nHost {alias}\n    HostName {hostname}\n"
+    if user:
+        block += f"    User {user}\n"
+    block += f"    IdentityFile {identity_path}\n"
+    try:
+        os.makedirs(os.path.dirname(SSH_CONFIG_PATH), exist_ok=True)
+        with open(SSH_CONFIG_PATH, "a", encoding="utf-8") as f:
+            f.write(block)
+    except OSError as e:
+        return False, f"寫入 SSH config 失敗：{e}"
+    return True, f"已加入 SSH config：Host {alias}"
+
+
+# ============================================================
+# known_hosts（~/.ssh/known_hosts）檢視與清理
+# ============================================================
+KNOWN_HOSTS_PATH = os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
+
+
+def parse_known_hosts(path: str = KNOWN_HOSTS_PATH):
+    """解析 known_hosts，回傳每行的 {line_no, host, hashed, key_type}。
+    注意：主機名雜湊過（HashKnownHosts，OpenSSH 預設行為）的話，同一台主機每次新增
+    都會用不同的 salt 重新雜湊，光比對雜湊字串本身抓不出「這是不是同一台主機」，
+    所以這裡只對『明碼主機名』做重複偵測，雜湊過的只列出、不做重複判斷。"""
+    entries = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except OSError:
+        return entries
+    for i, line in enumerate(lines):
+        s = line.rstrip("\n").strip()
+        if not s or s.startswith("#") or s.startswith("@"):
+            continue
+        parts = s.split(None, 2)
+        if len(parts) < 2:
+            continue
+        host_field = parts[0]
+        hashed = host_field.startswith("|1|")
+        key_type = parts[1]
+        entries.append({"line_no": i, "host": host_field, "hashed": hashed, "key_type": key_type})
+    # 同一台主機同時有 ed25519/ecdsa/rsa 等不同類型是正常現象，不算重複；
+    # 「同主機、同類型」出現超過一次才是真的重複（通常代表換過金鑰但舊條目沒清掉）。
+    seen_plain = {}
+    for e in entries:
+        if not e["hashed"]:
+            seen_plain.setdefault((e["host"], e["key_type"]), []).append(e)
+    for e in entries:
+        e["duplicate"] = (not e["hashed"]) and len(seen_plain.get((e["host"], e["key_type"]), [])) > 1
+    return entries
+
+
+def delete_known_hosts_entry(line_no: int, path: str = KNOWN_HOSTS_PATH):
+    """刪除 known_hosts 指定行（先備份原檔）。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except OSError as e:
+        return False, f"讀取失敗：{e}"
+    if line_no < 0 or line_no >= len(lines):
+        return False, "行號超出範圍，可能檔案已被改動，請重新整理。"
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = f"{path}.bak-{ts}"
+    try:
+        shutil.copy2(path, backup_path)
+        del lines[line_no]
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except OSError as e:
+        return False, f"寫入失敗：{e}"
+    return True, f"已刪除第 {line_no + 1} 行（原檔已備份到 {backup_path}）"
+
+
 def build_records(folders):
     """掃描所有資料夾，配對公私鑰、補齊指紋/強度/時間/建議，回傳紀錄清單。"""
     all_pub, all_priv, all_ppk = [], [], []
@@ -400,6 +530,12 @@ def build_records(folders):
             rec["mtime"] = os.path.getmtime(path_for_time) if path_for_time else None
         except OSError:
             rec["mtime"] = None
+
+    ssh_config_map = parse_ssh_config()
+    for rec in records:
+        priv_path = rec.get("priv_path")
+        hosts = ssh_config_map.get(_norm_path(priv_path)) if priv_path else None
+        rec["ssh_config_hosts"] = hosts or []
 
     for rec in records:
         rec["advisories"] = build_advisories(rec, fingerprints_seen)
@@ -488,6 +624,10 @@ class Worker(QThread):
                 self._run_purge_archive()
             elif self.mode == "read_private_raw":
                 self._run_read_private_raw()
+            elif self.mode == "list_known_hosts":
+                self._run_list_known_hosts()
+            elif self.mode == "delete_known_hosts_entry":
+                self._run_delete_known_hosts_entry()
             else:
                 self.done.emit(False, f"未知模式：{self.mode}")
         except Exception as e:
@@ -523,7 +663,15 @@ class Worker(QThread):
             self.done.emit(False, "產生金鑰失敗：" + (cp.stderr or cp.stdout).strip())
             return
         audit_log("generate", f"{path}（{key_type}, comment={comment}）")
-        self.done.emit(True, f"已產生金鑰對：\n{path}\n{path}.pub")
+        msg = f"已產生金鑰對：\n{path}\n{path}.pub"
+        if self.params.get("write_ssh_config"):
+            alias = self.params.get("ssh_config_alias", "")
+            hostname = self.params.get("ssh_config_hostname", "")
+            user = self.params.get("ssh_config_user", "")
+            ok, cfg_msg = append_ssh_config_host(alias, hostname, user, path)
+            audit_log("write_ssh_config", f"{alias} -> {path}（{'成功' if ok else '失敗：' + cfg_msg}）")
+            msg += f"\n{cfg_msg}"
+        self.done.emit(True, msg)
 
     def _run_delete(self):
         pub_path = self.params.get("pub_path")
@@ -625,6 +773,18 @@ class Worker(QThread):
         self.result.emit(content)
         self.done.emit(True, "已讀取。")
 
+    def _run_list_known_hosts(self):
+        entries = parse_known_hosts()
+        self.result.emit(entries)
+        self.done.emit(True, f"共 {len(entries)} 筆 known_hosts 紀錄。")
+
+    def _run_delete_known_hosts_entry(self):
+        line_no = self.params.get("line_no")
+        ok, msg = delete_known_hosts_entry(line_no)
+        if ok:
+            audit_log("delete_known_hosts_entry", msg)
+        self.done.emit(ok, msg)
+
 
 # ============================================================
 # 對話框
@@ -679,8 +839,27 @@ class GenerateKeyDialog(QDialog):
         self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         g.addWidget(self.pass_edit, 5, 1)
         lay.addLayout(g)
+
+        cfg_box = QGroupBox("同時寫入 SSH config（可選）")
+        cfg_box.setCheckable(True)
+        cfg_box.setChecked(False)
+        self.ssh_config_box = cfg_box
+        cg = QGridLayout(cfg_box)
+        cg.addWidget(QLabel("Host 別名："), 0, 0)
+        self.host_alias_edit = QLineEdit()
+        self.host_alias_edit.setPlaceholderText("例如 nas-git_user2（ssh <別名> 就會用這把金鑰）")
+        cg.addWidget(self.host_alias_edit, 0, 1)
+        cg.addWidget(QLabel("HostName（伺服器位址）："), 1, 0)
+        self.hostname_edit = QLineEdit()
+        self.hostname_edit.setPlaceholderText("例如 kcc3713.synology.me")
+        cg.addWidget(self.hostname_edit, 1, 1)
+        cg.addWidget(QLabel("User（可留空）："), 2, 0)
+        self.ssh_user_edit = QLineEdit()
+        cg.addWidget(self.ssh_user_edit, 2, 1)
+        lay.addWidget(cfg_box)
+
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
+        bb.accepted.connect(self._ok)
         bb.rejected.connect(self.reject)
         bb.button(QDialogButtonBox.StandardButton.Ok).setText("產生")
         lay.addWidget(bb)
@@ -690,14 +869,26 @@ class GenerateKeyDialog(QDialog):
         if d:
             self.dir_edit.setText(d)
 
+    def _ok(self):
+        if self.ssh_config_box.isChecked():
+            if not self.host_alias_edit.text().strip() or not self.hostname_edit.text().strip():
+                QMessageBox.information(self, "缺欄位", "要寫入 SSH config 的話，Host 別名跟 HostName 都要填。")
+                return
+        self.accept()
+
     def values(self):
         bits = self.bits_edit.text().strip()
+        path = os.path.join(self.dir_edit.text().strip(), self.name_edit.text().strip())
         return {
             "key_type": self.type_combo.currentText(),
             "bits": int(bits) if bits.isdigit() else None,
-            "path": os.path.join(self.dir_edit.text().strip(), self.name_edit.text().strip()),
+            "path": path,
             "comment": self.comment_edit.text().strip(),
             "passphrase": self.pass_edit.text(),
+            "write_ssh_config": self.ssh_config_box.isChecked(),
+            "ssh_config_alias": self.host_alias_edit.text().strip(),
+            "ssh_config_hostname": self.hostname_edit.text().strip(),
+            "ssh_config_user": self.ssh_user_edit.text().strip(),
         }
 
 
@@ -806,6 +997,76 @@ class AuditLogDialog(QDialog):
             self.text.setPlainText("（目前沒有紀錄）")
 
 
+class KnownHostsDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.worker = None
+        self.setWindowTitle("known_hosts 管理")
+        self.resize(640, 460)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            f"檔案：{KNOWN_HOSTS_PATH}\n"
+            "主機名雜湊過的（HashKnownHosts，OpenSSH 預設行為）看不出實際主機名，也沒辦法判斷重複；"
+            "只有明碼主機名才會標記「重複」。刪除前會先備份原檔。"))
+        self.list = QListWidget()
+        lay.addWidget(self.list, stretch=1)
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新整理")
+        self.delete_b = QPushButton("刪除選取…")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.refresh_b)
+        row.addWidget(self.delete_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.refresh_b.clicked.connect(self.refresh)
+        self.delete_b.clicked.connect(self.on_delete)
+        self.close_b.clicked.connect(self.accept)
+        self.refresh()
+
+    def refresh(self):
+        self.list.clear()
+        self.worker = Worker("list_known_hosts")
+        self.worker.result.connect(self.on_entries)
+        self.worker.done.connect(self.on_done)
+        self.worker.start()
+
+    def on_entries(self, entries):
+        self.list.clear()
+        for e in entries:
+            host = "（已雜湊，看不出主機名）" if e["hashed"] else e["host"]
+            dup = "　⚠ 重複" if e.get("duplicate") else ""
+            it = QListWidgetItem(f"{host}    {e['key_type']}{dup}")
+            it.setData(Qt.ItemDataRole.UserRole, e["line_no"])
+            self.list.addItem(it)
+
+    def on_done(self, ok, msg):
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+    def on_delete(self):
+        it = self.list.currentItem()
+        if not it:
+            self.status.setText("請先選一筆。")
+            return
+        line_no = it.data(Qt.ItemDataRole.UserRole)
+        r = QMessageBox.question(self, "刪除", f"確定刪除這筆 known_hosts 紀錄？\n\n{it.text()}\n\n原檔會先備份。")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self.worker = Worker("delete_known_hosts_entry", {"line_no": line_no})
+        self.worker.done.connect(self._on_delete_done)
+        self.worker.start()
+
+    def _on_delete_done(self, ok, msg):
+        self.on_done(ok, msg)
+        if ok:
+            self.refresh()
+
+
 # ============================================================
 # 主視窗
 # ============================================================
@@ -849,9 +1110,10 @@ class MainWindow(QMainWindow):
         fb.addLayout(frow)
         lay.addWidget(folder_box)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["金鑰使用者", "檔名", "類型與強度", "SHA256 指紋", "私鑰狀態", "最後修改", "建議", "路徑"])
+            ["金鑰使用者", "檔名", "類型與強度", "SHA256 指紋", "私鑰狀態",
+             "SSH config Host", "最後修改", "建議", "路徑"])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -890,10 +1152,13 @@ class MainWindow(QMainWindow):
         self.archive_mgmt_b.clicked.connect(self.on_archive_mgmt)
         self.audit_b = QPushButton("稽核紀錄…")
         self.audit_b.clicked.connect(self.on_audit_log)
+        self.known_hosts_b = QPushButton("known_hosts 管理…")
+        self.known_hosts_b.clicked.connect(self.on_known_hosts)
         self.export_b = QPushButton("匯出 CSV 報表…")
         self.export_b.clicked.connect(self.on_export_csv)
         brow.addWidget(self.archive_mgmt_b)
         brow.addWidget(self.audit_b)
+        brow.addWidget(self.known_hosts_b)
         brow.addStretch(1)
         brow.addWidget(self.export_b)
         lay.addLayout(brow)
@@ -952,11 +1217,12 @@ class MainWindow(QMainWindow):
             priv_status = "存在・已加密" if enc else ("存在・未加密" if enc is False else "存在・無法判斷")
         else:
             priv_status = "不存在"
+        ssh_hosts = "、".join(rec.get("ssh_config_hosts", [])) or "（未設定）"
         mtime = rec.get("mtime")
         mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "—"
         advisories = rec.get("advisories", "—")
         path = rec.get("pub_path") or rec.get("priv_path") or ""
-        return [comment, base, type_strength, fp, priv_status, mtime_str, advisories, path]
+        return [comment, base, type_strength, fp, priv_status, ssh_hosts, mtime_str, advisories, path]
 
     def populate_table(self, records):
         self.table.setRowCount(0)
@@ -1136,6 +1402,10 @@ class MainWindow(QMainWindow):
         dlg = AuditLogDialog(self)
         dlg.exec()
 
+    def on_known_hosts(self):
+        dlg = KnownHostsDialog(self)
+        dlg.exec()
+
     # ---------- 匯出 CSV ----------
     def on_export_csv(self):
         if not self.records:
@@ -1155,7 +1425,7 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.writer(f)
-                header = ["金鑰使用者", "檔名", "類型與強度", "SHA256指紋", "私鑰狀態",
+                header = ["金鑰使用者", "檔名", "類型與強度", "SHA256指紋", "私鑰狀態", "SSH config Host",
                           "最後修改", "建議", "公鑰路徑", "私鑰路徑", "公鑰內容"]
                 if include_raw:
                     header.append("私鑰原始內容")
@@ -1174,7 +1444,8 @@ class MainWindow(QMainWindow):
                     pub_content = ""
                     if rec.get("type") and rec.get("blob"):
                         pub_content = f"{rec['type']} {base64.b64encode(rec['blob']).decode()} {comment}".strip()
-                    row = [comment, base, type_strength, fp, priv_status, mtime_str,
+                    ssh_hosts = "、".join(rec.get("ssh_config_hosts", [])) or "（未設定）"
+                    row = [comment, base, type_strength, fp, priv_status, ssh_hosts, mtime_str,
                            rec.get("advisories", "—"), rec.get("pub_path") or "",
                            rec.get("priv_path") or "", pub_content]
                     if include_raw:
