@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.3.1"
+__version__ = "2.3.2"
 
 import os
 import sys
@@ -2011,6 +2011,29 @@ class Worker(QThread):
             "done",
             "[ \"$lfs_hits\" = 0 ] && echo '[OK] 沒有偵測到明顯需要上 LFS 的大型檔案'",
             "echo",
+            "echo '== git_devs 帳號 SSH 金鑰登入 ACL 檢查 =='",
+            "#    DSM 的 sshd 會檢查 home 目錄本身的 Synology ACL，ACL 不乾淨的話會整段無聲",
+            "#    忽略 authorized_keys、退回密碼登入，不會報任何錯誤，很難察覺（2026-07-15 實際事故）。",
+            "acl_bad=0",
+            "gd_members=$(grep '^git_devs:' /etc/group | cut -d: -f4)",
+            "old_ifs=$IFS; IFS=','",
+            "for u in $gd_members; do",
+            "  [ -z \"$u\" ] && continue",
+            "  home=$(grep \"^$u:\" /etc/passwd | cut -d: -f6)",
+            "  [ -z \"$home\" ] && continue",
+            "  acl_line=$(synoacltool -get \"$home\" 2>/dev/null | head -1)",
+            "  if [ -z \"$acl_line\" ]; then",
+            "    echo \"[  ] $u：無法讀取 $home 的 ACL 狀態（權限不足或指令不存在），略過\"",
+            "  elif echo \"$acl_line\" | grep -q 'No ACL'; then",
+            "    :",
+            "  else",
+            "    echo \"[!!] $u：home 目錄（$home）還有 Synology ACL，SSH 金鑰登入可能被無聲忽略、退回密碼登入。修法：sudo synoacltool -del \\\"$home\\\" && sudo chmod 700 \\\"$home\\\"\"",
+            "    acl_bad=$((acl_bad+1))",
+            "  fi",
+            "done",
+            "IFS=$old_ifs",
+            "[ \"$acl_bad\" = 0 ] && echo '[OK] 所有 git_devs 帳號的 home 目錄 ACL 正常'",
+            "echo",
             "echo '== 日誌 =='",
             "[ -d \"$BASE/logs\" ] && echo '[OK] logs 目錄存在' || echo '[  ] 無 logs 目錄'",
             "echo ___END___",
@@ -3984,6 +4007,10 @@ class CreateGitDevsUserDialog(QDialog):
             'echo "偵測到的 home 目錄：$HOME_DIR"',
             "",
             "# 4) 設定 SSH 金鑰登入",
+            "#    先清掉 home 目錄本身的 Synology ACL：DSM 的 sshd 會額外檢查 home 目錄的 ACL，",
+            "#    ACL 不乾淨的話會整個無聲忽略 authorized_keys、直接退回密碼登入（不報錯，很難察覺）。",
+            'sudo synoacltool -del "$HOME_DIR"',
+            'sudo chmod 700 "$HOME_DIR"',
             'sudo mkdir -p "$HOME_DIR/.ssh"',
             "sudo tee \"$HOME_DIR/.ssh/authorized_keys\" >/dev/null <<'EOF'",
             pubkey,
@@ -4341,6 +4368,10 @@ class AddKeyForUserDialog(QDialog):
             'echo "偵測到的 home 目錄：$HOME_DIR"',
             "",
             "# 2) 新增金鑰（若這把已經存在則跳過，不重複加入，不動原本其他金鑰）",
+            "#    先清掉 home 目錄本身的 Synology ACL：DSM 的 sshd 會額外檢查 home 目錄的 ACL，",
+            "#    ACL 不乾淨的話會整個無聲忽略 authorized_keys、直接退回密碼登入（不報錯，很難察覺）。",
+            'sudo synoacltool -del "$HOME_DIR"',
+            'sudo chmod 700 "$HOME_DIR"',
             'sudo mkdir -p "$HOME_DIR/.ssh"',
             'sudo touch "$HOME_DIR/.ssh/authorized_keys"',
             "NEWKEY=$(cat <<'EOF'",
