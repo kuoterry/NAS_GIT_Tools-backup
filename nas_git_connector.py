@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.3.1"
+__version__ = "2.3.2"
 
 import os
 import sys
@@ -3984,6 +3984,10 @@ class CreateGitDevsUserDialog(QDialog):
             'echo "偵測到的 home 目錄：$HOME_DIR"',
             "",
             "# 4) 設定 SSH 金鑰登入",
+            "#    先清掉 home 目錄本身的 Synology ACL：DSM 的 sshd 會額外檢查 home 目錄的 ACL，",
+            "#    ACL 不乾淨的話會整個無聲忽略 authorized_keys、直接退回密碼登入（不報錯，很難察覺）。",
+            'sudo synoacltool -del "$HOME_DIR"',
+            'sudo chmod 700 "$HOME_DIR"',
             'sudo mkdir -p "$HOME_DIR/.ssh"',
             "sudo tee \"$HOME_DIR/.ssh/authorized_keys\" >/dev/null <<'EOF'",
             pubkey,
@@ -4341,6 +4345,10 @@ class AddKeyForUserDialog(QDialog):
             'echo "偵測到的 home 目錄：$HOME_DIR"',
             "",
             "# 2) 新增金鑰（若這把已經存在則跳過，不重複加入，不動原本其他金鑰）",
+            "#    先清掉 home 目錄本身的 Synology ACL：DSM 的 sshd 會額外檢查 home 目錄的 ACL，",
+            "#    ACL 不乾淨的話會整個無聲忽略 authorized_keys、直接退回密碼登入（不報錯，很難察覺）。",
+            'sudo synoacltool -del "$HOME_DIR"',
+            'sudo chmod 700 "$HOME_DIR"',
             'sudo mkdir -p "$HOME_DIR/.ssh"',
             'sudo touch "$HOME_DIR/.ssh/authorized_keys"',
             "NEWKEY=$(cat <<'EOF'",
