@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 import os
 import sys
@@ -32,6 +32,7 @@ import base64
 import hashlib
 import secrets
 import string
+import json
 from datetime import datetime
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
@@ -171,6 +172,59 @@ def ssh_fingerprint(line: str) -> str:
         return "?"
     digest = hashlib.sha256(raw).digest()
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+# Key_Management（同倉庫的獨立姊妹工具）本機金鑰名冊路徑。兩工具原則上完全獨立、
+# 不共用程式碼，這裡是唯一的例外：唯讀讀取這個 JSON 檔案，省去手動複製貼上公鑰，
+# 僅止於此，不反向寫入、不 import 對方模組。
+KEY_MANAGEMENT_REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".key_management", "registry.json")
+
+
+def key_management_registry_pubkeys():
+    """唯讀掃 Key_Management 的 registry.json，回傳 [(顯示用標籤, 公鑰單行內容), ...]。
+    只收目前狀態 active、且對應 .pub 檔存在並看得懂（單行 OpenSSH 格式）的項目；
+    .ppk 或多行 RFC4716 格式的公鑰不在這裡處理，讀不到就跳過。"""
+    try:
+        with open(KEY_MANAGEMENT_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            reg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    items = []
+    for entry in reg.values():
+        if entry.get("status") != "active":
+            continue
+        pub_path = entry.get("pub_path")
+        if not pub_path or not os.path.isfile(pub_path):
+            continue
+        try:
+            with open(pub_path, "r", encoding="utf-8") as f:
+                line = f.readline().strip()
+        except OSError:
+            continue
+        if not is_ssh_pubkey(line):
+            continue
+        comment = entry.get("comment") or "(無 comment)"
+        fp = entry.get("fingerprint") or ssh_fingerprint(line)
+        label = f"{comment}  [{entry.get('type', '?')}]  {fp}"
+        items.append((label, line))
+    return items
+
+
+def pick_key_management_pubkey(parent):
+    """跳出清單讓使用者從 Key_Management 名冊挑一把公鑰，回傳公鑰單行內容或 None（取消/沒東西可選）。"""
+    items = key_management_registry_pubkeys()
+    if not items:
+        QMessageBox.information(
+            parent, "從 Key_Management 匯入",
+            "找不到可用的公鑰——Key_Management 可能還沒產生過金鑰，或現有的都是 .ppk／多行格式，"
+            "請自行開檔複製內容。")
+        return None
+    labels = [it[0] for it in items]
+    label, ok = QInputDialog.getItem(
+        parent, "從 Key_Management 匯入公鑰", "選一把公鑰：", labels, editable=False)
+    if not ok:
+        return None
+    return dict(items)[label]
 
 
 def fmt_size_kb(kb: int) -> str:
@@ -3607,10 +3661,12 @@ class SshKeysDialog(QDialog):
         row = QHBoxLayout()
         self.refresh_b = QPushButton("重新整理")
         self.add_b = QPushButton("新增金鑰…")
+        self.import_b = QPushButton("從 Key_Management 匯入…")
         self.delete_b = QPushButton("刪除")
         self.close_b = QPushButton("關閉")
         row.addWidget(self.refresh_b)
         row.addWidget(self.add_b)
+        row.addWidget(self.import_b)
         row.addWidget(self.delete_b)
         row.addStretch(1)
         row.addWidget(self.close_b)
@@ -3621,12 +3677,13 @@ class SshKeysDialog(QDialog):
 
         self.refresh_b.clicked.connect(self.refresh)
         self.add_b.clicked.connect(self.on_add)
+        self.import_b.clicked.connect(self.on_import)
         self.delete_b.clicked.connect(self.on_delete)
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
     def _busy(self, b):
-        for x in (self.refresh_b, self.add_b, self.delete_b):
+        for x in (self.refresh_b, self.add_b, self.import_b, self.delete_b):
             x.setEnabled(not b)
 
     def refresh(self):
@@ -3662,6 +3719,14 @@ class SshKeysDialog(QDialog):
         text = text.strip()
         if not ok or not text:
             return
+        self._add_key_line(text)
+
+    def on_import(self):
+        pubkey = pick_key_management_pubkey(self)
+        if pubkey:
+            self._add_key_line(pubkey)
+
+    def _add_key_line(self, text):
         cfg = dict(self.cfg)
         cfg["key_line"] = text
         self._busy(True)
@@ -3746,6 +3811,10 @@ class CreateGitDevsUserDialog(QDialog):
             "如果這個帳號是要給別人用，記得把私鑰檔安全地交給對方，不要用明碼管道傳送。")
         self.gen_key_b.clicked.connect(self.on_gen_key)
         pubkey_row.addWidget(self.gen_key_b)
+        self.import_key_b = QPushButton("從 Key_Management 匯入…")
+        self.import_key_b.setToolTip("從姊妹工具 Key_Management 的本機金鑰名冊挑一把已產生好的公鑰，唯讀讀取，不會改動對方的檔案。")
+        self.import_key_b.clicked.connect(self.on_import_key)
+        pubkey_row.addWidget(self.import_key_b)
         lay.addLayout(pubkey_row)
         self.pubkey_edit = QPlainTextEdit()
         self.pubkey_edit.setPlaceholderText("ssh-ed25519 AAAA... comment")
@@ -3809,6 +3878,11 @@ class CreateGitDevsUserDialog(QDialog):
                 self, "金鑰已產生",
                 msg + "\n\n如果這個帳號要給別人用，請把私鑰檔安全地交給對方（不要用 email/聊天軟體明碼傳），"
                       "交接完成後可考慮從這台機器上刪除私鑰。")
+
+    def on_import_key(self):
+        pubkey = pick_key_management_pubkey(self)
+        if pubkey:
+            self.pubkey_edit.setPlainText(pubkey)
 
     def on_generate(self):
         username = self.user_edit.text().strip()
@@ -3936,14 +4010,18 @@ class GitDevsUsersDialog(QDialog):
         self.setWindowTitle("git_devs 帳號清單")
         self.resize(580, 420)
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("目前 git_devs 群組的所有成員（含 home 目錄與 authorized_keys 金鑰數）。選一個可以移除。"))
+        lay.addWidget(QLabel("目前 git_devs 群組的所有成員（含 home 目錄與 authorized_keys 金鑰數）。選一個可以移除、加金鑰或輪替金鑰。"))
         self.list = QListWidget()
         lay.addWidget(self.list, stretch=1)
         row = QHBoxLayout()
         self.refresh_b = QPushButton("重新整理")
+        self.add_key_b = QPushButton("幫選取帳號新增金鑰…")
+        self.rotate_b = QPushButton("金鑰輪替…")
         self.remove_b = QPushButton("移除選取帳號…")
         self.close_b = QPushButton("關閉")
         row.addWidget(self.refresh_b)
+        row.addWidget(self.add_key_b)
+        row.addWidget(self.rotate_b)
         row.addWidget(self.remove_b)
         row.addStretch(1)
         row.addWidget(self.close_b)
@@ -3953,13 +4031,22 @@ class GitDevsUsersDialog(QDialog):
         lay.addWidget(self.status)
 
         self.refresh_b.clicked.connect(self.refresh)
+        self.add_key_b.clicked.connect(self.on_add_key)
+        self.rotate_b.clicked.connect(self.on_rotate)
         self.remove_b.clicked.connect(self.on_remove)
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
     def _busy(self, b):
-        for x in (self.refresh_b, self.remove_b):
+        for x in (self.refresh_b, self.add_key_b, self.rotate_b, self.remove_b):
             x.setEnabled(not b)
+
+    def _selected_username(self):
+        it = self.list.currentItem()
+        if not it:
+            self.status.setText("請先在清單選一個帳號。")
+            return None
+        return it.data(Qt.ItemDataRole.UserRole)
 
     def refresh(self):
         self.list.clear()
@@ -3984,12 +4071,26 @@ class GitDevsUsersDialog(QDialog):
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
 
-    def on_remove(self):
-        it = self.list.currentItem()
-        if not it:
-            self.status.setText("請先在清單選一個帳號。")
+    def on_add_key(self):
+        username = self._selected_username()
+        if not username:
             return
-        username = it.data(Qt.ItemDataRole.UserRole)
+        dlg = AddKeyForUserDialog(self, self.cfg, username)
+        dlg.exec()
+        self.refresh()
+
+    def on_rotate(self):
+        username = self._selected_username()
+        if not username:
+            return
+        dlg = RotateKeyDialog(self, self.cfg, username)
+        dlg.exec()
+        self.refresh()
+
+    def on_remove(self):
+        username = self._selected_username()
+        if not username:
+            return
         dlg = RemoveGitDevsUserDialog(self, self.cfg, username)
         dlg.exec()
         self.refresh()
@@ -4120,6 +4221,312 @@ class RemoveGitDevsUserDialog(QDialog):
                 "#    但仍可用同一把 SSH 金鑰登入 NAS shell）。之後若要徹底刪除，可自行執行：",
                 f"#    sudo synouser --del {self.username}",
             ]
+        return "\n".join(lines)
+
+
+# ============================================================
+# 幫既有 git_devs 帳號新增一把 SSH 金鑰：產生指令（做法比照新增/移除帳號，工具本身不執行）
+# 跟 SshKeysDialog 的差異：SshKeysDialog 只能改「目前登入身份自己」的 authorized_keys，
+# 這裡透過 sudo 腳本，即使連不上目標帳號本人，也能由有 sudo 權限的管理者代為加鑰匙。
+# ============================================================
+class AddKeyForUserDialog(QDialog):
+    def __init__(self, parent, cfg, username):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.username = username
+        self.worker = None
+        self.setWindowTitle(f"幫既有帳號新增金鑰 — {username}")
+        self.setMinimumWidth(520)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            f"幫「{username}」這個既有 git_devs 帳號多加一把 SSH 公鑰。跟建立新帳號一樣，"
+            "這套工具不會自動執行——按「產生設定指令」後把整段複製，貼到有 sudo 權限的 SSH 視窗一次執行到底。\n"
+            "適用情境：你自己連不上這個帳號（沒有它原本的金鑰/密碼），但有 sudo 權限，要代為加鑰匙。"))
+        pubkey_row = QHBoxLayout()
+        pubkey_row.addWidget(QLabel("新公鑰內容："), stretch=1)
+        self.gen_key_b = QPushButton("本機產生新金鑰…")
+        self.gen_key_b.setToolTip("在這台機器上跑 ssh-keygen 產生一組新的金鑰對，私鑰留在本機，只把公鑰內容帶進下面欄位。")
+        self.gen_key_b.clicked.connect(self.on_gen_key)
+        pubkey_row.addWidget(self.gen_key_b)
+        self.import_key_b = QPushButton("從 Key_Management 匯入…")
+        self.import_key_b.clicked.connect(self.on_import_key)
+        pubkey_row.addWidget(self.import_key_b)
+        lay.addLayout(pubkey_row)
+        self.pubkey_edit = QPlainTextEdit()
+        self.pubkey_edit.setPlaceholderText("ssh-ed25519 AAAA... comment")
+        self.pubkey_edit.setFixedHeight(80)
+        lay.addWidget(self.pubkey_edit)
+
+        row = QHBoxLayout()
+        self.gen_b = QPushButton("產生設定指令")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.gen_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.gen_b.clicked.connect(self.on_generate)
+        self.close_b.clicked.connect(self.accept)
+
+    def on_gen_key(self):
+        default_name = f"id_ed25519_{self.username}"
+        name, ok = QInputDialog.getText(
+            self, "本機產生新金鑰",
+            "金鑰檔名（存到 ~/.ssh/ 底下，私鑰留在這台機器，只有公鑰內容會被帶進上面欄位）：",
+            text=default_name)
+        name = name.strip()
+        if not ok or not name:
+            return
+        ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+        path = os.path.join(ssh_dir, name)
+        if os.path.exists(path) or os.path.exists(path + ".pub"):
+            QMessageBox.warning(self, "檔案已存在", f"{path}（或 .pub）已經存在，請換一個檔名，避免覆蓋既有金鑰。")
+            return
+        self.gen_key_b.setEnabled(False)
+        self.status.setText("本機產生金鑰中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["key_path"] = path
+        cfg["key_comment"] = self.username
+        self.worker = Worker(cfg, mode="local_gen_ssh_key")
+        self.worker.hooks.connect(lambda pubkey: self.pubkey_edit.setPlainText(pubkey))
+        self.worker.done.connect(self._on_gen_key_done)
+        self.worker.start()
+
+    def _on_gen_key_done(self, ok, msg):
+        self.gen_key_b.setEnabled(True)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        if ok:
+            QMessageBox.information(
+                self, "金鑰已產生",
+                msg + "\n\n請把私鑰檔安全地交給實際使用這個帳號的人（不要用 email/聊天軟體明碼傳）。")
+
+    def on_import_key(self):
+        pubkey = pick_key_management_pubkey(self)
+        if pubkey:
+            self.pubkey_edit.setPlainText(pubkey)
+
+    def on_generate(self):
+        pubkey = " ".join(self.pubkey_edit.toPlainText().split())
+        if not is_ssh_pubkey(pubkey):
+            self.status.setText("公鑰格式看起來不對，應以 ssh-rsa / ssh-ed25519 等開頭。")
+            self.status.setStyleSheet("color:#b00020;")
+            return
+        script = self._build_script(pubkey)
+        dlg = TextViewDialog(self, f"幫既有帳號新增金鑰 — 待執行指令（{self.username}）", script)
+        dlg.exec()
+        self.status.setText("✔ 指令已產生，請複製貼到有 sudo 權限的 SSH 視窗執行。")
+        self.status.setStyleSheet("color:#1a7f37;")
+
+    def _build_script(self, pubkey):
+        lines = [
+            "# ============================================================",
+            f"# 幫既有 git_devs 帳號新增金鑰：{self.username}",
+            "# 由 NasGitConnector 產生，這段指令不會自動執行。",
+            "# 整段複製、貼到有 sudo 權限的 SSH 視窗、一次執行到底即可。",
+            "# 全程唯一會問你的是最開頭的 sudo -v（問你自己的登入密碼），其餘全自動，不用手動改任何一行。",
+            "# ============================================================",
+            "",
+            "# 0) 先讓 sudo 記住密碼，避免整段貼下去時中途又跳密碼提示、把後面指令吃掉／打斷",
+            "sudo -v",
+            "",
+            "# 1) 確認實際 home 目錄（不同 DSM 設定可能不是 /var/services/homes/<帳號>）",
+            f"HOME_DIR=$(grep \"^{self.username}:\" /etc/passwd | cut -d: -f6)",
+            f'[ -z "$HOME_DIR" ] && HOME_DIR=/var/services/homes/{self.username}',
+            'echo "偵測到的 home 目錄：$HOME_DIR"',
+            "",
+            "# 2) 新增金鑰（若這把已經存在則跳過，不重複加入，不動原本其他金鑰）",
+            'sudo mkdir -p "$HOME_DIR/.ssh"',
+            'sudo touch "$HOME_DIR/.ssh/authorized_keys"',
+            "NEWKEY=$(cat <<'EOF'",
+            pubkey,
+            "EOF",
+            ")",
+            'if sudo grep -qxF "$NEWKEY" "$HOME_DIR/.ssh/authorized_keys" 2>/dev/null; then',
+            '  echo "這把公鑰已經存在，不重複加入。"',
+            "else",
+            '  echo "$NEWKEY" | sudo tee -a "$HOME_DIR/.ssh/authorized_keys" >/dev/null',
+            '  echo "已新增。"',
+            "fi",
+            'sudo chmod 700 "$HOME_DIR/.ssh"',
+            'sudo chmod 600 "$HOME_DIR/.ssh/authorized_keys"',
+            f'sudo chown -R {self.username}:users "$HOME_DIR/.ssh"',
+        ]
+        return "\n".join(lines)
+
+
+# ============================================================
+# git_devs 既有帳號金鑰輪替：新公鑰＋撤銷舊公鑰一次做完（做法比照新增/移除帳號，工具本身不執行）
+# 刻意只做這一件事：不碰 Key_Management 的名冊狀態，也不做排程／自動化，
+# 舊鑰匙要不要在 Key_Management 那邊標記封存，交回使用者自行判斷。
+# ============================================================
+class RotateKeyDialog(QDialog):
+    def __init__(self, parent, cfg, username):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.username = username
+        self.worker = None
+        self.setWindowTitle(f"金鑰輪替 — {username}")
+        self.setMinimumWidth(560)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            f"幫「{username}」把舊金鑰換成新金鑰：新公鑰加入、舊公鑰撤銷，一段腳本做完。\n"
+            "跟其他帳號管理功能一樣，這套工具不會自動執行——產生指令後自行複製貼到有 sudo 權限的 SSH 視窗執行。\n"
+            "注意：這裡只處理 NAS 端的 authorized_keys，Key_Management 本機名冊裡舊金鑰要不要標記封存，"
+            "請自行到 Key_Management 那邊處理，這裡不會幫你動。"))
+
+        lay.addWidget(QLabel("舊公鑰（要撤銷，貼上完整那一行；留空則只加新的，不撤銷）："))
+        self.old_pubkey_edit = QPlainTextEdit()
+        self.old_pubkey_edit.setPlaceholderText("ssh-ed25519 AAAA... old-comment（可留空）")
+        self.old_pubkey_edit.setFixedHeight(60)
+        lay.addWidget(self.old_pubkey_edit)
+
+        new_row = QHBoxLayout()
+        new_row.addWidget(QLabel("新公鑰："), stretch=1)
+        self.gen_key_b = QPushButton("本機產生新金鑰…")
+        self.gen_key_b.clicked.connect(self.on_gen_key)
+        new_row.addWidget(self.gen_key_b)
+        self.import_key_b = QPushButton("從 Key_Management 匯入…")
+        self.import_key_b.clicked.connect(self.on_import_key)
+        new_row.addWidget(self.import_key_b)
+        lay.addLayout(new_row)
+        self.new_pubkey_edit = QPlainTextEdit()
+        self.new_pubkey_edit.setPlaceholderText("ssh-ed25519 AAAA... new-comment")
+        self.new_pubkey_edit.setFixedHeight(60)
+        lay.addWidget(self.new_pubkey_edit)
+
+        row = QHBoxLayout()
+        self.gen_b = QPushButton("產生設定指令")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.gen_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.gen_b.clicked.connect(self.on_generate)
+        self.close_b.clicked.connect(self.accept)
+
+    def on_gen_key(self):
+        default_name = f"id_ed25519_{self.username}_new"
+        name, ok = QInputDialog.getText(
+            self, "本機產生新金鑰",
+            "金鑰檔名（存到 ~/.ssh/ 底下，私鑰留在這台機器，只有公鑰內容會被帶進下面欄位）：",
+            text=default_name)
+        name = name.strip()
+        if not ok or not name:
+            return
+        ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+        path = os.path.join(ssh_dir, name)
+        if os.path.exists(path) or os.path.exists(path + ".pub"):
+            QMessageBox.warning(self, "檔案已存在", f"{path}（或 .pub）已經存在，請換一個檔名，避免覆蓋既有金鑰。")
+            return
+        self.gen_key_b.setEnabled(False)
+        self.status.setText("本機產生金鑰中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["key_path"] = path
+        cfg["key_comment"] = f"{self.username}-rotated"
+        self.worker = Worker(cfg, mode="local_gen_ssh_key")
+        self.worker.hooks.connect(lambda pubkey: self.new_pubkey_edit.setPlainText(pubkey))
+        self.worker.done.connect(self._on_gen_key_done)
+        self.worker.start()
+
+    def _on_gen_key_done(self, ok, msg):
+        self.gen_key_b.setEnabled(True)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        if ok:
+            QMessageBox.information(
+                self, "金鑰已產生",
+                msg + "\n\n請把新私鑰檔安全地交給實際使用這個帳號的人，確認新鑰匙能登入後，再把舊私鑰刪除、作廢。")
+
+    def on_import_key(self):
+        pubkey = pick_key_management_pubkey(self)
+        if pubkey:
+            self.new_pubkey_edit.setPlainText(pubkey)
+
+    def on_generate(self):
+        new_pubkey = " ".join(self.new_pubkey_edit.toPlainText().split())
+        if not is_ssh_pubkey(new_pubkey):
+            self.status.setText("新公鑰格式看起來不對，應以 ssh-rsa / ssh-ed25519 等開頭。")
+            self.status.setStyleSheet("color:#b00020;")
+            return
+        old_pubkey = " ".join(self.old_pubkey_edit.toPlainText().split())
+        if old_pubkey and not is_ssh_pubkey(old_pubkey):
+            self.status.setText("舊公鑰格式看起來不對，應以 ssh-rsa / ssh-ed25519 等開頭（或留空跳過撤銷）。")
+            self.status.setStyleSheet("color:#b00020;")
+            return
+        script = self._build_script(new_pubkey, old_pubkey)
+        dlg = TextViewDialog(self, f"金鑰輪替 — 待執行指令（{self.username}）", script)
+        dlg.exec()
+        self.status.setText("✔ 指令已產生，請複製貼到有 sudo 權限的 SSH 視窗執行。")
+        self.status.setStyleSheet("color:#1a7f37;")
+
+    def _build_script(self, new_pubkey, old_pubkey):
+        lines = [
+            "# ============================================================",
+            f"# 金鑰輪替：{self.username}",
+            "# 由 NasGitConnector 產生，這段指令不會自動執行。",
+            "# 整段複製、貼到有 sudo 權限的 SSH 視窗、一次執行到底即可。",
+            "# 全程唯一會問你的是最開頭的 sudo -v（問你自己的登入密碼），其餘全自動，不用手動改任何一行。",
+            "# ============================================================",
+            "",
+            "# 0) 先讓 sudo 記住密碼，避免整段貼下去時中途又跳密碼提示、把後面指令吃掉／打斷",
+            "sudo -v",
+            "",
+            "# 1) 確認實際 home 目錄（不同 DSM 設定可能不是 /var/services/homes/<帳號>）",
+            f"HOME_DIR=$(grep \"^{self.username}:\" /etc/passwd | cut -d: -f6)",
+            f'[ -z "$HOME_DIR" ] && HOME_DIR=/var/services/homes/{self.username}',
+            'echo "偵測到的 home 目錄：$HOME_DIR"',
+            'AK="$HOME_DIR/.ssh/authorized_keys"',
+            "",
+            "# 2) 動手前先備份原檔",
+            'sudo mkdir -p "$HOME_DIR/.ssh"',
+            'sudo touch "$AK"',
+            'sudo cp "$AK" "$AK.bak-$(date +%Y%m%d-%H%M%S)"',
+            "",
+            "# 3) 加入新公鑰（若已存在則跳過，不重複加入）",
+            "NEWKEY=$(cat <<'EOF'",
+            new_pubkey,
+            "EOF",
+            ")",
+            'if sudo grep -qxF "$NEWKEY" "$AK" 2>/dev/null; then',
+            '  echo "新公鑰已經存在，不重複加入。"',
+            "else",
+            '  echo "$NEWKEY" | sudo tee -a "$AK" >/dev/null',
+            '  echo "已加入新公鑰。"',
+            "fi",
+        ]
+        if old_pubkey:
+            lines += [
+                "",
+                "# 4) 撤銷舊公鑰（找不到也不會報錯，就當作本來就不在）",
+                "OLDKEY=$(cat <<'EOF'",
+                old_pubkey,
+                "EOF",
+                ")",
+                'sudo grep -vxF "$OLDKEY" "$AK" | sudo tee "$AK.tmp" >/dev/null',
+                'sudo mv "$AK.tmp" "$AK"',
+                'echo "已撤銷舊公鑰（原檔已備份在上面第 2 步印出的 .bak 檔名）。"',
+            ]
+        else:
+            lines += [
+                "",
+                "# 4) 沒有填舊公鑰，跳過撤銷這步（只新增，不撤銷任何既有金鑰）",
+            ]
+        lines += [
+            "",
+            'sudo chmod 700 "$HOME_DIR/.ssh"',
+            'sudo chmod 600 "$AK"',
+            f'sudo chown -R {self.username}:users "$HOME_DIR/.ssh"',
+            "",
+            "# 完成後記得：確認新鑰匙能登入、舊鑰匙不能登入，再回 Key_Management 把舊金鑰標記封存/刪除。",
+        ]
         return "\n".join(lines)
 
 
