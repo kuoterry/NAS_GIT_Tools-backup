@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.3.2"
+__version__ = "2.4.0"
 
 import os
 import sys
@@ -433,10 +433,12 @@ class Worker(QThread):
         return cp.returncode, out, err
 
     def _ssh(self, remote_cmd):
-        """對 NAS 執行遠端指令。有密碼→用 plink -pw；無密碼→用內建 ssh（金鑰）。"""
+        """對 NAS 執行遠端指令。有密碼→用 plink -pw；無密碼→用內建 ssh（金鑰，若這個身份
+        指定了私鑰檔就明確帶 -i，避免 SSH 只憑預設檔名/agent 猜不到非預設命名的金鑰）。"""
         c = self.cfg
         ssh_host = f"{c['user']}@{c['host']}"
         pw = c.get("password", "")
+        identity_file = c.get("identity_file", "")
         if pw:
             plink = shutil.which("plink")
             if not plink:
@@ -454,21 +456,29 @@ class Worker(QThread):
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ConnectTimeout=10",
-                ssh_host, remote_cmd,
             ]
+            if identity_file:
+                args += ["-i", identity_file, "-o", "IdentitiesOnly=yes"]
+            args += [ssh_host, remote_cmd]
             return self._run(args)
 
     def _git_env(self):
-        """本地 git 若要用密碼推送，透過 plink 當 GIT_SSH_COMMAND。無密碼回 None。"""
+        """本地 git 若要用密碼推送，透過 plink 當 GIT_SSH_COMMAND；若無密碼但這個身份指定了
+        私鑰檔，改用內建 ssh 明確帶 -i。兩者都沒設就回 None，讓 git 用系統預設解析。"""
         pw = self.cfg.get("password", "")
-        if not pw:
-            return None
-        plink = shutil.which("plink")
-        if not plink:
-            return None
-        env = os.environ.copy()
-        env["GIT_SSH_COMMAND"] = f'"{plink}" -pw {pw}'
-        return env
+        identity_file = self.cfg.get("identity_file", "")
+        if pw:
+            plink = shutil.which("plink")
+            if not plink:
+                return None
+            env = os.environ.copy()
+            env["GIT_SSH_COMMAND"] = f'"{plink}" -pw {pw}'
+            return env
+        if identity_file:
+            env = os.environ.copy()
+            env["GIT_SSH_COMMAND"] = f'ssh -i "{identity_file}" -o IdentitiesOnly=yes'
+            return env
+        return None
 
     def run(self):
         if self.mode == "test":
@@ -4916,6 +4926,18 @@ class MainWindow(QMainWindow):
         )
         ng.addWidget(self.remember_pw_check, 6, 0, 1, 5)
 
+        # 私鑰檔案（選填）：留空＝交給 SSH 預設解析（agent／~/.ssh/config／預設檔名）；
+        # 有填＝這個身份的每次連線都明確帶 -i 指定這把，適合非預設檔名的金鑰（例如 git_devs 各帳號）。
+        ng.addWidget(QLabel("私鑰檔案："), 7, 0)
+        id_file_row = QHBoxLayout()
+        self.identity_file_edit = QLineEdit()
+        self.identity_file_edit.setPlaceholderText("留空＝用 SSH 預設解析（agent／~/.ssh/config／預設檔名）")
+        id_file_row.addWidget(self.identity_file_edit)
+        id_file_browse_btn = QPushButton("瀏覽…")
+        id_file_browse_btn.clicked.connect(self.on_browse_identity_file)
+        id_file_row.addWidget(id_file_browse_btn)
+        ng.addLayout(id_file_row, 7, 1, 1, 4)
+
         root.addWidget(nb)
 
         save_prof_btn.clicked.connect(self.save_current_profile)
@@ -5310,12 +5332,14 @@ class MainWindow(QMainWindow):
         self.settings.setValue(f"profiles/{name}/user", vals.get("user", ""))
         self.settings.setValue(f"profiles/{name}/host", vals.get("host", ""))
         self.settings.setValue(f"profiles/{name}/remote_root", vals.get("remote_root", ""))
+        self.settings.setValue(f"profiles/{name}/identity_file", vals.get("identity_file", ""))
 
     def _read_profile(self, name):
         return {
             "user": self.settings.value(f"profiles/{name}/user", "kuoterry"),
             "host": self.settings.value(f"profiles/{name}/host", "kcc3713.synology.me"),
             "remote_root": self.settings.value(f"profiles/{name}/remote_root", "/volume1/Git_Server"),
+            "identity_file": self.settings.value(f"profiles/{name}/identity_file", ""),
         }
 
     def load_profile_into_fields(self, name):
@@ -5325,6 +5349,7 @@ class MainWindow(QMainWindow):
         self.user_edit.setText(vals["user"])
         self.host_combo.setCurrentText(vals["host"])
         self.root_edit.setText(vals["remote_root"])
+        self.identity_file_edit.setText(vals["identity_file"])
         # 密碼：只有之前勾了「記住」才會有存；沒有就留空
         saved_pw = self.settings.value(f"profiles/{name}/password", "")
         self.pw_edit.setText(saved_pw)
@@ -5344,6 +5369,7 @@ class MainWindow(QMainWindow):
             "user": self.user_edit.text().strip(),
             "host": self.host_combo.currentText().strip(),
             "remote_root": self.root_edit.text().strip(),
+            "identity_file": self.identity_file_edit.text().strip(),
         })
         # 密碼：勾了「記住」才寫入登錄檔；沒勾就把之前存的清掉
         if self.remember_pw_check.isChecked():
@@ -5366,6 +5392,7 @@ class MainWindow(QMainWindow):
             "user": self.user_edit.text().strip() or "kuoterry",
             "host": self.host_combo.currentText().strip() or "kcc3713.synology.me",
             "remote_root": self.root_edit.text().strip() or "/volume1/Git_Server",
+            "identity_file": self.identity_file_edit.text().strip(),
         })
         names.append(name)
         self.settings.setValue("profile_names", names)
@@ -5460,6 +5487,7 @@ class MainWindow(QMainWindow):
             "host": self.host_combo.currentText().strip() or "kcc3713.synology.me",
             "remote_root": self.root_edit.text().strip() or "/volume1/Git_Server",
             "password": self.pw_edit.text(),
+            "identity_file": self.identity_file_edit.text().strip(),
         }
 
     def save_settings(self, cfg):
@@ -5474,12 +5502,19 @@ class MainWindow(QMainWindow):
             "host": self.host_combo.currentText().strip() or "kcc3713.synology.me",
             "remote_root": self.root_edit.text().strip() or "/volume1/Git_Server",
             "password": self.pw_edit.text(),
+            "identity_file": self.identity_file_edit.text().strip(),
         }
 
     def toggle_pw_echo(self):
         mode = (QLineEdit.EchoMode.Normal if self.show_pw_check.isChecked()
                 else QLineEdit.EchoMode.Password)
         self.pw_edit.setEchoMode(mode)
+
+    def on_browse_identity_file(self):
+        start = self.identity_file_edit.text().strip() or os.path.join(os.path.expanduser("~"), ".ssh")
+        path, _ = QFileDialog.getOpenFileName(self, "選擇這個身份要用的私鑰檔案", start)
+        if path:
+            self.identity_file_edit.setText(path)
 
     def append_log(self, text: str):
         self.log_view.appendPlainText(text)
