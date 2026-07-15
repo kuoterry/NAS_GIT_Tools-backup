@@ -50,8 +50,19 @@ if errorlevel 1 (
 )
 echo.
 
-echo [3/3] Done!
-echo   EXE: "%~dp0dist\KeyManagement.exe"
+echo [3/4] Tagging a versioned copy...
+set "VERSION="
+for /f "delims=" %%v in ('%PY% -c "import re;print(re.search(r'__version__ *= *\"([^\"]+)\"', open('key_management.py', encoding='utf-8').read()).group(1))"') do set "VERSION=%%v"
+if defined VERSION (
+  copy /y "%~dp0dist\KeyManagement.exe" "%~dp0dist\KeyManagement_v%VERSION%.exe" >nul
+  echo   Versioned copy: "%~dp0dist\KeyManagement_v%VERSION%.exe"
+) else (
+  echo   [WARN] Could not read __version__ from key_management.py, skipped versioned copy.
+)
+echo.
+
+echo [4/4] Done!
+echo   EXE (stable name, use this for your desktop shortcut): "%~dp0dist\KeyManagement.exe"
 echo   Drag dist\KeyManagement.exe to the desktop and double-click to use.
 echo.
 echo   Note: "Generate new key pair" and deriving a public key from an

@@ -50,8 +50,19 @@ if errorlevel 1 (
 )
 echo.
 
-echo [3/3] Done!
-echo   EXE: "%~dp0dist\NasGitConnector.exe"
+echo [3/4] Tagging a versioned copy...
+set "VERSION="
+for /f "delims=" %%v in ('%PY% -c "import re;print(re.search(r'__version__ *= *\"([^\"]+)\"', open('nas_git_connector.py', encoding='utf-8').read()).group(1))"') do set "VERSION=%%v"
+if defined VERSION (
+  copy /y "%~dp0dist\NasGitConnector.exe" "%~dp0dist\NasGitConnector_v%VERSION%.exe" >nul
+  echo   Versioned copy: "%~dp0dist\NasGitConnector_v%VERSION%.exe"
+) else (
+  echo   [WARN] Could not read __version__ from nas_git_connector.py, skipped versioned copy.
+)
+echo.
+
+echo [4/4] Done!
+echo   EXE (stable name, use this for your desktop shortcut): "%~dp0dist\NasGitConnector.exe"
 echo   Drag dist\NasGitConnector.exe to the desktop and double-click to use.
 echo.
 echo   Note: the PC still needs git and ssh (Windows built-in OpenSSH),
