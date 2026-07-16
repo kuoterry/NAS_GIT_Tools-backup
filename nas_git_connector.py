@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.4.4"
+__version__ = "2.4.5"
 
 import os
 import sys
@@ -251,6 +251,40 @@ def open_admin_terminal(cfg: dict):
         return True, ""
     except OSError as e:
         return False, f"開啟終端機失敗：{e}"
+
+
+def _login_precondition_selfcheck(username: str) -> list:
+    """回傳一段 shell 片段（字串 list），一次檢查「SSH 金鑰登入某 git_devs 帳號」目前已知
+    會踩到的每一個前置條件，跑完印出 ✅/‼️ 摘要——不是每次踩到新坑才補一條檢查，而是
+    把目前已知的坑（shell、home 擁有者、home ACL、authorized_keys）一次列成清單，讓下一個
+    帳號在「建立/補金鑰當下」就能看到問題，不用等事後登入失敗才回頭排查。
+
+    只檢查、印警告，不重覆做已經在腳本前面做過的修正動作（shell 強制設定、
+    chown/chmod/synoacltool 都已經在前面步驟做過），這裡純粹是跑完後的總結。
+    CreateGitDevsUserDialog（新帳號）、AddKeyForUserDialog（補金鑰）都呼叫這個共用片段，
+    確保兩邊的檢查清單不會慢慢長歪、各自遺漏。"""
+    return [
+        "# ---- 登入前置條件自我檢查（已知會擋 SSH 金鑰登入的項目，一次列出）----",
+        f'SHELL_NOW=$(grep "^{username}:" /etc/passwd | cut -d: -f7)',
+        'case "$SHELL_NOW" in',
+        '  */nologin|*/false)',
+        f'    echo "‼️  shell 是 $SHELL_NOW，SSH 執行的所有指令（含 git push）都會被擋，需要人工排查" ;;',
+        "  *)",
+        '    echo "✅ shell：$SHELL_NOW" ;;',
+        "esac",
+        f'OWNER_NOW=$(stat -c "%U" "$HOME_DIR" 2>/dev/null)',
+        f'if [ "$OWNER_NOW" = "{username}" ]; then',
+        '  echo "✅ home 目錄擁有者：$OWNER_NOW"',
+        "else",
+        f'  echo "‼️  home 目錄擁有者是 $OWNER_NOW，不是 {username}，sshd 會拒絕金鑰登入"',
+        "fi",
+        '# authorized_keys 在對方 700 的 .ssh 目錄底下，非 root 連 stat 都進不去，必須用 sudo 才問得到真相：',
+        'if sudo test -s "$HOME_DIR/.ssh/authorized_keys" 2>/dev/null; then',
+        '  echo "✅ authorized_keys 有內容"',
+        "else",
+        '  echo "‼️  authorized_keys 是空的或不存在，這個帳號還沒有能用的金鑰"',
+        "fi",
+    ]
 
 
 def ssh_fingerprint(line: str) -> str:
@@ -4116,7 +4150,14 @@ class CreateGitDevsUserDialog(QDialog):
         lines += [
             f"sudo synouser --add {username} '{password}' {shq(desc)} {shq(email)} 0 0",
             "",
-            "# 2) 加入 git_devs 群組",
+            "# 2) 強制設定登入 shell（不依賴 synouser --add 的預設值）",
+            "#    DSM 建帳號時偶爾給 /sbin/nologin（觸發條件不明，synouser 沒有可靠參數能指定），",
+            "#    /sbin/nologin 會擋掉「所有」透過 SSH 執行的指令，不只是互動登入——git push 用的",
+            "#    git-receive-pack 一樣被擋，金鑰再對也沒用（git_user4 就是栽在這裡）。直接改",
+            "#    /etc/passwd 那一行最保險，不依賴任何 synouser 子指令（版本不明、不可靠）。",
+            f"sudo sed -i 's#^\\({username}:.*:\\)/sbin/nologin$#\\1/bin/sh#' /etc/passwd",
+            "",
+            "# 3) 加入 git_devs 群組",
             "#    注意：synogroup --member 是「整批覆蓋」不是「附加」！",
             f"#    以下已經把產生指令當下查到的既有成員（{', '.join(member_list) or '（查不到既有成員——如果你知道應該有人，先手動核對 /etc/group 再繼續，不要照跑下一行）'}）都列進去。",
             f"sudo synogroup --member git_devs {new_members}",
@@ -4130,12 +4171,12 @@ class CreateGitDevsUserDialog(QDialog):
             "done",
             'echo "目前 git_devs 成員：$AFTER_MEMBERS"',
             "",
-            "# 3) 確認實際 home 目錄（不同 DSM 設定可能不是 /var/services/homes/<帳號>）",
+            "# 4) 確認實際 home 目錄（不同 DSM 設定可能不是 /var/services/homes/<帳號>）",
             f"HOME_DIR=$(grep \"^{username}:\" /etc/passwd | cut -d: -f6)",
             f'[ -z "$HOME_DIR" ] && HOME_DIR=/var/services/homes/{username}',
             'echo "偵測到的 home 目錄：$HOME_DIR"',
             "",
-            "# 4) 設定 SSH 金鑰登入",
+            "# 5) 設定 SSH 金鑰登入",
             "#    先清掉 home 目錄本身的 Synology ACL：DSM 的 sshd 會額外檢查 home 目錄的 ACL，",
             "#    ACL 不乾淨的話會整個無聲忽略 authorized_keys、直接退回密碼登入（不報錯，很難察覺）。",
             "#    synouser --add 建出來的 home 目錄擁有者常常還是 root，不 chown 回本人的話，",
@@ -4151,11 +4192,15 @@ class CreateGitDevsUserDialog(QDialog):
             'sudo chmod 600 "$HOME_DIR/.ssh/authorized_keys"',
             f'sudo chown -R {username}:users "$HOME_DIR/.ssh"',
             "",
-            "# 5) 同步既有倉庫權限，讓新帳號一開始就能直接 push（跟修 kuoterry/Git_User1 那次同一件事）",
+            "# 6) 同步既有倉庫權限，讓新帳號一開始就能直接 push（跟修 kuoterry/Git_User1 那次同一件事）",
             f"sudo chmod -R g+rwX {root}",
             f"sudo find {root} -maxdepth 1 -type d -name '*.git' -exec chmod g+s {{}} \\;",
             "",
-            "# 6) 完成後回這套工具按「一鍵修復…」，把 core.sharedRepository=group 補到每個既有倉庫。",
+            "# 7) 完成後回這套工具按「一鍵修復…」，把 core.sharedRepository=group 補到每個既有倉庫。",
+            "",
+        ] + _login_precondition_selfcheck(username) + [
+            "",
+            "# 完成。上面「登入前置條件自我檢查」若全部 ✅，這個帳號應該就能直接用金鑰登入。",
         ]
         return "\n".join(lines)
 
@@ -4502,7 +4547,14 @@ class AddKeyForUserDialog(QDialog):
             f'[ -z "$HOME_DIR" ] && HOME_DIR=/var/services/homes/{self.username}',
             'echo "偵測到的 home 目錄：$HOME_DIR"',
             "",
-            "# 2) 新增金鑰（若這把已經存在則跳過，不重複加入，不動原本其他金鑰）",
+            "# 2) 強制設定登入 shell（既有帳號也可能被 DSM 設成 /sbin/nologin）",
+            "#    /sbin/nologin 會擋掉「所有」透過 SSH 執行的指令，不只是互動登入——git push 用的",
+            "#    git-receive-pack 一樣被擋，金鑰再對也沒用（git_user4 就是栽在這裡）。這個帳號",
+            "#    可能是很久以前建的、也可能不是這套工具建的，不確定當初 shell 設對了沒，",
+            "#    每次補金鑰都順手檢查/修正一次，比等下次登入失敗才回頭查划算。",
+            f"sudo sed -i 's#^\\({self.username}:.*:\\)/sbin/nologin$#\\1/bin/sh#' /etc/passwd",
+            "",
+            "# 3) 新增金鑰（若這把已經存在則跳過，不重複加入，不動原本其他金鑰）",
             "#    先清掉 home 目錄本身的 Synology ACL：DSM 的 sshd 會額外檢查 home 目錄的 ACL，",
             "#    ACL 不乾淨的話會整個無聲忽略 authorized_keys、直接退回密碼登入（不報錯，很難察覺）。",
             "#    同時確保 home 目錄擁有者是本人（不是 root）——擁有者不對，sshd 一樣拒絕金鑰登入。",
@@ -4524,6 +4576,10 @@ class AddKeyForUserDialog(QDialog):
             'sudo chmod 700 "$HOME_DIR/.ssh"',
             'sudo chmod 600 "$HOME_DIR/.ssh/authorized_keys"',
             f'sudo chown -R {self.username}:users "$HOME_DIR/.ssh"',
+            "",
+        ] + _login_precondition_selfcheck(self.username) + [
+            "",
+            "# 完成。上面「登入前置條件自我檢查」若全部 ✅，這個帳號應該就能直接用金鑰登入。",
         ]
         return "\n".join(lines)
 
