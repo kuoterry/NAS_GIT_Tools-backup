@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
 
-__version__ = "1.2.0"
+__version__ = "1.2.2"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -189,7 +189,12 @@ def _is_openssh_v1_encrypted(raw: bytes):
     try:
         text = raw.decode("ascii", errors="ignore")
         b64_lines = [ln for ln in text.splitlines() if ln and not ln.startswith("-----")]
-        blob = base64.b64decode("".join(b64_lines))
+        joined = "".join(b64_lines)
+        # magic(15 bytes) + cipher name 的 4-byte 長度前綴 + 名稱本身，128 個 base64 字元
+        # （解碼後約 96 bytes）綽綽有餘；只解這一小段前綴，不把整段私鑰本體解碼進記憶體。
+        prefix = joined[:128]
+        prefix = prefix[: len(prefix) - len(prefix) % 4]
+        blob = base64.b64decode(prefix)
         magic = b"openssh-key-v1\x00"
         if not blob.startswith(magic):
             return None
@@ -389,7 +394,7 @@ def append_ssh_config_host(alias: str, hostname: str, user: str, identity_path: 
     block = f"\nHost {alias}\n    HostName {hostname}\n"
     if user:
         block += f"    User {user}\n"
-    block += f"    IdentityFile {identity_path}\n"
+    block += f'    IdentityFile "{identity_path}"\n'
     try:
         os.makedirs(os.path.dirname(SSH_CONFIG_PATH), exist_ok=True)
         with open(SSH_CONFIG_PATH, "a", encoding="utf-8") as f:
@@ -657,8 +662,16 @@ class Worker(QThread):
         args = ["ssh-keygen", "-t", key_type, "-N", passphrase, "-C", comment, "-f", path]
         if bits:
             args += ["-b", str(bits)]
-        self.log.emit("$ " + " ".join(a if a else "''" for a in args))
-        cp = subprocess.run(args, capture_output=True, text=True, creationflags=_NO_WINDOW)
+        # masked_args 靠 "-N" 在 comment/path 之前這件事才能定位到正確的 passphrase 位置，
+        # 之後若調整 args 組成順序，要記得同步檢查這裡還抓不抓得對。
+        masked_args = list(args)
+        if passphrase:
+            masked_args[args.index("-N") + 1] = "***"
+        self.log.emit("$ " + " ".join(a if a else "''" for a in masked_args))
+        cp = subprocess.run(
+            args, capture_output=True, text=True, timeout=30, input="",
+            creationflags=_NO_WINDOW,
+        )
         if cp.returncode != 0:
             self.done.emit(False, "產生金鑰失敗：" + (cp.stderr or cp.stdout).strip())
             return
@@ -923,8 +936,13 @@ class ArchiveManageDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
+    def _busy(self, b):
+        for x in (self.refresh_b, self.restore_b, self.purge_b):
+            x.setEnabled(not b)
+
     def refresh(self):
         self.list.clear()
+        self._busy(True)
         self.worker = Worker("list_archive")
         self.worker.result.connect(self.on_entries)
         self.worker.done.connect(self.on_done)
@@ -938,6 +956,7 @@ class ArchiveManageDialog(QDialog):
             self.list.addItem(it)
 
     def on_done(self, ok, msg):
+        self._busy(False)
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
 
@@ -954,6 +973,7 @@ class ArchiveManageDialog(QDialog):
             self, "還原到哪個資料夾", os.path.join(os.path.expanduser("~"), ".ssh"))
         if not d:
             return
+        self._busy(True)
         self.worker = Worker("restore_archive", {"name": name, "target_dir": d})
         self.worker.done.connect(self._on_action_done)
         self.worker.start()
@@ -966,6 +986,7 @@ class ArchiveManageDialog(QDialog):
         r = QMessageBox.question(self, "永久刪除", f"確定永久刪除封存「{name}」？此動作無法復原。")
         if r != QMessageBox.StandardButton.Yes:
             return
+        self._busy(True)
         self.worker = Worker("purge_archive", {"name": name})
         self.worker.done.connect(self._on_action_done)
         self.worker.start()
@@ -1028,8 +1049,13 @@ class KnownHostsDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
+    def _busy(self, b):
+        for x in (self.refresh_b, self.delete_b):
+            x.setEnabled(not b)
+
     def refresh(self):
         self.list.clear()
+        self._busy(True)
         self.worker = Worker("list_known_hosts")
         self.worker.result.connect(self.on_entries)
         self.worker.done.connect(self.on_done)
@@ -1045,6 +1071,7 @@ class KnownHostsDialog(QDialog):
             self.list.addItem(it)
 
     def on_done(self, ok, msg):
+        self._busy(False)
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
 
@@ -1057,6 +1084,7 @@ class KnownHostsDialog(QDialog):
         r = QMessageBox.question(self, "刪除", f"確定刪除這筆 known_hosts 紀錄？\n\n{it.text()}\n\n原檔會先備份。")
         if r != QMessageBox.StandardButton.Yes:
             return
+        self._busy(True)
         self.worker = Worker("delete_known_hosts_entry", {"line_no": line_no})
         self.worker.done.connect(self._on_delete_done)
         self.worker.start()
@@ -1168,7 +1196,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.status)
 
     def _busy(self, b):
-        for x in (self.scan_b, self.gen_b, self.archive_mgmt_b, self.audit_b, self.export_b):
+        for x in (self.scan_b, self.gen_b, self.archive_mgmt_b, self.audit_b, self.export_b,
+                  self.archive_del_b, self.hard_del_b, self.backup_b, self.view_raw_b):
             x.setEnabled(not b)
         if not b:
             self.on_selection_changed()
@@ -1355,11 +1384,16 @@ class MainWindow(QMainWindow):
             "確定要繼續嗎？")
         if r != QMessageBox.StandardButton.Yes:
             return
+        self._busy(True)
         self.worker = Worker("read_private_raw", {"path": rec["priv_path"]})
         self.worker.result.connect(self._show_raw)
-        self.worker.done.connect(
-            lambda ok, msg: None if ok else QMessageBox.warning(self, "讀取失敗", msg))
+        self.worker.done.connect(self._on_view_raw_done)
         self.worker.start()
+
+    def _on_view_raw_done(self, ok, msg):
+        self._busy(False)
+        if not ok:
+            QMessageBox.warning(self, "讀取失敗", msg)
 
     def _show_raw(self, content):
         dlg = TextViewDialog(self, "私鑰原始內容（請小心保管視窗內容，關閉前避免截圖/分享）", content)
