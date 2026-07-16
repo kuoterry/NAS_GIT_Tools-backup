@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -366,8 +366,9 @@ def parse_ssh_config(path: str = SSH_CONFIG_PATH):
         if key == "host":
             current_hosts = [h for h in value.split() if h != "*"]
         elif key == "match":
-            # Match Host <h> User <u> 這種寫法，把 Host 值也當別名記下來
-            m = re.search(r"\bhost\s+(\S+)", value, re.IGNORECASE)
+            # Match Host <h> User <u> 或 Match OriginalHost <h> User <u> 這種寫法，
+            # 把 Host/OriginalHost 值也當別名記下來
+            m = re.search(r"\b(?:originalhost|host)\s+(\S+)", value, re.IGNORECASE)
             current_hosts = [m.group(1)] if m else []
         elif key == "identityfile" and current_hosts:
             idpath = _norm_path(value)
@@ -377,7 +378,17 @@ def parse_ssh_config(path: str = SSH_CONFIG_PATH):
 
 
 def append_ssh_config_host(alias: str, hostname: str, user: str, identity_path: str):
-    """把新的 Host 區塊附加到 SSH config；別名已存在就不寫，避免覆蓋既有設定。"""
+    """把新的區塊附加到 SSH config；區塊已存在就不寫，避免覆蓋既有設定。
+
+    user 有填：寫 `Match originalhost <hostname> user <user>` 區塊。像
+    NasGitConnector 這類工具一律直接用 `ssh user@hostname` 連線，從不打別名，
+    傳統 `Host <alias>` 區塊只有「真的手動輸入這個別名」才會生效，所以同一台主機
+    給多個帳號共用時，Host 別名等於沒用——這是本機一次真實踩雷後才發現的：先前
+    只寫 Host 區塊，帳號金鑰在 NAS 端已經加好，但沒人記得再手動改 config，導致
+    ssh/git 連線一直卡在「有金鑰卻連不上」。Match originalhost 這種寫法不管怎麼連都自動
+    生效，不用多一個「記得改 config」的步驟。
+    user 沒填：維持原本的 `Host <alias>` 區塊（單一身份、慣用 `ssh <別名>` 連線的情境）。
+    """
     try:
         if os.path.exists(SSH_CONFIG_PATH):
             with open(SSH_CONFIG_PATH, "r", encoding="utf-8", errors="ignore") as f:
@@ -386,22 +397,33 @@ def append_ssh_config_host(alias: str, hostname: str, user: str, identity_path: 
             existing = ""
     except OSError as e:
         return False, f"讀取 SSH config 失敗：{e}"
-    for line in existing.splitlines():
-        s = line.strip()
-        if s.lower().startswith("host "):
-            if alias in s.split(None, 1)[1].split():
-                return False, f"SSH config 裡已經有 Host「{alias}」，為避免衝突不會自動改寫，請自行手動編輯。"
-    block = f"\nHost {alias}\n    HostName {hostname}\n"
+
     if user:
-        block += f"    User {user}\n"
-    block += f'    IdentityFile "{identity_path}"\n'
+        match_re = re.compile(
+            r"^match\s+originalhost\s+" + re.escape(hostname) + r"\s+user\s+" + re.escape(user) + r"\s*$",
+            re.IGNORECASE)
+        for line in existing.splitlines():
+            if match_re.match(line.strip()):
+                return False, (f"SSH config 裡已經有「{hostname}」+「{user}」的 Match 區塊，"
+                                "為避免衝突不會自動改寫，請自行手動編輯。")
+        block = f'\nMatch originalhost {hostname} user {user}\n    IdentityFile "{identity_path}"\n'
+        desc = f"Match originalhost {hostname} user {user}"
+    else:
+        for line in existing.splitlines():
+            s = line.strip()
+            if s.lower().startswith("host "):
+                if alias in s.split(None, 1)[1].split():
+                    return False, f"SSH config 裡已經有 Host「{alias}」，為避免衝突不會自動改寫，請自行手動編輯。"
+        block = f'\nHost {alias}\n    HostName {hostname}\n    IdentityFile "{identity_path}"\n'
+        desc = f"Host {alias}"
+
     try:
         os.makedirs(os.path.dirname(SSH_CONFIG_PATH), exist_ok=True)
         with open(SSH_CONFIG_PATH, "a", encoding="utf-8") as f:
             f.write(block)
     except OSError as e:
         return False, f"寫入 SSH config 失敗：{e}"
-    return True, f"已加入 SSH config：Host {alias}"
+    return True, f"已加入 SSH config：{desc}"
 
 
 # ============================================================
@@ -858,16 +880,17 @@ class GenerateKeyDialog(QDialog):
         cfg_box.setChecked(False)
         self.ssh_config_box = cfg_box
         cg = QGridLayout(cfg_box)
-        cg.addWidget(QLabel("Host 別名："), 0, 0)
+        cg.addWidget(QLabel("Host 別名（User 留空時才需要）："), 0, 0)
         self.host_alias_edit = QLineEdit()
-        self.host_alias_edit.setPlaceholderText("例如 nas-git_user2（ssh <別名> 就會用這把金鑰）")
+        self.host_alias_edit.setPlaceholderText("例如 nas-git_user2（要打 ssh <別名> 才會用這把金鑰）")
         cg.addWidget(self.host_alias_edit, 0, 1)
         cg.addWidget(QLabel("HostName（伺服器位址）："), 1, 0)
         self.hostname_edit = QLineEdit()
         self.hostname_edit.setPlaceholderText("例如 kcc3713.synology.me")
         cg.addWidget(self.hostname_edit, 1, 1)
-        cg.addWidget(QLabel("User（可留空）："), 2, 0)
+        cg.addWidget(QLabel("User（同一主機多帳號共用請務必填）："), 2, 0)
         self.ssh_user_edit = QLineEdit()
+        self.ssh_user_edit.setPlaceholderText("填了就自動生效：ssh user@hostname 不用打別名也吃得到這把金鑰")
         cg.addWidget(self.ssh_user_edit, 2, 1)
         lay.addWidget(cfg_box)
 
@@ -884,8 +907,14 @@ class GenerateKeyDialog(QDialog):
 
     def _ok(self):
         if self.ssh_config_box.isChecked():
-            if not self.host_alias_edit.text().strip() or not self.hostname_edit.text().strip():
-                QMessageBox.information(self, "缺欄位", "要寫入 SSH config 的話，Host 別名跟 HostName 都要填。")
+            if not self.hostname_edit.text().strip():
+                QMessageBox.information(self, "缺欄位", "要寫入 SSH config 的話，HostName 一定要填。")
+                return
+            if not self.ssh_user_edit.text().strip() and not self.host_alias_edit.text().strip():
+                QMessageBox.information(
+                    self, "缺欄位",
+                    "User 留空的話（單一身份、慣用別名連線）就要填 Host 別名；"
+                    "同一主機給多帳號共用的話，填 User 即可，別名可以留空。")
                 return
         self.accept()
 
