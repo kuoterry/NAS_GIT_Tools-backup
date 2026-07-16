@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -662,6 +662,8 @@ class Worker(QThread):
         args = ["ssh-keygen", "-t", key_type, "-N", passphrase, "-C", comment, "-f", path]
         if bits:
             args += ["-b", str(bits)]
+        # masked_args 靠 "-N" 在 comment/path 之前這件事才能定位到正確的 passphrase 位置，
+        # 之後若調整 args 組成順序，要記得同步檢查這裡還抓不抓得對。
         masked_args = list(args)
         if passphrase:
             masked_args[args.index("-N") + 1] = "***"
@@ -934,8 +936,13 @@ class ArchiveManageDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
+    def _busy(self, b):
+        for x in (self.refresh_b, self.restore_b, self.purge_b):
+            x.setEnabled(not b)
+
     def refresh(self):
         self.list.clear()
+        self._busy(True)
         self.worker = Worker("list_archive")
         self.worker.result.connect(self.on_entries)
         self.worker.done.connect(self.on_done)
@@ -949,6 +956,7 @@ class ArchiveManageDialog(QDialog):
             self.list.addItem(it)
 
     def on_done(self, ok, msg):
+        self._busy(False)
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
 
@@ -965,6 +973,7 @@ class ArchiveManageDialog(QDialog):
             self, "還原到哪個資料夾", os.path.join(os.path.expanduser("~"), ".ssh"))
         if not d:
             return
+        self._busy(True)
         self.worker = Worker("restore_archive", {"name": name, "target_dir": d})
         self.worker.done.connect(self._on_action_done)
         self.worker.start()
@@ -977,6 +986,7 @@ class ArchiveManageDialog(QDialog):
         r = QMessageBox.question(self, "永久刪除", f"確定永久刪除封存「{name}」？此動作無法復原。")
         if r != QMessageBox.StandardButton.Yes:
             return
+        self._busy(True)
         self.worker = Worker("purge_archive", {"name": name})
         self.worker.done.connect(self._on_action_done)
         self.worker.start()
@@ -1039,8 +1049,13 @@ class KnownHostsDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
+    def _busy(self, b):
+        for x in (self.refresh_b, self.delete_b):
+            x.setEnabled(not b)
+
     def refresh(self):
         self.list.clear()
+        self._busy(True)
         self.worker = Worker("list_known_hosts")
         self.worker.result.connect(self.on_entries)
         self.worker.done.connect(self.on_done)
@@ -1056,6 +1071,7 @@ class KnownHostsDialog(QDialog):
             self.list.addItem(it)
 
     def on_done(self, ok, msg):
+        self._busy(False)
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
 
@@ -1068,6 +1084,7 @@ class KnownHostsDialog(QDialog):
         r = QMessageBox.question(self, "刪除", f"確定刪除這筆 known_hosts 紀錄？\n\n{it.text()}\n\n原檔會先備份。")
         if r != QMessageBox.StandardButton.Yes:
             return
+        self._busy(True)
         self.worker = Worker("delete_known_hosts_entry", {"line_no": line_no})
         self.worker.done.connect(self._on_delete_done)
         self.worker.start()

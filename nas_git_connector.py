@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.4.1"
+__version__ = "2.4.2"
 
 import os
 import sys
@@ -1249,7 +1249,13 @@ class Worker(QThread):
         self.hooks.emit(body)
         nfail = body.count("[FAIL]")
         nok = body.count("[OK]")
-        self.done.emit(nfail == 0, f"GC 完成：成功 {nok}、失敗 {nfail}。")
+        msg = f"GC 完成：成功 {nok}、失敗 {nfail}。"
+        if nfail > 0 and nok > 0:
+            # 部分成功部分失敗時 done(ok=False) 不會走到 on_ci_done 的成功分支，
+            # 但已成功的那幾個 repo 仍真的執行了 git gc，這裡直接補記，避免漏記。
+            # 全部失敗（nok==0）則沒有任何破壞性動作發生，維持原本不記錄的行為。
+            audit_log(c.get("user", ""), c.get("host", ""), "repo_gc", msg)
+        self.done.emit(nfail == 0, msg)
 
     # --- 完整性檢查（git fsck，唯讀）---
     def _run_repo_fsck(self):
@@ -5866,18 +5872,16 @@ class MainWindow(QMainWindow):
 
     def on_ci_done(self, ok: bool, msg: str):
         self.set_busy(False)
-        # 批次類破壞性操作（如 repo_gc）可能部分成功部分失敗，這時 ok=False，
-        # 但已成功的那幾個 repo 仍真的執行了破壞性動作，audit_log 不能因此漏記，
-        # 所以不論 ok 與否，只要 mode 屬於 DESTRUCTIVE_MODES 就一律留稽核紀錄。
-        if self.worker and self.worker.mode in DESTRUCTIVE_MODES:
-            c = self.collect_identity_cfg()
-            audit_log(c.get("user", ""), c.get("host", ""), self.worker.mode, msg.replace("\n", " "))
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
+            if self.worker and self.worker.mode in DESTRUCTIVE_MODES:
+                c = self.collect_identity_cfg()
+                audit_log(c.get("user", ""), c.get("host", ""), self.worker.mode, msg.replace("\n", " "))
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
+            QMessageBox.warning(self, "讀取失敗", msg)
             QMessageBox.warning(self, "讀取失敗", msg)
 
     # ---------- 設定 CI（每 repo 獨立）----------
