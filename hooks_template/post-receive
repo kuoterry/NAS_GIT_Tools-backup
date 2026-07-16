@@ -1,0 +1,68 @@
+#!/bin/bash
+# =====================================================
+# Git post-receive hook（Synology 非阻塞穩定版）
+# =====================================================
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# ---------- 基本設定 ----------
+BASE="/volume1/Git_Server"
+CONF="$BASE/config/tg_bot.conf"   # 與 CI 引擎、鏡像同步腳本共用同一份 Telegram 設定
+
+BOT_TOKEN=""; CHAT_ID=""
+[ -f "$CONF" ] && . "$CONF"
+
+FIXED_REPO_URL="kcc3713.synology.me"
+
+# ✅ 一定要放在 shared folder
+LOG_BASE="$BASE/logs"
+LOG_FILE="$LOG_BASE/git_push.log"
+DEBUG_LOG="$LOG_BASE/post_receive_debug.log"
+
+NOW="$(date '+%Y-%m-%d %H:%M:%S')"
+PUSH_USER="$(whoami)"
+REPO_NAME="$(basename "$(pwd)")"
+
+BRANCH_NAME=""
+OLDREV=""
+NEWREV=""
+
+# ---------- 建立 log 目錄 ----------
+mkdir -p "$LOG_BASE"
+chmod g+rwX "$LOG_BASE" 2>/dev/null
+
+# ---------- 讀取 push 資訊 ----------
+while read oldrev newrev refname; do
+    OLDREV="$oldrev"
+    NEWREV="$newrev"
+
+    case "$refname" in
+        refs/heads/*)
+            BRANCH_NAME="${refname#refs/heads/}"
+            ;;
+    esac
+done
+
+MESSAGE_BODY="🚨 Git 推送通知: ${REPO_NAME}
+👤 推送者: ${PUSH_USER}
+🌳 分支: ${BRANCH_NAME}
+🔀 舊版: ${OLDREV}
+🔁 新版: ${NEWREV}
+🔗 儲存庫: ${FIXED_REPO_URL}
+🕒 時間: ${NOW}"
+
+# ---------- 寫入 push log（同步、不重要也不阻擋） ----------
+echo "${NOW} | ${PUSH_USER} | ${REPO_NAME} | ${BRANCH_NAME} | ${OLDREV} -> ${NEWREV}" \
+    >> "$LOG_FILE" 2>/dev/null
+
+# ---------- 非阻塞 Telegram（僅在有設定時發送） ----------
+if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+(
+  curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${MESSAGE_BODY}" \
+    --data-urlencode "parse_mode=HTML"
+) >> "$DEBUG_LOG" 2>&1 &
+fi
+
+exit 0
