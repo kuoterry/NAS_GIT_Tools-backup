@@ -161,6 +161,66 @@ def is_ssh_pubkey(line: str) -> bool:
     return bool(_SSH_PUBKEY_RE.match(line))
 
 
+def append_ssh_config_match_block(hostname: str, user: str, identity_path: str):
+    """在本機 ~/.ssh/config 附加一段 `Match originalhost <hostname> user <user>` 區塊，
+    讓之後不管是這個工具的 _ssh()、還是終端機直接打 `ssh user@hostname`/`git push`，
+    都不用手動帶 -i 就會自動用到剛產生的這把私鑰。
+
+    只有「同一台 NAS、多個帳號各自不同金鑰」這種情境才需要——因為 ssh 只認預設檔名
+    （id_rsa/id_ed25519/id_ecdsa），本機產生金鑰時若檔名帶了帳號後綴（例如
+    id_ed25519_git_user3），沒有這段設定的話 ssh 根本不會主動去試這把私鑰。
+    區塊已存在就不重寫，避免覆蓋既有設定；與 Key_Management 專案 `key_management.py`
+    的 `append_ssh_config_host()` 是各自獨立的實作，寫法故意保持一致（同樣格式，
+    同一支 SSH config 可以互相讀懂），但這兩個工具彼此不 import、不共用程式碼。
+    """
+    ssh_config_path = os.path.join(os.path.expanduser("~"), ".ssh", "config")
+    try:
+        if os.path.exists(ssh_config_path):
+            with open(ssh_config_path, "r", encoding="utf-8", errors="ignore") as f:
+                existing = f.read()
+        else:
+            existing = ""
+    except OSError as e:
+        return False, f"讀取 SSH config 失敗：{e}"
+    match_re = re.compile(
+        r"^match\s+originalhost\s+" + re.escape(hostname) + r"\s+user\s+" + re.escape(user) + r"\s*$",
+        re.IGNORECASE)
+    for line in existing.splitlines():
+        if match_re.match(line.strip()):
+            return False, (f"SSH config 裡已經有「{hostname}」+「{user}」的 Match 區塊，"
+                            "為避免衝突不會自動改寫，請自行手動編輯。")
+    block = f'\nMatch originalhost {hostname} user {user}\n    IdentityFile "{identity_path}"\n'
+    try:
+        os.makedirs(os.path.dirname(ssh_config_path), exist_ok=True)
+        with open(ssh_config_path, "a", encoding="utf-8") as f:
+            f.write(block)
+    except OSError as e:
+        return False, f"寫入 SSH config 失敗：{e}"
+    return True, f"已加入 SSH config：Match originalhost {hostname} user {user}"
+
+
+def offer_write_local_ssh_config(parent, hostname: str, user: str, key_path: str):
+    """本機產生金鑰成功後，問一次「這把金鑰要不要也在這台機器直接用」；
+    要的話寫入 append_ssh_config_match_block()，不用每次都手動編輯 SSH config。
+    只問一次、預設不寫（No），因為這幾個對話框（CreateGitDevsUserDialog／
+    AddKeyForUserDialog／RotateKeyDialog）原本的預設情境是「產生給別人用、
+    私鑰要交接出去」，不是每次都要在本機直接登入。"""
+    r = QMessageBox.question(
+        parent, "本機也要用這個帳號登入嗎？",
+        f"這把金鑰要不要順便設定成：以後這台機器直接 ssh/git 用「{user}@{hostname}」"
+        "登入時，自動用這把私鑰（不用再手動加 -i）？\n\n"
+        "如果這把金鑰是要交給別人用、不會在這台機器登入，選「否」即可。",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No)
+    if r != QMessageBox.StandardButton.Yes:
+        return
+    ok, msg = append_ssh_config_match_block(hostname, user, key_path)
+    if ok:
+        QMessageBox.information(parent, "已寫入 SSH config", msg)
+    else:
+        QMessageBox.warning(parent, "未寫入 SSH config", msg)
+
+
 def ssh_fingerprint(line: str) -> str:
     """算 authorized_keys 一行的 SHA256 指紋（同 ssh-keygen -lf 的格式），純本機計算不用連 NAS。"""
     parts = line.split(None, 2)
@@ -3905,6 +3965,8 @@ class CreateGitDevsUserDialog(QDialog):
         self.gen_key_b.setEnabled(False)
         self.status.setText("本機產生金鑰中…")
         self.status.setStyleSheet("")
+        self._last_gen_key_path = path
+        self._last_gen_key_username = username
         cfg = dict(self.cfg)
         cfg["key_path"] = path
         cfg["key_comment"] = username
@@ -3925,6 +3987,8 @@ class CreateGitDevsUserDialog(QDialog):
                 self, "金鑰已產生",
                 msg + "\n\n如果這個帳號要給別人用，請把私鑰檔安全地交給對方（不要用 email/聊天軟體明碼傳），"
                       "交接完成後可考慮從這台機器上刪除私鑰。")
+            offer_write_local_ssh_config(
+                self, self.cfg.get("host", ""), self._last_gen_key_username, self._last_gen_key_path)
 
     def on_import_key(self):
         pubkey = pick_key_management_pubkey(self)
@@ -4338,6 +4402,7 @@ class AddKeyForUserDialog(QDialog):
         self.gen_key_b.setEnabled(False)
         self.status.setText("本機產生金鑰中…")
         self.status.setStyleSheet("")
+        self._last_gen_key_path = path
         cfg = dict(self.cfg)
         cfg["key_path"] = path
         cfg["key_comment"] = self.username
@@ -4354,6 +4419,7 @@ class AddKeyForUserDialog(QDialog):
             QMessageBox.information(
                 self, "金鑰已產生",
                 msg + "\n\n請把私鑰檔安全地交給實際使用這個帳號的人（不要用 email/聊天軟體明碼傳）。")
+            offer_write_local_ssh_config(self, self.cfg.get("host", ""), self.username, self._last_gen_key_path)
 
     def on_import_key(self):
         pubkey = pick_key_management_pubkey(self)
@@ -4483,6 +4549,7 @@ class RotateKeyDialog(QDialog):
         self.gen_key_b.setEnabled(False)
         self.status.setText("本機產生金鑰中…")
         self.status.setStyleSheet("")
+        self._last_gen_key_path = path
         cfg = dict(self.cfg)
         cfg["key_path"] = path
         cfg["key_comment"] = f"{self.username}-rotated"
@@ -4499,6 +4566,7 @@ class RotateKeyDialog(QDialog):
             QMessageBox.information(
                 self, "金鑰已產生",
                 msg + "\n\n請把新私鑰檔安全地交給實際使用這個帳號的人，確認新鑰匙能登入後，再把舊私鑰刪除、作廢。")
+            offer_write_local_ssh_config(self, self.cfg.get("host", ""), self.username, self._last_gen_key_path)
 
     def on_import_key(self):
         pubkey = pick_key_management_pubkey(self)
