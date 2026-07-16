@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.4.3"
+__version__ = "2.4.4"
 
 import os
 import sys
@@ -219,6 +219,38 @@ def offer_write_local_ssh_config(parent, hostname: str, user: str, key_path: str
         QMessageBox.information(parent, "已寫入 SSH config", msg)
     else:
         QMessageBox.warning(parent, "未寫入 SSH config", msg)
+
+
+def open_admin_terminal(cfg: dict):
+    """開一個新終端機視窗，直接 SSH 進 NAS（用目前連線設定的身份：kuoterry／Git_User1 等
+    有 sudo 權限的身份），免得使用者還要自己另開終端機貼待執行腳本。
+
+    判斷邏輯跟 Worker._ssh() 一致：有填密碼→plink -pw；沒填→內建 ssh（有指定私鑰檔就明確
+    帶 -i／IdentitiesOnly=yes，理由同 _ssh()：非預設檔名的金鑰，ssh 不會自動去試）。
+    只在 Windows 上支援（這個工具本來就是 Windows 專用 GUI）。"""
+    if os.name != "nt":
+        return False, "目前只支援 Windows 開啟終端機。"
+    host = cfg.get("host", "")
+    user = cfg.get("user", "")
+    if not host or not user:
+        return False, "目前身份設定缺少帳號或主機，無法開啟終端機。"
+    password = cfg.get("password", "")
+    identity_file = cfg.get("identity_file", "")
+    try:
+        if password:
+            plink = shutil.which("plink")
+            if not plink:
+                return False, "有填密碼，但找不到 plink.exe（PuTTY），無法開啟終端機登入。"
+            args = [plink, "-pw", password, f"{user}@{host}"]
+        else:
+            args = ["ssh"]
+            if identity_file:
+                args += ["-i", identity_file, "-o", "IdentitiesOnly=yes"]
+            args += [f"{user}@{host}"]
+        subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        return True, ""
+    except OSError as e:
+        return False, f"開啟終端機失敗：{e}"
 
 
 def ssh_fingerprint(line: str) -> str:
@@ -2693,7 +2725,7 @@ class DeleteRepoDialog(QDialog):
 # 通用文字檢視對話框（用於顯示 CI hook 內容）
 # ============================================================
 class TextViewDialog(QDialog):
-    def __init__(self, parent, title, text, markdown=False, goto_line=None):
+    def __init__(self, parent, title, text, markdown=False, goto_line=None, terminal_cfg=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(720, 560)
@@ -2726,15 +2758,25 @@ class TextViewDialog(QDialog):
         row = QHBoxLayout()
         copy_btn = QPushButton("複製全部")
         copy_btn.clicked.connect(self._copy)
+        row.addWidget(copy_btn)
+        if terminal_cfg is not None:
+            self._terminal_cfg = terminal_cfg
+            term_btn = QPushButton(f"開啟終端機（{terminal_cfg.get('user', '')}@{terminal_cfg.get('host', '')}）…")
+            term_btn.clicked.connect(self._open_terminal)
+            row.addWidget(term_btn)
         close_btn = QPushButton("關閉")
         close_btn.clicked.connect(self.accept)
-        row.addWidget(copy_btn)
         row.addStretch(1)
         row.addWidget(close_btn)
         lay.addLayout(row)
 
     def _copy(self):
         QApplication.clipboard().setText(self._text)
+
+    def _open_terminal(self):
+        ok, msg = open_admin_terminal(self._terminal_cfg)
+        if not ok:
+            QMessageBox.warning(self, "開啟終端機失敗", msg)
 
 
 # ============================================================
@@ -4045,7 +4087,8 @@ class CreateGitDevsUserDialog(QDialog):
             f"「{username}」的登入密碼已寫入本機檔案：\n{GIT_DEVS_CRED_LOG_PATH}\n\n"
             "這是明碼檔案，請自行妥善保護（例如搬到有加密的資料夾），不需要的紀錄記得定期清理。")
         script = self._build_script(username, pubkey, member_list, exists, password)
-        dlg = TextViewDialog(self, f"新增 git_devs 帳號 — 待執行指令（{username}）", script)
+        dlg = TextViewDialog(self, f"新增 git_devs 帳號 — 待執行指令（{username}）", script,
+                             terminal_cfg=self.cfg)
         dlg.exec()
 
     def _build_script(self, username, pubkey, member_list, exists, password):
@@ -4436,7 +4479,8 @@ class AddKeyForUserDialog(QDialog):
             self.status.setStyleSheet("color:#b00020;")
             return
         script = self._build_script(pubkey)
-        dlg = TextViewDialog(self, f"幫既有帳號新增金鑰 — 待執行指令（{self.username}）", script)
+        dlg = TextViewDialog(self, f"幫既有帳號新增金鑰 — 待執行指令（{self.username}）", script,
+                             terminal_cfg=self.cfg)
         dlg.exec()
         self.status.setText("✔ 指令已產生，請複製貼到有 sudo 權限的 SSH 視窗執行。")
         self.status.setStyleSheet("color:#1a7f37;")
