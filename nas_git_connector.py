@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 import os
 import sys
@@ -1400,7 +1400,8 @@ class Worker(QThread):
             "  base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
             "  [ -z \"$base\" ] && continue",
             "  git --git-dir=\"$repo\" grep -n -I -e \"$PATTERN\" \"$base\" 2>/dev/null | "
-            "sed \"s/^/HIT\\t$name\\t/\"",
+            "awk -v b=\"$base\" -v n=\"$name\" "
+            "'{ print \"HIT\\t\" n \"\\t\" substr($0, length(b) + 2) }'",
             "done",
             "echo ___END___",
             "true",
@@ -1418,10 +1419,12 @@ class Worker(QThread):
             if len(parts) != 2:
                 continue
             repo_name, grepline = parts
-            gparts = grepline.split(":", 3)
-            if len(gparts) < 4:
+            # 檔名本身可能含冒號，不能盲目 split(":", n)；改抓「第一個 :數字: 分界」
+            # 當作 path/lineno 的界線（line number 保證是純數字，path/content 則否）。
+            m = re.match(r"^(.*?):(\d+):(.*)$", grepline)
+            if not m:
                 continue
-            _tree, path, lineno, content = gparts
+            path, lineno, content = m.groups()
             hits.append((repo_name, path, lineno, content))
         self.repos.emit(hits)
         self.done.emit(True, f"搜尋「{pattern}」完成，共 {len(hits)} 筆符合。")
@@ -2226,7 +2229,7 @@ class Worker(QThread):
             ]
         cmd = "\n".join([
             "echo ___BEGIN___",
-            f"BASE='{root}'; name='{name}'; branch='{branch}'; pol='{pol}'",
+            f"BASE='{root}'; name='{name}'; branch={shq(branch)}; pol='{pol}'",
             "repo=\"$BASE/$name\"",
             "if [ -e \"$repo\" ]; then echo EXISTS; echo ___END___; exit 0; fi",
             "git init --bare \"$repo\" >/dev/null 2>&1 || { echo INIT_FAIL; echo ___END___; exit 0; }",
@@ -2403,6 +2406,9 @@ class Worker(QThread):
 
         if not repo_name.endswith(".git"):
             repo_name = repo_name + ".git"
+        if not is_safe_name(repo_name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{repo_name!r}")
+            return
         remote_repo_path = f"{root}/{repo_name}"
         remote_url = f"{user}@{host}:{remote_repo_path}"
         ssh_host = f"{user}@{host}"
@@ -2466,8 +2472,8 @@ class Worker(QThread):
         # 安裝 hook（盡力而為）
         self.log.emit("👉 安裝 Git hook...")
         hook_cmd = (
-            f"if [ -f {root}/install_and_monitor_git_hooks.sh ]; then "
-            f"{root}/install_and_monitor_git_hooks.sh {repo_name}; "
+            f"if [ -f '{root}/install_and_monitor_git_hooks.sh' ]; then "
+            f"'{root}/install_and_monitor_git_hooks.sh' '{repo_name}'; "
             f"else echo '[WARN] 找不到 install_and_monitor_git_hooks.sh，略過'; fi"
         )
         self._ssh(hook_cmd)
@@ -2552,7 +2558,7 @@ class Worker(QThread):
 
         # 2-7 NAS HEAD 指向本分支
         rc, _, _ = self._ssh(
-            f"git --git-dir='{remote_repo_path}' symbolic-ref HEAD refs/heads/{branch}"
+            f"git --git-dir='{remote_repo_path}' symbolic-ref HEAD refs/heads/{shq(branch)}"
         )
         if rc == 0:
             self.log.emit(f"✔ 已將 NAS 預設分支(HEAD)指向 {branch}")
@@ -3995,7 +4001,7 @@ class CreateGitDevsUserDialog(QDialog):
         if exists:
             lines.append(f"#    帳號 {username} 已存在，這段可能不需要，請自行判斷是否跳過：")
         lines += [
-            f"sudo synouser --add {username} '{password}' \"{desc}\" \"{email}\" 0 0",
+            f"sudo synouser --add {username} '{password}' {shq(desc)} {shq(email)} 0 0",
             "",
             "# 2) 加入 git_devs 群組",
             "#    注意：synogroup --member 是「整批覆蓋」不是「附加」！",
@@ -5860,12 +5866,15 @@ class MainWindow(QMainWindow):
 
     def on_ci_done(self, ok: bool, msg: str):
         self.set_busy(False)
+        # 批次類破壞性操作（如 repo_gc）可能部分成功部分失敗，這時 ok=False，
+        # 但已成功的那幾個 repo 仍真的執行了破壞性動作，audit_log 不能因此漏記，
+        # 所以不論 ok 與否，只要 mode 屬於 DESTRUCTIVE_MODES 就一律留稽核紀錄。
+        if self.worker and self.worker.mode in DESTRUCTIVE_MODES:
+            c = self.collect_identity_cfg()
+            audit_log(c.get("user", ""), c.get("host", ""), self.worker.mode, msg.replace("\n", " "))
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
-            if self.worker and self.worker.mode in DESTRUCTIVE_MODES:
-                c = self.collect_identity_cfg()
-                audit_log(c.get("user", ""), c.get("host", ""), self.worker.mode, msg.replace("\n", " "))
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
