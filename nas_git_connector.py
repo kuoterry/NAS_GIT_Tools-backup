@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.4.5"
+__version__ = "2.4.6"
 
 import os
 import sys
@@ -5061,8 +5061,16 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
 
         # ================= 共用：身份 / NAS 設定 =================
+        # 可摺疊：這塊平常填好就不太需要再看，摺起來讓下面分頁（倉庫清單等）可視範圍變大。
+        # 摺疊狀態記在 QSettings，跟其他 UI 偏好一樣重開機記得住；預設展開，不影響第一次使用的體驗。
         nb = QGroupBox("身份 / NAS 設定（會依本機電腦名稱自動選身份；兩個分頁共用）")
-        ng = QGridLayout(nb)
+        nb.setCheckable(True)
+        nb.setToolTip("取消勾選可摺疊此區塊，讓下面的分頁內容有更大可視範圍。")
+        nb_outer = QVBoxLayout(nb)
+        nb_outer.setContentsMargins(0, 0, 0, 0)
+        nb_content = QWidget()
+        ng = QGridLayout(nb_content)
+        nb_outer.addWidget(nb_content)
 
         ng.addWidget(QLabel("身份："), 0, 0)
         self.profile_combo = QComboBox()
@@ -5124,6 +5132,12 @@ class MainWindow(QMainWindow):
         ng.addLayout(id_file_row, 7, 1, 1, 4)
 
         root.addWidget(nb)
+
+        nb_expanded = self.settings.value("identity_panel_expanded", True, type=bool)
+        nb.setChecked(nb_expanded)
+        nb_content.setVisible(nb_expanded)
+        nb.toggled.connect(nb_content.setVisible)
+        nb.toggled.connect(lambda checked: self.settings.setValue("identity_panel_expanded", checked))
 
         save_prof_btn.clicked.connect(self.save_current_profile)
         add_prof_btn.clicked.connect(self.add_profile)
