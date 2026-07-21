@@ -10,6 +10,8 @@ This repo also contains `Key_Management/`, a completely separate PyQt6 tool (own
 
 `HOWTO_新增SSH金鑰到NAS.md` is an end-user walkthrough (in Traditional Chinese) of the four key-provisioning scenarios covered by `CreateGitDevsUserDialog`/`AddKeyForUserDialog`/`RotateKeyDialog`/`SshKeysDialog` — read it for the user-facing "what button do I click" narrative; this file covers the "why does the code work this way" side instead, and the two deliberately don't repeat each other's content.
 
+A few loose top-level files are one-off or personal-workflow scripts, not part of the GUI tool itself: `fix_git_user3_home_acl.sh` is a point-in-time diagnostic/fix script written for the `git_user3` incident (see "Creating new `git_devs` accounts" below) and kept only as a historical reference, not a reusable tool — its ACL theory was later superseded by the home-directory-ownership root cause found for that same incident. `sync-git-identity.ps1`/`sync-git-identity.md` is an unrelated personal utility for keeping `git config user.name` distinct per machine across this user's own repos (home vs office), documented in its own `.md` — it has nothing to do with the NAS connector or the `git_devs` account system.
+
 ## Commands
 
 ```
@@ -50,7 +52,7 @@ The NAS runs a shared `pre-receive.ci` hook engine (one copy for all repos) that
 
 Both scripts now also send the same message body as an email, by piping it through `send_email.py` (`echo "$MSG" | python3 "$BASE/tools/send_email.py" --subject "..."`). `send_email.py` is a small stdlib-only helper (no `pip` on this NAS, so no `requests`/etc.) that reads SMTP credentials from **`/volume1/NAS_Safety/login_watch/config.json`**'s `smtp` block — a deliberate cross-project reuse of the `login_watch` project's already-working Gmail SMTP setup rather than maintaining a second copy of the same credentials. It exits 0 even on failure (missing config, SMTP error) so a broken mail path never fails the calling bash script or blocks its Telegram send.
 
-`NAS_Safety/login_watch/login_watch.py` (a separate project, not otherwise part of this repo — see its own `README.md`) got the mirror-image fix: it already emailed on new-login events via its own `config.json` SMTP block, and now also POSTs to Telegram using `load_telegram_config()`/`send_telegram()`, reading the *same* `/volume1/Git_Server/config/tg_bot.conf` these NAS_GIT_Tools scripts use — again to avoid a second Telegram credential living in a different project. The two notification paths are independent: either one missing/failing doesn't block the other, and neither blocks writing the JSONL record or advancing `state.json`.
+`NAS_Safety/login_watch/login_watch.py` (a separate project with its own deployment path on the NAS and its own `README.md` — its source just happens to be tracked inside this same git repo) got the mirror-image fix: it already emailed on new-login events via its own `config.json` SMTP block, and now also POSTs to Telegram using `load_telegram_config()`/`send_telegram()`, reading the *same* `/volume1/Git_Server/config/tg_bot.conf` these NAS_GIT_Tools scripts use — again to avoid a second Telegram credential living in a different project. The two notification paths are independent: either one missing/failing doesn't block the other, and neither blocks writing the JSONL record or advancing `state.json`.
 
 ### Offsite backup (the reverse direction of GitHub mirrors)
 
