@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.4.6"
+__version__ = "2.4.7"
 
 import os
 import sys
@@ -2155,6 +2155,32 @@ class Worker(QThread):
             "  fi",
             "done",
             "[ \"$lfs_hits\" = 0 ] && echo '[OK] 沒有偵測到明顯需要上 LFS 的大型檔案'",
+            "echo",
+            "echo '== .bat 換行風險掃描（缺 .gitattributes CRLF 保護）=='",
+            "#    純 LF 或依賴簽出機器 core.autocrlf 的 .bat，換一台設定不同的機器",
+            "#    clone/pull 下來後，cmd.exe 解析跨行 if(...)/for /f(...) 區塊可能整段",
+            "#    錯亂（NAS_GIT_Tools 自己的 build_exe.bat 已實際發生過）。",
+            "bat_hits=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  n=$(basename \"$repo\")",
+            "  base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
+            "  [ -z \"$base\" ] && continue",
+            "  bats=$(git --git-dir=\"$repo\" ls-tree -r --name-only \"$base\" 2>/dev/null | grep -i '\\.bat$')",
+            "  [ -z \"$bats\" ] && continue",
+            "  ga_ok=0",
+            "  if git --git-dir=\"$repo\" cat-file -e \"$base:.gitattributes\" 2>/dev/null; then",
+            "    if git --git-dir=\"$repo\" show \"$base:.gitattributes\" 2>/dev/null | grep -Eq '^\\*\\.bat[[:space:]]+.*eol=crlf'; then",
+            "      ga_ok=1",
+            "    fi",
+            "  fi",
+            "  if [ \"$ga_ok\" = 0 ]; then",
+            "    cnt=$(echo \"$bats\" | grep -c .)",
+            "    echo \"[  ] $n：有 $cnt 個 .bat 檔，但沒有 .gitattributes 的 *.bat eol=crlf 保護，換機器 clone 可能因 core.autocrlf 設定不同讓 .bat 內多行 if/for 區塊解析錯亂\"",
+            "    bat_hits=$((bat_hits+1))",
+            "  fi",
+            "done",
+            "[ \"$bat_hits\" = 0 ] && echo '[OK] 沒有偵測到缺 CRLF 保護的 .bat 檔'",
             "echo",
             "echo '== git_devs 帳號 SSH 金鑰登入 ACL 檢查 =='",
             "#    DSM 的 sshd 會檢查 home 目錄本身的 Synology ACL，ACL 不乾淨的話會整段無聲",
