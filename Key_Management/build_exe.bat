@@ -52,7 +52,7 @@ echo.
 
 echo [3/4] Tagging a versioned copy...
 set "VERSION="
-for /f "delims=" %%v in ('%PY% -c "import re;print(re.search(r'__version__ *= *\"([^\"]+)\"', open('key_management.py', encoding='utf-8').read()).group(1))"') do set "VERSION=%%v"
+for /f "delims=" %%v in ('%PY% "%~dp0get_version.py"') do set "VERSION=%%v"
 if defined VERSION (
   copy /y "%~dp0dist\KeyManagement.exe" "%~dp0dist\KeyManagement_v%VERSION%.exe" >nul
   echo   Versioned copy: "%~dp0dist\KeyManagement_v%VERSION%.exe"

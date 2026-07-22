@@ -16,7 +16,7 @@ build_exe.bat                     # build dist\KeyManagement.exe (onefile/window
 
 No test suite, linter, or CI config — verification is manual (`python -c "import key_management"` for a syntax/import check; the module's pure functions like `build_records()` can also be exercised directly from a Python REPL without touching Qt).
 
-Current version is tracked in the `__version__` constant near the top of `key_management.py` and shown in the window title; bump it whenever a feature-level change lands. `build_exe.bat` produces two files in `dist\`: the stable `KeyManagement.exe` (desktop-shortcut target, name never changes) and a versioned copy `KeyManagement_v<__version__>.exe` (auto-copied, version read out of the `.py` source) — same convention as the sibling `NAS_GIT_Tools` project's `build_exe.bat`.
+Current version is tracked in the `__version__` constant near the top of `key_management.py` and shown in the window title; bump it whenever a feature-level change lands. `build_exe.bat` produces two files in `dist\`: the stable `KeyManagement.exe` (desktop-shortcut target, name never changes) and a versioned copy `KeyManagement_v<__version__>.exe` (auto-copied, version read out of the `.py` source via `get_version.py`, not an inline `python -c` — see "Build tooling" in the sibling `NAS_GIT_Tools/CLAUDE.md` for why) — same convention as the sibling `NAS_GIT_Tools` project's `build_exe.bat`.
 
 ## Architecture
 
