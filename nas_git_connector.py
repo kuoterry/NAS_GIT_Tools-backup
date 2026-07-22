@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 import os
 import sys
@@ -5754,6 +5754,10 @@ class MainWindow(QMainWindow):
             ms.append(mid)
         self._set_profile_machines(name, ms)
         self.update_machine_label()
+        QMessageBox.information(
+            self, "已綁定",
+            f"這台電腦「{mid}」已綁定到身份「{name}」。\n下次開啟會自動選這個身份。"
+        )
 
     # ---------- 跨機器同步身份設定（config/profiles_sync.json，不含密碼/identity_file）----------
     def on_sync_profiles(self):
@@ -5796,6 +5800,7 @@ class MainWindow(QMainWindow):
                     "user": winner.get("user", ""),
                     "host": winner.get("host", ""),
                     "remote_root": winner.get("remote_root", ""),
+                    "identity_file": l.get("identity_file", ""),  # 機器本地路徑，永遠沿用本機，不被遠端覆蓋
                     "updated_at": max(lu, ru),
                     "machines": machines,
                 }
@@ -5849,10 +5854,6 @@ class MainWindow(QMainWindow):
                 f"已同步跨機器身份設定：新增 {self._sync_added} 個、更新 {self._sync_updated} 個身份。")
         else:
             QMessageBox.warning(self, "同步失敗", msg)
-        QMessageBox.information(
-            self, "已綁定",
-            f"這台電腦「{mid}」已綁定到身份「{name}」。\n下次開啟會自動選這個身份。"
-        )
 
     # --- 收集設定 ---
     def collect_cfg(self) -> dict:
