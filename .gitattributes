@@ -1,0 +1,3 @@
+# Windows batch 檔強制 CRLF：純 LF 的 .bat 在 cmd.exe 解析多行
+# if(...)/for /f(...) 區塊時會整段錯亂，不能只靠簽出機器的 core.autocrlf 設定運氣好。
+*.bat text eol=crlf
