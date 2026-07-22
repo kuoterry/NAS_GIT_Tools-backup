@@ -11,9 +11,19 @@
   - 私鑰的解析只讀取檔頭中繼資料（格式／是否加密），不需要密碼、不解密。
   - 唯一會讀取私鑰完整原始內容的地方是「檢視私鑰原始內容…」，且會先跳確認、
     並記錄到稽核紀錄。
-  - 完全獨立於 NAS_GIT_Tools 專案的 nas_git_connector.py，不 import、不共用設定。
+  - 與 NAS_GIT_Tools 專案的 nas_git_connector.py 各自獨立運作、不 import、不共用程式碼。
+    唯一例外是「跨電腦同步」功能（見下方「跨機器同步」）：(1) 可以唯讀取用
+    NasGitConnector 的 QSettings 身份設定方便帶入連線資訊，不寫回、不強制依賴；
+    (2) 同步只會把金鑰名冊的中繼資料（指紋／備註／類型／時間戳／看過它的電腦名稱）
+    上傳到 NAS 共享檔案，私鑰檔案內容本身永遠不會被讀取、不會離開本機。
 
-作者備註：本機資料（金鑰名冊、稽核紀錄、封存區）都放在 ~/.key_management/。
+跨機器同步（選用，預設不啟用，需先在「⚙ 雲端同步設定…」填好連線資訊才會用到網路）：
+  - 只支援 SSH 金鑰登入，不支援密碼登入（避免把單純本機工具的複雜度拉高不成比例）。
+  - 共享檔案：NAS 上 <remote_root>/config/km_registry_sync.json，寫入前會先備份舊檔。
+  - 合併規則：以指紋（或路徑後備）為 key；last_seen 較新的欄位為準；history 串接去重；
+    seen_hosts（記錄「這把鑰匙在哪些電腦出現過」）一律聯集、只加不減。
+
+作者備註：本機資料（金鑰名冊、稽核紀錄、封存區、同步連線設定）都放在 ~/.key_management/。
 """
 
 import os
@@ -24,11 +34,12 @@ import json
 import base64
 import hashlib
 import shutil
+import socket
 import subprocess
 import time
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -37,7 +48,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
 
-__version__ = "1.2.3"
+__version__ = "1.3.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -52,6 +63,7 @@ APP_DIR = os.path.join(os.path.expanduser("~"), ".key_management")
 REGISTRY_PATH = os.path.join(APP_DIR, "registry.json")
 AUDIT_LOG_PATH = os.path.join(APP_DIR, "audit.log")
 ARCHIVE_DIR = os.path.join(APP_DIR, "archive")
+SYNC_CONFIG_PATH = os.path.join(APP_DIR, "sync_config.json")
 
 # 掃描時明確跳過的檔名：這些是「金鑰集合／設定檔」，不是單一身份金鑰本身。
 SKIP_FILENAMES = {"known_hosts", "known_hosts.old", "authorized_keys", "config"}
@@ -301,7 +313,7 @@ def scan_folder(folder: str):
     return pub_files, priv_files, ppk_files
 
 
-def build_advisories(rec: dict, fingerprints_seen: dict) -> str:
+def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict = None, this_host: str = "") -> str:
     notes = []
     strength = rec.get("strength", "") or ""
     if strength.startswith("RSA"):
@@ -332,6 +344,10 @@ def build_advisories(rec: dict, fingerprints_seen: dict) -> str:
     fp = rec.get("fingerprint")
     if fp and len(fingerprints_seen.get(fp, [])) > 1:
         notes.append("⚠ 與其他檔案指紋相同，可能是重複複製的金鑰")
+    if fp and seen_hosts_by_fp:
+        others = sorted(h for h in seen_hosts_by_fp.get(fp, {}) if h and h != this_host)
+        if others:
+            notes.append(f"⚠ 這把金鑰也在其他電腦（{'、'.join(others)}）登記過，確認是否為刻意複製")
     return "；".join(notes) if notes else "—"
 
 
@@ -564,8 +580,16 @@ def build_records(folders):
         hosts = ssh_config_map.get(_norm_path(priv_path)) if priv_path else None
         rec["ssh_config_hosts"] = hosts or []
 
+    # 跨機器資訊：從本機 registry.json 裡（若曾經同步過）帶的 seen_hosts 讀出來，
+    # 純本機比對，不觸發任何網路動作——同步時寫入，之後每次掃描都能用到，不用每次都連線。
+    seen_hosts_by_fp = {}
+    for entry in load_registry().values():
+        fp, sh = entry.get("fingerprint"), entry.get("seen_hosts")
+        if fp and sh:
+            seen_hosts_by_fp.setdefault(fp, {}).update(sh)
+    this_host = socket.gethostname() or ""
     for rec in records:
-        rec["advisories"] = build_advisories(rec, fingerprints_seen)
+        rec["advisories"] = build_advisories(rec, fingerprints_seen, seen_hosts_by_fp, this_host)
 
     return records
 
@@ -621,6 +645,110 @@ def update_registry_from_scan(records):
 
 
 # ============================================================
+# 跨機器同步（選用）：把金鑰名冊的中繼資料跟 NAS 上其他電腦互相同步。
+# 私鑰檔案內容本身永遠不會出現在這一段的任何函式裡。
+# ============================================================
+
+def load_sync_config():
+    try:
+        with open(SYNC_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_sync_config(cfg: dict):
+    os.makedirs(APP_DIR, exist_ok=True)
+    with open(SYNC_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def read_nas_git_connector_profiles():
+    """唯讀窺看 NasGitConnector 的 QSettings 身份設定（同一個 Windows 使用者底下才看得到），
+    只用來讓「從 NasGitConnector 帶入」省去重複輸入 host/user/identity_file。不寫回、
+    NasGitConnector 沒裝過/沒設定過就回空 dict——不是必要依賴，只是省事的捷徑。"""
+    s = QSettings("TerryTools", "NasGitConnector")
+    names = s.value("profile_names", [])
+    if isinstance(names, str):
+        names = [names] if names else []
+    result = {}
+    for name in (names or []):
+        result[name] = {
+            "user": s.value(f"profiles/{name}/user", ""),
+            "host": s.value(f"profiles/{name}/host", ""),
+            "remote_root": s.value(f"profiles/{name}/remote_root", ""),
+            "identity_file": s.value(f"profiles/{name}/identity_file", ""),
+        }
+    return result
+
+
+def _sync_ssh(sync_cfg: dict, remote_cmd: str):
+    """對 NAS 執行遠端指令，只走 SSH 金鑰登入，不支援密碼——這支工具本來就只有
+    ssh-keygen 這一個 subprocess 依賴，刻意不加 plink/密碼分支，比照
+    nas_git_connector.py 的 _ssh() 但精簡到只剩同步需要的這一條路徑。"""
+    user = sync_cfg.get("user", "")
+    host = sync_cfg.get("host", "")
+    identity_file = sync_cfg.get("identity_file", "")
+    if not (user and host and identity_file):
+        return 255, "", "同步設定未填完整（需要 user/host/identity_file）"
+    args = [
+        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10", "-i", identity_file, "-o", "IdentitiesOnly=yes",
+        f"{user}@{host}", remote_cmd,
+    ]
+    try:
+        cp = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=30,
+                             creationflags=_NO_WINDOW if os.name == "nt" else 0)
+        return cp.returncode, cp.stdout, cp.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 255, "", str(e)
+
+
+def _between(text: str) -> str:
+    """擷取 ___BEGIN___/___END___ 之間的內容，濾掉 SSH 登入橫幅等雜訊。跟
+    nas_git_connector.py 的同名函式用途一致，各自獨立實作，不 import 對方。"""
+    start = text.find("___BEGIN___")
+    end = text.find("___END___")
+    if start == -1 or end == -1:
+        return text
+    return text[start + len("___BEGIN___"):end].strip("\n")
+
+
+def merge_registries(local: dict, remote: dict, hostname: str):
+    """合併本機與雲端的金鑰名冊。key 選法跟 update_registry_from_scan 一致（指紋或路徑
+    後備）。每筆依 last_seen 較新的欄位為準；history 串接去重；seen_hosts（這把鑰匙在
+    哪些電腦出現過）一律聯集、只加不減，本機這次同步時把自己也蓋進去。"""
+    merged = {}
+    for key in set(local) | set(remote):
+        l, r = local.get(key), remote.get(key)
+        if l and not r:
+            entry = dict(l)
+        elif r and not l:
+            entry = dict(r)
+        else:
+            entry = dict(r if (r.get("last_seen") or "") > (l.get("last_seen") or "") else l)
+            firsts = [x for x in (l.get("first_seen"), r.get("first_seen")) if x]
+            if firsts:
+                entry["first_seen"] = min(firsts)
+            seen_pairs = {(h.get("ts"), h.get("action")) for h in l.get("history", [])}
+            history = list(l.get("history", []))
+            for h in r.get("history", []):
+                pair = (h.get("ts"), h.get("action"))
+                if pair not in seen_pairs:
+                    history.append(h)
+                    seen_pairs.add(pair)
+            entry["history"] = history
+        seen_hosts = dict((l or {}).get("seen_hosts") or {})
+        seen_hosts.update((r or {}).get("seen_hosts") or {})
+        if l:
+            seen_hosts[hostname] = l.get("last_seen", "")
+        entry["seen_hosts"] = seen_hosts
+        merged[key] = entry
+    return merged
+
+
+# ============================================================
 # 背景工作執行緒：所有檔案系統/subprocess 動作都走這裡，避免卡住 UI
 # ============================================================
 class Worker(QThread):
@@ -655,6 +783,8 @@ class Worker(QThread):
                 self._run_list_known_hosts()
             elif self.mode == "delete_known_hosts_entry":
                 self._run_delete_known_hosts_entry()
+            elif self.mode == "sync_registry":
+                self._run_sync_registry()
             else:
                 self.done.emit(False, f"未知模式：{self.mode}")
         except Exception as e:
@@ -819,6 +949,55 @@ class Worker(QThread):
         if ok:
             audit_log("delete_known_hosts_entry", msg)
         self.done.emit(ok, msg)
+
+    def _run_sync_registry(self):
+        """跨機器同步金鑰名冊中繼資料：拉遠端 → 跟本機合併 → 存回本機 → 推合併結果回 NAS。
+        只碰 registry.json 的中繼資料欄位，私鑰檔案本身完全不會被讀取或傳輸。"""
+        sync_cfg = self.params.get("sync_cfg", {})
+        remote_root = (sync_cfg.get("remote_root") or "").rstrip("/")
+        if not remote_root:
+            self.done.emit(False, "同步設定未填 remote_root，請先到「⚙ 雲端同步設定…」設定。")
+            return
+        hostname = socket.gethostname() or "UNKNOWN"
+        self.log.emit("--- 跨機器同步金鑰名冊 ---")
+
+        pull_cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"f='{remote_root}/config/km_registry_sync.json'",
+            "if [ -f \"$f\" ]; then cat \"$f\"; else echo '{}'; fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, err = _sync_ssh(sync_cfg, pull_cmd)
+        if rc != 0:
+            self.done.emit(False, f"讀取雲端金鑰名冊失敗：{(err or out).strip()}")
+            return
+        try:
+            remote_reg = json.loads(_between(out) or "{}")
+        except json.JSONDecodeError:
+            remote_reg = {}
+
+        local_reg = load_registry()
+        merged = merge_registries(local_reg, remote_reg, hostname)
+        save_registry(merged)
+
+        payload = json.dumps(merged, ensure_ascii=False)
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        push_cmd = "\n".join([
+            f"d='{remote_root}/config'; f=\"$d/km_registry_sync.json\"",
+            "mkdir -p \"$d\"",
+            "[ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
+            f"printf '%s' '{b64}' | base64 -d > \"$f\"",
+            "chmod 600 \"$f\"",
+            "echo ___OK___",
+        ])
+        rc2, out2, err2 = _sync_ssh(sync_cfg, push_cmd)
+        if rc2 != 0 or "___OK___" not in out2:
+            self.done.emit(False, f"推送雲端金鑰名冊失敗：{(err2 or out2).strip()}")
+            return
+        audit_log("sync_registry", f"host={hostname} merged_keys={len(merged)}")
+        self.result.emit(merged)
+        self.done.emit(True, f"已同步金鑰名冊，共 {len(merged)} 筆（涵蓋所有已同步過的電腦）。")
 
 
 # ============================================================
@@ -1124,6 +1303,179 @@ class KnownHostsDialog(QDialog):
             self.refresh()
 
 
+class SyncConfigDialog(QDialog):
+    """跨機器同步的連線設定：host/user/remote_root/identity_file，存在本機
+    sync_config.json。只支援金鑰登入，可以從 NasGitConnector 的 QSettings 一鍵帶入，
+    省去重複輸入 SSH 連線資訊。"""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("雲端同步設定")
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "設定完成後，「🌐 跨電腦金鑰總覽…」才能連上 NAS 同步。只支援 SSH 金鑰登入。\n"
+            "同步只會上傳金鑰的中繼資料（指紋／備註／類型／時間戳／看過它的電腦名稱），\n"
+            "私鑰檔案內容本身永遠不會被讀取或上傳。"))
+        g = QGridLayout()
+        g.addWidget(QLabel("NAS 主機："), 0, 0)
+        self.host_edit = QLineEdit()
+        g.addWidget(self.host_edit, 0, 1)
+        g.addWidget(QLabel("SSH 使用者："), 1, 0)
+        self.user_edit = QLineEdit()
+        g.addWidget(self.user_edit, 1, 1)
+        g.addWidget(QLabel("Git_Server 根："), 2, 0)
+        self.root_edit = QLineEdit()
+        self.root_edit.setPlaceholderText("/volume1/Git_Server")
+        g.addWidget(self.root_edit, 2, 1)
+        g.addWidget(QLabel("私鑰檔案："), 3, 0)
+        id_row = QHBoxLayout()
+        self.identity_edit = QLineEdit()
+        id_browse_b = QPushButton("瀏覽…")
+        id_row.addWidget(self.identity_edit)
+        id_row.addWidget(id_browse_b)
+        g.addLayout(id_row, 3, 1)
+        lay.addLayout(g)
+
+        import_b = QPushButton("從 NasGitConnector 帶入…")
+        lay.addWidget(import_b)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.bb.accepted.connect(self.on_save)
+        self.bb.rejected.connect(self.reject)
+        lay.addWidget(self.bb)
+
+        id_browse_b.clicked.connect(self.on_browse_identity)
+        import_b.clicked.connect(self.on_import)
+        self._load()
+
+    def _load(self):
+        cfg = load_sync_config()
+        self.host_edit.setText(cfg.get("host", ""))
+        self.user_edit.setText(cfg.get("user", ""))
+        self.root_edit.setText(cfg.get("remote_root", ""))
+        self.identity_edit.setText(cfg.get("identity_file", ""))
+
+    def on_browse_identity(self):
+        start = self.identity_edit.text().strip() or os.path.join(os.path.expanduser("~"), ".ssh")
+        path, _ = QFileDialog.getOpenFileName(self, "選擇同步用的私鑰檔案", start)
+        if path:
+            self.identity_edit.setText(path)
+
+    def on_import(self):
+        profiles = read_nas_git_connector_profiles()
+        if not profiles:
+            self.status.setText("找不到 NasGitConnector 的身份設定（可能沒裝過或還沒設定過任何身份）。")
+            self.status.setStyleSheet("color:#b06f00;")
+            return
+        names = list(profiles.keys())
+        name, ok = QInputDialog.getItem(self, "從 NasGitConnector 帶入", "選一個身份：", names, 0, False)
+        if not ok or not name:
+            return
+        vals = profiles[name]
+        self.host_edit.setText(vals.get("host", ""))
+        self.user_edit.setText(vals.get("user", ""))
+        self.root_edit.setText(vals.get("remote_root", ""))
+        if vals.get("identity_file"):
+            self.identity_edit.setText(vals["identity_file"])
+            self.status.setText(f"已帶入身份「{name}」。")
+            self.status.setStyleSheet("color:#1a7f37;")
+        else:
+            self.status.setText(
+                f"已帶入身份「{name}」的 host/user/remote_root，但這個身份是密碼登入——"
+                "Key_Management 同步僅支援金鑰登入，請自行填一個私鑰檔案路徑。")
+            self.status.setStyleSheet("color:#b06f00;")
+
+    def on_save(self):
+        cfg = {
+            "host": self.host_edit.text().strip(),
+            "user": self.user_edit.text().strip(),
+            "remote_root": self.root_edit.text().strip(),
+            "identity_file": self.identity_edit.text().strip(),
+        }
+        save_sync_config(cfg)
+        self.accept()
+
+
+class SyncOverviewDialog(QDialog):
+    """跨電腦金鑰總覽：唯讀顯示本機 registry.json（同步過的話就含所有電腦的中繼資料），
+    也可以按「立即同步」重新拉取/推送最新狀態。"""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.worker = None
+        self.setWindowTitle("跨電腦金鑰總覽")
+        self.resize(900, 480)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "顯示本機金鑰名冊裡記錄到的所有電腦（按「立即同步」才會連 NAS 拉最新狀態；"
+            "不按的話這裡只是上次同步當下的快照）。"))
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["SHA256 指紋", "備註", "類型", "看過的電腦", "最後看到時間", "建議"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self.table, stretch=1)
+        row = QHBoxLayout()
+        self.sync_b = QPushButton("🔄 立即同步")
+        self.close_b = QPushButton("關閉")
+        row.addWidget(self.sync_b)
+        row.addStretch(1)
+        row.addWidget(self.close_b)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.sync_b.clicked.connect(self.on_sync)
+        self.close_b.clicked.connect(self.accept)
+        self.refresh_from_local()
+
+    def refresh_from_local(self):
+        self._populate(load_registry())
+
+    def _populate(self, reg: dict):
+        this_host = socket.gethostname() or ""
+        rows = [(key, entry) for key, entry in reg.items() if entry.get("fingerprint")]
+        rows.sort(key=lambda kv: kv[1].get("last_seen", ""), reverse=True)
+        self.table.setRowCount(len(rows))
+        for i, (_key, entry) in enumerate(rows):
+            seen_hosts = entry.get("seen_hosts") or {}
+            hosts_text = "、".join(sorted(seen_hosts)) if seen_hosts else "（尚未同步過）"
+            advisory = "⚠ 也存在其他電腦" if len(seen_hosts) > 1 or (
+                seen_hosts and this_host not in seen_hosts) else "—"
+            for col, val in enumerate([
+                entry.get("fingerprint", ""),
+                entry.get("comment", ""),
+                entry.get("type", ""),
+                hosts_text,
+                entry.get("last_seen", ""),
+                advisory,
+            ]):
+                self.table.setItem(i, col, QTableWidgetItem(str(val)))
+
+    def on_sync(self):
+        sync_cfg = load_sync_config()
+        if not (sync_cfg.get("host") and sync_cfg.get("user") and sync_cfg.get("identity_file")):
+            self.status.setText("尚未設定同步連線資訊，請先按「⚙ 雲端同步設定…」設定。")
+            self.status.setStyleSheet("color:#b06f00;")
+            return
+        self.sync_b.setEnabled(False)
+        self.status.setText("同步中…")
+        self.status.setStyleSheet("")
+        self.worker = Worker("sync_registry", {"sync_cfg": sync_cfg})
+        self.worker.result.connect(self._populate)
+        self.worker.done.connect(self.on_sync_done)
+        self.worker.start()
+
+    def on_sync_done(self, ok, msg):
+        self.sync_b.setEnabled(True)
+        self.status.setText(("✔ " if ok else "❌ ") + msg)
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+
+
 # ============================================================
 # 主視窗
 # ============================================================
@@ -1211,11 +1563,17 @@ class MainWindow(QMainWindow):
         self.audit_b.clicked.connect(self.on_audit_log)
         self.known_hosts_b = QPushButton("known_hosts 管理…")
         self.known_hosts_b.clicked.connect(self.on_known_hosts)
+        self.sync_config_b = QPushButton("⚙ 雲端同步設定…")
+        self.sync_config_b.clicked.connect(self.on_sync_config)
+        self.sync_overview_b = QPushButton("🌐 跨電腦金鑰總覽…")
+        self.sync_overview_b.clicked.connect(self.on_sync_overview)
         self.export_b = QPushButton("匯出 CSV 報表…")
         self.export_b.clicked.connect(self.on_export_csv)
         brow.addWidget(self.archive_mgmt_b)
         brow.addWidget(self.audit_b)
         brow.addWidget(self.known_hosts_b)
+        brow.addWidget(self.sync_config_b)
+        brow.addWidget(self.sync_overview_b)
         brow.addStretch(1)
         brow.addWidget(self.export_b)
         lay.addLayout(brow)
@@ -1467,6 +1825,15 @@ class MainWindow(QMainWindow):
 
     def on_known_hosts(self):
         dlg = KnownHostsDialog(self)
+        dlg.exec()
+
+    # ---------- 跨機器同步 ----------
+    def on_sync_config(self):
+        dlg = SyncConfigDialog(self)
+        dlg.exec()
+
+    def on_sync_overview(self):
+        dlg = SyncOverviewDialog(self)
         dlg.exec()
 
     # ---------- 匯出 CSV ----------

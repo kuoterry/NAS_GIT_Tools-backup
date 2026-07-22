@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.4.7"
+__version__ = "2.5.0"
 
 import os
 import sys
@@ -33,7 +33,7 @@ import hashlib
 import secrets
 import string
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
 from PyQt6.QtGui import QFont
@@ -693,6 +693,10 @@ class Worker(QThread):
             self._run_tg_conf_get()
         elif self.mode == "tg_conf_set":
             self._run_tg_conf_set()
+        elif self.mode == "profile_sync_pull":
+            self._run_profile_sync_pull()
+        elif self.mode == "profile_sync_push":
+            self._run_profile_sync_push()
         elif self.mode == "repair":
             self._run_repair()
         elif self.mode == "log":
@@ -2285,6 +2289,45 @@ class Worker(QThread):
             self.done.emit(True, "已更新 Telegram 通知設定（舊檔已備份）。")
         else:
             self.done.emit(False, "更新 Telegram 通知設定失敗（連線或權限問題）。")
+
+    # --- 讀取跨機器共享的身份設定（config/profiles_sync.json；只含 user/host/remote_root/
+    #     updated_at/machines，絕不含密碼或 identity_file——那兩者是機器本地的東西）---
+    def _run_profile_sync_pull(self):
+        root = self.cfg["remote_root"]
+        self.log.emit("--- 拉取跨機器身份設定 ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            f"f='{root}/config/profiles_sync.json'",
+            "if [ -f \"$f\" ]; then cat \"$f\"; else echo '{}'; fi",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc != 0:
+            self.done.emit(False, "讀取跨機器身份設定失敗（連線或權限問題）。")
+            return
+        self.hooks.emit(self._between(out).strip() or "{}")
+        self.done.emit(True, "已讀取跨機器身份設定。")
+
+    # --- 寫回合併後的跨機器身份設定（走 base64，寫前先備份舊檔）---
+    def _run_profile_sync_push(self):
+        root = self.cfg["remote_root"]
+        payload = self.cfg.get("sync_payload", "{}")
+        self.log.emit("--- 推送跨機器身份設定 ---")
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        cmd = "\n".join([
+            f"d='{root}/config'; f=\"$d/profiles_sync.json\"",
+            "mkdir -p \"$d\"",
+            "[ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
+            f"printf '%s' '{b64}' | base64 -d > \"$f\"",
+            "chmod 600 \"$f\"",
+            "echo ___OK___",
+        ])
+        rc, out, _ = self._ssh(cmd)
+        if rc == 0 and "___OK___" in out:
+            self.done.emit(True, "已同步身份設定到 NAS（舊檔已備份）。")
+        else:
+            self.done.emit(False, "推送跨機器身份設定失敗（連線或權限問題）。")
 
     # --- 一鍵修復（套用 template hook + 修群組權限）---
     def _run_repair(self):
@@ -5108,6 +5151,11 @@ class MainWindow(QMainWindow):
         ng.addWidget(save_prof_btn, 0, 2)
         ng.addWidget(add_prof_btn, 0, 3)
         ng.addWidget(del_prof_btn, 0, 4)
+        sync_prof_btn = QPushButton("☁ 同步跨機器設定")
+        sync_prof_btn.setToolTip(
+            "把身份設定（不含密碼、不含私鑰檔路徑）跟 NAS 上其他電腦同步："
+            "拉回其他電腦新增/更新過的身份，再把這台的更新推上去。")
+        ng.addWidget(sync_prof_btn, 0, 5)
 
         self.machine_label = QLabel("")
         self.machine_label.setWordWrap(True)
@@ -5169,6 +5217,8 @@ class MainWindow(QMainWindow):
         add_prof_btn.clicked.connect(self.add_profile)
         del_prof_btn.clicked.connect(self.delete_profile)
         bind_btn.clicked.connect(self.bind_current_machine)
+        sync_prof_btn.clicked.connect(self.on_sync_profiles)
+        self.sync_prof_btn = sync_prof_btn
         self.profile_combo.currentTextChanged.connect(self.on_profile_changed)
 
         # ================= 分頁 =================
@@ -5553,11 +5603,17 @@ class MainWindow(QMainWindow):
                 self._write_profile(name, vals)
             self.settings.setValue("profile_names", list(DEFAULT_PROFILES.keys()))
 
-    def _write_profile(self, name, vals):
+    def _write_profile(self, name, vals, stamp=True):
+        """寫入單一身份設定。stamp=True（預設）會順便蓋 updated_at，供跨機器同步比對新舊；
+        同步流程套用遠端已經算好的值時要傳 stamp=False，避免自己剛拉回來的資料又被當成「本機更新」。"""
         self.settings.setValue(f"profiles/{name}/user", vals.get("user", ""))
         self.settings.setValue(f"profiles/{name}/host", vals.get("host", ""))
         self.settings.setValue(f"profiles/{name}/remote_root", vals.get("remote_root", ""))
         self.settings.setValue(f"profiles/{name}/identity_file", vals.get("identity_file", ""))
+        if stamp:
+            self.settings.setValue(f"profiles/{name}/updated_at", datetime.now(timezone.utc).isoformat())
+        elif "updated_at" in vals:
+            self.settings.setValue(f"profiles/{name}/updated_at", vals["updated_at"])
 
     def _read_profile(self, name):
         return {
@@ -5565,6 +5621,7 @@ class MainWindow(QMainWindow):
             "host": self.settings.value(f"profiles/{name}/host", "kcc3713.synology.me"),
             "remote_root": self.settings.value(f"profiles/{name}/remote_root", "/volume1/Git_Server"),
             "identity_file": self.settings.value(f"profiles/{name}/identity_file", ""),
+            "updated_at": self.settings.value(f"profiles/{name}/updated_at", ""),
         }
 
     def load_profile_into_fields(self, name):
@@ -5697,6 +5754,101 @@ class MainWindow(QMainWindow):
             ms.append(mid)
         self._set_profile_machines(name, ms)
         self.update_machine_label()
+
+    # ---------- 跨機器同步身份設定（config/profiles_sync.json，不含密碼/identity_file）----------
+    def on_sync_profiles(self):
+        self.sync_prof_btn.setEnabled(False)
+        self.maint_status.setText("同步身份設定中（拉取）…")
+        self.maint_status.setStyleSheet("")
+        self.save_current_profile(silent=True)
+        cfg = self.collect_identity_cfg()
+        self._pulled_profiles_text = "{}"
+        self._sync_worker = Worker(cfg, mode="profile_sync_pull")
+        self._sync_worker.log.connect(self.append_log)
+        self._sync_worker.hooks.connect(self._on_profile_sync_pulled)
+        self._sync_worker.done.connect(self._on_profile_sync_pull_done)
+        self._sync_worker.start()
+
+    def _on_profile_sync_pulled(self, text):
+        self._pulled_profiles_text = text
+
+    @staticmethod
+    def _merge_profiles(local: dict, remote: dict):
+        """單人多機器情境：每筆帶 updated_at，較新的贏；machines（電腦名稱綁定）一律聯集、
+        只加不減，避免一台機器同步時洗掉另一台機器登記的綁定。回傳 (merged, added, updated)。"""
+        merged = {}
+        added = updated = 0
+        for name in set(local) | set(remote):
+            l, r = local.get(name), remote.get(name)
+            if l and not r:
+                merged[name] = l
+            elif r and not l:
+                merged[name] = dict(r)
+                added += 1
+            else:
+                lu, ru = l.get("updated_at") or "", r.get("updated_at") or ""
+                winner = r if ru > lu else l
+                l_machines = sorted(l.get("machines") or [])
+                machines = sorted(set(l.get("machines") or []) | set(r.get("machines") or []))
+                if ru > lu or machines != l_machines:
+                    updated += 1
+                merged[name] = {
+                    "user": winner.get("user", ""),
+                    "host": winner.get("host", ""),
+                    "remote_root": winner.get("remote_root", ""),
+                    "updated_at": max(lu, ru),
+                    "machines": machines,
+                }
+        return merged, added, updated
+
+    def _on_profile_sync_pull_done(self, ok, msg):
+        if not ok:
+            self.sync_prof_btn.setEnabled(True)
+            self.maint_status.setText("")
+            QMessageBox.warning(self, "同步失敗", msg)
+            return
+        try:
+            remote = json.loads(self._pulled_profiles_text or "{}")
+        except (json.JSONDecodeError, TypeError):
+            remote = {}
+        local = {name: {**self._read_profile(name), "machines": self._profile_machines(name)}
+                  for name in self._profile_names()}
+        merged, added, updated = self._merge_profiles(local, remote)
+
+        for name, vals in merged.items():
+            if name not in self._profile_names():
+                self.settings.setValue("profile_names", self._profile_names() + [name])
+            self._write_profile(name, vals, stamp=False)
+            self._set_profile_machines(name, vals.get("machines", []))
+
+        cur = self.profile_combo.currentText()
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItems(self._profile_names())
+        if cur in self._profile_names():
+            self.profile_combo.setCurrentText(cur)
+        self.profile_combo.blockSignals(False)
+        self.load_profile_into_fields(self.profile_combo.currentText())
+        self.update_machine_label()
+
+        self.maint_status.setText("同步身份設定中（推送）…")
+        self._sync_added, self._sync_updated = added, updated
+        cfg = self.collect_identity_cfg()
+        cfg["sync_payload"] = json.dumps(merged, ensure_ascii=False)
+        self._sync_worker = Worker(cfg, mode="profile_sync_push")
+        self._sync_worker.log.connect(self.append_log)
+        self._sync_worker.done.connect(self._on_profile_sync_push_done)
+        self._sync_worker.start()
+
+    def _on_profile_sync_push_done(self, ok, msg):
+        self.sync_prof_btn.setEnabled(True)
+        self.maint_status.setText("")
+        if ok:
+            QMessageBox.information(
+                self, "同步完成",
+                f"已同步跨機器身份設定：新增 {self._sync_added} 個、更新 {self._sync_updated} 個身份。")
+        else:
+            QMessageBox.warning(self, "同步失敗", msg)
         QMessageBox.information(
             self, "已綁定",
             f"這台電腦「{mid}」已綁定到身份「{name}」。\n下次開啟會自動選這個身份。"
