@@ -91,3 +91,23 @@ Root cause, reproduced directly on the second machine, independent of line endin
 The `if defined VERSION (...) else (...)` branch after it never sees a set `VERSION`, so it silently falls into the `[WARN] Could not read __version__` branch — the main PyInstaller build still succeeds, so the tool "works," just never produces the versioned filename, which is why this went unnoticed rather than erroring loudly.
 
 Fix: moved the regex out of the batch line entirely into a standalone `get_version.py` — the `for /f` capture command is now just `%PY% "path\to\get_version.py"` with zero embedded double quotes.
+
+## 2026-07-26 — CI engine skipped commit-message checks entirely on any new branch
+
+Found by accident: pushing a brand-new branch of this repo printed one line from the remote —
+
+```
+remote: fatal: Invalid revision range 0000000000000000000000000000000000000000..6c7c20f...
+```
+
+— and then succeeded anyway.
+
+Root cause: the engine's commit-message loop was `for c in $(git rev-list "$oldrev..$newrev")`. On a newly-created branch `$oldrev` is 40 zeros, so the range is invalid and `git rev-list` exits with that fatal, producing no output. The `for` body therefore never ran, and since the engine ends in `exit 0` regardless, the push went through with **none** of its commit messages checked — under `strict` too. The branch-name rule sits before the loop, so that half kept working, which is part of why nothing looked broken. A branch *deletion* (`$newrev` all zeros) hit the same fatal.
+
+The failure mode is the same shape as the 2026-07-22 build one: a check that silently stops checking is indistinguishable from a check that passes.
+
+Fix: `$newrev` all zeros → `continue` (nothing to check on a delete); `$oldrev` all zeros → `git rev-list "$newrev" --not --all`. The `--not --all` form is correct specifically because pre-receive runs *before* the new ref is created, so `--all` covers every pre-existing ref and the difference is exactly the commits this push is adding.
+
+Verified before committing, in a throwaway local bare repo with the engine installed as its `pre-receive` (`POLICY_MODE=strict` exported into the push): old engine reproduced the fatal and accepted a deliberately non-compliant commit message on a new branch; new engine reported the violation and blocked it; a compliant new branch and a follow-up push to an existing branch both stayed clean. The engine's hardcoded `export PATH=/usr/sbin:/usr/bin:/sbin:/bin` has to be stripped from the *test copy* of the hook for this to run under Windows git-bash — it's needed on the NAS, so don't "fix" it in the source.
+
+Note the fix only reaches production when someone clicks "升級 CI 引擎" in the GUI — committing it here changes what gets deployed, not what is currently running.
