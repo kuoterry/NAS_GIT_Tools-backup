@@ -28,6 +28,17 @@ No test suite, linter, or CI config exists in this repo — verification is manu
 
 `origin` is `kuoterry@kcc3713.synology.me:/volume1/Git_Server/NAS_GIT_Tools.git` — this repo is hosted on the same NAS Git server this tool manages, so the "Server-side CI system" rules below apply to its own pushes: default/working branch is `develop` (no `main`/`master`), feature work on `feature/*`, commit messages prefixed `feat:`/`fix:`/`chore:`/`docs:`. Enforced remotely by `pre-receive.ci` at push time, so nothing local warns first.
 
+### Branch naming and lifecycle
+
+The CI hook only checks the `develop|feature/*|release/*` shape; everything below is the convention this repo has actually followed on top of that, recoverable from `git log --merges` and `git branch -a` but not from the hook.
+
+- **Branch names are English kebab-case topics** (`feature/collapsible-identity-panel`, `feature/unify-telegram-email-notifications`, `feature/ci-engine-new-branch-fix`) even though commit messages and docs are Traditional Chinese — keeps `git branch -a` output aligned and typeable. No ticket ids (this repo has no tracker; the `[JIRA-n]`/`[TASK-n]` form the CI hook accepts is for other repos on that server), no dates, no author prefixes.
+- **`release/*` is allowed by the hook but has never been used here.** Versions ship straight off `develop` plus a tag; there's no stabilization branch. Don't create one out of gitflow habit.
+- **Not every change gets a branch.** Single-purpose docs/fix commits land directly on `develop` (that's most of the recent non-merge history). Branch when the work is multi-commit, or touches `nas_git_connector.py` behavior in a way that might need to be abandoned or reviewed as a unit.
+- **Merge back with `--no-ff`**, merge-commit message `chore: 合併 <中文摘要> (feature/<name>)`. The no-ff merge commit is what makes a feature's commit set identifiable afterwards; a fast-forward would dissolve it into the linear history.
+- **Merged branches are not deleted** — not locally, not on `origin` (decision 2026-07-27; seven merged `feature/*` branches were kept rather than pruned). They're the cheapest index of which commits made up a feature, and with one admin there's no branch-list clutter to pay for it. The consequence to remember: **branch count is not a work-in-progress signal.** `git branch -a --no-merged develop` (empty = nothing outstanding) is the only check that means anything here; a long `git branch -a` listing is expected and says nothing about unfinished work.
+- **Tags use two independent namespaces**, matching the two independently-versioned tools: `v<x.y.z>` for the NAS connector, `key-management-v<x.y.z>` for Key_Management. Annotated, created after the version bump commit is pushed.
+
 ### Build tooling: version-tagged exe copy relies on `get_version.py`, not an inline `python -c`
 
 `build_exe.bat`'s "[3/4] Tagging a versioned copy" step reads `__version__` out of `nas_git_connector.py` via `for /f "delims=" %%v in ('%PY% "%~dp0get_version.py"') do set "VERSION=%%v"`. `Key_Management/build_exe.bat` does the identical thing against `key_management.py` via its own `Key_Management/get_version.py`. Both `get_version.py` files are tiny (open the `.py` source, regex out `__version__ *= *"([^"]+)"`, `print()` the match) and exist for exactly one reason: don't put that regex inline as a `python -c "..."` string inside a batch `for /f ('...')` capture.
