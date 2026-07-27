@@ -1,4 +1,4 @@
-<#
+﻿<#
 把這台電腦的 git commit 身分統一成指定名字（例如家用機用 kuoterry）：
   1) 設定 global user.name
   2) 掃描指定的 repo 根目錄，找出「自己另外設了 local user.name/user.email」的 repo
