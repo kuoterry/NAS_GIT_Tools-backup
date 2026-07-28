@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.5.2"
+__version__ = "2.6.0"
 
 import os
 import sys
@@ -33,6 +33,8 @@ import hashlib
 import secrets
 import string
 import json
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
@@ -40,8 +42,9 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QPlainTextEdit, QComboBox, QCheckBox,
-    QFileDialog, QMessageBox, QGroupBox, QInputDialog, QTabWidget, QListWidget,
-    QDialog, QRadioButton, QDialogButtonBox, QListWidgetItem, QSpinBox, QTextBrowser
+    QFileDialog, QMessageBox, QGroupBox, QInputDialog, QTabWidget, QTabBar, QListWidget,
+    QDialog, QRadioButton, QDialogButtonBox, QListWidgetItem, QSpinBox, QTextBrowser,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 
 # ============================================================
@@ -351,6 +354,25 @@ def pick_key_management_pubkey(parent):
     if not ok:
         return None
     return dict(items)[label]
+
+
+# 倉庫來源分類：mirror 由 remote.origin.mirror 決定，優先於 nasgit.kind（見 CLAUDE.md）。
+REPO_KIND_TABS = [
+    ("all", "全部"),
+    ("own", "自己的"),
+    ("fork", "我 fork 的"),
+    ("clone", "clone 別人的"),
+    ("mirror", "鏡像"),
+    ("", "未分類"),
+]
+REPO_KIND_MARK = {"own": "🏠自己", "fork": "🍴fork", "clone": "📥clone", "mirror": "↺鏡像"}
+
+
+def effective_repo_kind(mirror: str, kind: str) -> str:
+    """回傳這個倉庫實際歸屬的分類：mirror 一律優先，其次是 nasgit.kind，都沒有就是未分類（空字串）。"""
+    if mirror:
+        return "mirror"
+    return kind or ""
 
 
 def fmt_size_kb(kb: int) -> str:
@@ -722,6 +744,12 @@ class Worker(QThread):
             self._run_archive_restore()
         elif self.mode == "archive_purge":
             self._run_archive_purge()
+        elif self.mode == "set_repo_kind":
+            self._run_set_repo_kind()
+        elif self.mode == "github_scan":
+            self._run_github_scan()
+        elif self.mode == "local_scan":
+            self._run_local_scan()
         else:
             self._run_connect()
 
@@ -750,7 +778,8 @@ class Worker(QThread):
         c = self.cfg
         root = c["remote_root"]
         self.log.emit(f"--- 列出 {root} 底下的倉庫 ---")
-        # 每行：name<TAB>status<TAB>policy<TAB>mirror_url（mirror_url 非空代表是 GitHub 鏡像）
+        # 每行：name<TAB>status<TAB>policy<TAB>mirror_url<TAB>size_kb<TAB>kind<TAB>upstream
+        # mirror_url 非空代表是 GitHub 鏡像；kind 為 own/fork/clone/空（未分類），鏡像庫一律不讀 kind
         cmd = "\n".join([
             "echo ___BEGIN___",
             f'for d in "{root}"/*/; do',
@@ -763,12 +792,17 @@ class Worker(QThread):
             "  [ -z \"$pol\" ] && pol=none",
             "  mu=''",
             "  [ \"$(git --git-dir=\"$d\" config --get remote.origin.mirror 2>/dev/null)\" = true ] && mu=$(git --git-dir=\"$d\" config --get remote.origin.url 2>/dev/null)",
+            "  kind=''; upstream=''",
+            "  if [ -z \"$mu\" ]; then",
+            "    kind=$(git --git-dir=\"$d\" config --get nasgit.kind 2>/dev/null)",
+            "    upstream=$(git --git-dir=\"$d\" config --get nasgit.upstream 2>/dev/null)",
+            "  fi",
             "  sz=$(du -sk \"$d\" 2>/dev/null | cut -f1); [ -z \"$sz\" ] && sz=0",
             "  if [ -z \"$info\" ]; then",
-            "    printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\" \"$mu\" \"$sz\"",
+            "    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\" \"$mu\" \"$sz\" \"$kind\" \"$upstream\"",
             "  else",
             "    dt=${info%%|*}; br=${info#*|}",
-            "    printf '%s\\t%s (%s)\\t%s\\t%s\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\" \"$mu\" \"$sz\"",
+            "    printf '%s\\t%s (%s)\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\" \"$mu\" \"$sz\" \"$kind\" \"$upstream\"",
             "  fi",
             "done",
             "echo ___END___",
@@ -801,7 +835,9 @@ class Worker(QThread):
                 size_kb = int(parts[4].strip()) if len(parts) > 4 else 0
             except ValueError:
                 size_kb = 0
-            items.append((name, status, pol, mirror, size_kb))
+            kind = parts[5].strip() if len(parts) > 5 else ""
+            upstream = parts[6].strip() if len(parts) > 6 else ""
+            items.append((name, status, pol, mirror, size_kb, kind, upstream))
         items.sort(key=lambda t: t[0].lower())
         self.repos.emit(items)
         n_empty = sum(1 for t in items if t[1].startswith("空庫"))
@@ -2092,6 +2128,153 @@ class Worker(QThread):
         nok = body.count("[OK]")
         self.done.emit(nfail == 0, f"離站備份同步完成：成功 {nok}、失敗 {nfail}。")
 
+    # --- 設定/批次設定倉庫來源分類（nasgit.kind / nasgit.upstream / nasgit.kindsrc）---
+    # 鏡像庫（remote.origin.mirror=true）一律拒寫：mirror 這個分類只認 git 原生的
+    # mirror flag，不能被 nasgit.kind 蓋過去，避免兩個真相來源打架。
+    def _run_set_repo_kind(self):
+        c = self.cfg
+        root = c["remote_root"]
+        items = c.get("kind_items", [])
+        src = c.get("kind_src", "manual")
+        if src not in ("manual", "auto-connect", "auto-github", "auto-local"):
+            src = "manual"
+        valid = [
+            (name, kind, upstream or "")
+            for name, kind, upstream in items
+            if is_safe_name(name) and kind in ("own", "fork", "clone", "")
+        ]
+        if not valid:
+            self.done.emit(False, "沒有可套用的有效倉庫。")
+            return
+        self.log.emit(f"--- 設定來源分類：{len(valid)} 個 repo ---")
+        steps = ["echo ___BEGIN___", f"BASE='{root}'"]
+        for name, kind, upstream in valid:
+            steps.append(f"repo=\"$BASE/{name}\"")
+            steps.append(
+                "if [ \"$(git --git-dir=\"$repo\" config --get remote.origin.mirror "
+                "2>/dev/null)\" = true ]; then"
+            )
+            steps.append(f"  echo '[SKIP] {name}（鏡像庫，不可設分類）'")
+            steps.append("else")
+            if kind:
+                steps.append(f"  git --git-dir=\"$repo\" config nasgit.kind {shq(kind)}")
+                steps.append(f"  git --git-dir=\"$repo\" config nasgit.kindsrc {shq(src)}")
+                if upstream:
+                    steps.append(f"  git --git-dir=\"$repo\" config nasgit.upstream {shq(upstream)}")
+                else:
+                    steps.append("  git --git-dir=\"$repo\" config --unset nasgit.upstream 2>/dev/null")
+            else:
+                steps.append("  git --git-dir=\"$repo\" config --unset nasgit.kind 2>/dev/null")
+                steps.append("  git --git-dir=\"$repo\" config --unset nasgit.upstream 2>/dev/null")
+                steps.append("  git --git-dir=\"$repo\" config --unset nasgit.kindsrc 2>/dev/null")
+            kind_label = kind or "未分類"
+            steps.append(f"  echo '[SET] {name} -> {kind_label}'")
+            steps.append("fi")
+        steps += ["echo ___OK___", "echo ___END___", "true"]
+        rc, out, _ = self._ssh("\n".join(steps))
+        if rc != 0 or "___OK___" not in out:
+            self.done.emit(False, "設定失敗（連線或權限問題）。")
+            return
+        self.log.emit(self._between(out))
+        self.done.emit(True, f"已設定 {len(valid)} 個倉庫的來源分類。")
+
+    # --- 掃描 GitHub 帳號的倉庫列表，比對 fork 狀態（唯一會碰外部網路的模式）---
+    # 只對「有機會對到目前 NAS 清單」的 fork 才多打一次 API 拿 parent 來源，避免大帳號逐一查爆額度。
+    def _run_github_scan(self):
+        c = self.cfg
+        login = (c.get("github_login", "") or "").strip()
+        token = (c.get("github_token", "") or "").strip()
+        match_names = {n.lower() for n in (c.get("match_names", []) or [])}
+        if not login:
+            self.done.emit(False, "尚未填 GitHub 帳號。")
+            return
+
+        def _get(url):
+            req = urllib.request.Request(url, headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "NasGitConnector",
+            })
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        self.log.emit(f"--- 掃描 GitHub 帳號 {login} 的倉庫（{'已帶 token' if token else '未帶 token，60 次/小時上限'}）---")
+        repos = []
+        page = 1
+        try:
+            while True:
+                batch = _get(f"https://api.github.com/users/{login}/repos?per_page=100&page={page}&type=owner")
+                if not batch:
+                    break
+                repos.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                self.done.emit(False, "GitHub API 額度超過限制（403）。填 token 可拉高額度，或稍後再試。")
+            elif e.code == 404:
+                self.done.emit(False, f"GitHub 帳號不存在或無法讀取：{login}")
+            else:
+                self.done.emit(False, f"GitHub API 失敗（HTTP {e.code}）。")
+            return
+        except urllib.error.URLError as e:
+            self.done.emit(False, f"連不到 GitHub（{e.reason}）。")
+            return
+
+        result = {}
+        for r in repos:
+            name = r.get("name", "")
+            if not name:
+                continue
+            entry = {"is_fork": bool(r.get("fork")), "owner": login, "parent": ""}
+            if entry["is_fork"] and (not match_names or name.lower() in match_names):
+                try:
+                    detail = _get(f"https://api.github.com/repos/{login}/{name}")
+                    entry["parent"] = (detail.get("parent") or {}).get("clone_url", "")
+                except (urllib.error.HTTPError, urllib.error.URLError):
+                    pass
+            result[name] = entry
+        self.hooks.emit(json.dumps(result, ensure_ascii=False))
+        self.done.emit(True, f"已讀取 GitHub 帳號 {login} 的 {len(result)} 個倉庫。")
+
+    # --- 掃描本機專案根目錄，挑出還留著非 NAS 來源 URL 的殘留 remote（fork 慣例的 upstream 等）---
+    def _run_local_scan(self):
+        c = self.cfg
+        root_paths = c.get("scan_roots", []) or []
+        nas_host_frag = c.get("host", "") or ""
+        self.log.emit(f"--- 掃描本機 {len(root_paths)} 個資料夾 ---")
+        found = {}
+        for base in root_paths:
+            if not base or not os.path.isdir(base):
+                continue
+            try:
+                subdirs = [os.path.join(base, d) for d in os.listdir(base)
+                           if os.path.isdir(os.path.join(base, d))]
+            except OSError:
+                continue
+            for proj in subdirs:
+                if not is_git_repo(proj):
+                    continue
+                rc, out, _ = self._run(
+                    ["git", "config", "--get-regexp", r"^remote\..*\.url"], cwd=proj
+                )
+                if rc != 0 or not out:
+                    continue
+                name = os.path.basename(proj)
+                for line in out.splitlines():
+                    parts = line.split(" ", 1)
+                    if len(parts) != 2:
+                        continue
+                    key, url = parts
+                    if nas_host_frag and nas_host_frag in url:
+                        continue
+                    remote_name = key.split(".")[1] if key.count(".") >= 2 else key
+                    found.setdefault(name, []).append({"remote": remote_name, "url": url})
+        self.hooks.emit(json.dumps(found, ensure_ascii=False))
+        self.done.emit(True, f"本機掃描完成，{len(found)} 個資料夾有殘留來源 URL。")
+
     # --- 一鍵升級 NAS 上的 CI 引擎（自動備份 + 換檔）---
     def _run_upgrade_engine(self):
         c = self.cfg
@@ -2714,7 +2897,10 @@ class Worker(QThread):
 
         # 2-3 remote origin
         rc, remotes, _ = self._run(["git", "remote"], cwd=project_path)
+        prev_origin = ""
         if "origin" in remotes.split():
+            # 覆蓋前先留一份，串接完會用它判斷這個專案的來源分類（自己的/clone/fork）
+            _, prev_origin, _ = self._run(["git", "remote", "get-url", "origin"], cwd=project_path)
             self._run(["git", "remote", "set-url", "origin", remote_url], cwd=project_path)
             self.log.emit(f"✔ 已更新 origin -> {remote_url}")
         else:
@@ -2775,7 +2961,63 @@ class Worker(QThread):
         if rc == 0:
             self.log.emit(f"✔ 已將 NAS 預設分支(HEAD)指向 {branch}")
 
+        # 2-8 記錄倉庫來源分類（NAS 上已有 nasgit.kind 就不覆蓋，見 CLAUDE.md）
+        self._record_repo_kind(remote_repo_path, prev_origin)
+
         self.done.emit(True, f"完成！專案已就地接上 NAS。\nNAS 倉庫：{remote_repo_path}")
+
+    # --- 串接當下依 prev_origin 判斷來源分類，寫入 nasgit.kind（NAS 已有值就不覆蓋，
+    # 避免蓋掉先前手動分類或批次比對的結果）---
+    def _record_repo_kind(self, remote_repo_path, prev_origin):
+        rc, existing, _ = self._ssh(
+            f"git --git-dir='{remote_repo_path}' config --get nasgit.kind 2>/dev/null; true"
+        )
+        if existing.strip():
+            return
+
+        prev_origin = (prev_origin or "").strip()
+        if not prev_origin:
+            kind, upstream, src = "own", "", "auto-connect"
+        else:
+            kind, upstream, src = "clone", prev_origin, "auto-connect"
+            m = re.match(
+                r"^(?:https://|git@|ssh://[^/]*/)github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?/?$",
+                prev_origin,
+            )
+            if m:
+                owner, gh_repo = m.group(1), m.group(2)
+                login = (self.cfg.get("github_login", "") or "").strip()
+                if login and login.lower() == owner.lower():
+                    try:
+                        req = urllib.request.Request(
+                            f"https://api.github.com/repos/{owner}/{gh_repo}",
+                            headers={"Accept": "application/vnd.github+json", "User-Agent": "NasGitConnector"},
+                        )
+                        token = (self.cfg.get("github_token", "") or "").strip()
+                        if token:
+                            req.add_header("Authorization", f"Bearer {token}")
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            detail = json.loads(resp.read().decode("utf-8"))
+                        if detail.get("fork"):
+                            kind, src = "fork", "auto-github"
+                        else:
+                            kind, upstream, src = "own", "", "auto-github"
+                    except (urllib.error.HTTPError, urllib.error.URLError):
+                        self.log.emit(
+                            "ℹ 無法連線 GitHub API 判斷 fork 狀態，先記成「clone 別人的」，"
+                            "之後可用「來源批次比對…」重新判定。"
+                        )
+
+        steps = [
+            f"repo='{remote_repo_path}'",
+            f"git --git-dir=\"$repo\" config nasgit.kind {shq(kind)}",
+            f"git --git-dir=\"$repo\" config nasgit.kindsrc {shq(src)}",
+        ]
+        if upstream:
+            steps.append(f"git --git-dir=\"$repo\" config nasgit.upstream {shq(upstream)}")
+        self._ssh("\n".join(steps))
+        label = {"own": "自己的", "fork": "我 fork 的", "clone": "clone 別人的"}[kind]
+        self.log.emit(f"ℹ 來源分類：{label}" + (f"（來源 {upstream}）" if upstream else ""))
 
 
 # ============================================================
@@ -5123,6 +5365,315 @@ class BackupDialog(QDialog):
 
 
 # ============================================================
+# 單一倉庫來源分類對話框
+# 分類值取自清單當下已載入的資料（不用額外連線讀取）；只有「儲存」會打 NAS。
+# 鏡像庫的分類由 remote.origin.mirror 決定，此對話框對鏡像庫唯讀。
+# ============================================================
+class RepoKindDialog(QDialog):
+    def __init__(self, parent, cfg, name, mirror_url, kind, upstream):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.name = name
+        self.is_mirror = bool(mirror_url)
+        self.worker = None
+        self.setWindowTitle(f"來源分類 — {name}")
+        self.setMinimumWidth(480)
+
+        lay = QVBoxLayout(self)
+        if self.is_mirror:
+            note = QLabel(f"這是鏡像庫（← {mirror_url}），分類固定為「鏡像」，不能在此更改。")
+            note.setWordWrap(True)
+            lay.addWidget(note)
+        else:
+            lay.addWidget(QLabel("這個倉庫的來源是？"))
+
+        gb = QGroupBox()
+        gl = QVBoxLayout(gb)
+        self.rb_own = QRadioButton("自己的（原創專案）")
+        self.rb_fork = QRadioButton("我 fork 的")
+        self.rb_clone = QRadioButton("clone 別人的（沒有 fork 關係）")
+        self.rb_none = QRadioButton("未分類")
+        for rb in (self.rb_own, self.rb_fork, self.rb_clone, self.rb_none):
+            gl.addWidget(rb)
+        lay.addWidget(gb)
+
+        g = QGridLayout()
+        g.addWidget(QLabel("來源 URL（fork/clone 才需要）："), 0, 0)
+        self.upstream_edit = QLineEdit(upstream or "")
+        g.addWidget(self.upstream_edit, 0, 1)
+        lay.addLayout(g)
+
+        {"own": self.rb_own, "fork": self.rb_fork, "clone": self.rb_clone,
+         "": self.rb_none}.get(kind, self.rb_none).setChecked(True)
+
+        if self.is_mirror:
+            for rb in (self.rb_own, self.rb_fork, self.rb_clone, self.rb_none):
+                rb.setEnabled(False)
+            self.upstream_edit.setEnabled(False)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.bb.accepted.connect(self.on_save)
+        self.bb.rejected.connect(self.reject)
+        self.bb.button(QDialogButtonBox.StandardButton.Save).setEnabled(not self.is_mirror)
+        lay.addWidget(self.bb)
+
+    def _selected_kind(self) -> str:
+        if self.rb_own.isChecked():
+            return "own"
+        if self.rb_fork.isChecked():
+            return "fork"
+        if self.rb_clone.isChecked():
+            return "clone"
+        return ""
+
+    def on_save(self):
+        kind = self._selected_kind()
+        upstream = self.upstream_edit.text().strip() if kind in ("fork", "clone") else ""
+        self.bb.setEnabled(False)
+        self.status.setText("儲存中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["kind_items"] = [(self.name, kind, upstream)]
+        cfg["kind_src"] = "manual"
+        self.worker = Worker(cfg, mode="set_repo_kind")
+        self.worker.done.connect(self._on_saved)
+        self.worker.start()
+
+    def _on_saved(self, ok, msg):
+        self.bb.setEnabled(True)
+        if ok:
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "set_repo_kind",
+                      f"repo={self.name} kind={self._selected_kind() or '(未分類)'}")
+            self.accept()
+        else:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+
+
+# ============================================================
+# 批次比對倉庫來源分類對話框
+# 兩個獨立證據來源合併給建議：GitHub 帳號的 fork 狀態（github_scan）、
+# 本機專案殘留的非 NAS remote URL（local_scan，覆蓋 fork 慣例常見的 upstream remote 殘留）。
+# 只給建議，不自動套用；逐列確認/可改分類，按「套用勾選」才真的寫回 NAS。
+# ============================================================
+class RepoKindScanDialog(QDialog):
+    def __init__(self, parent, cfg, all_repos):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.all_repos = all_repos  # (name, status, pol, mirror, size_kb, kind, upstream)
+        self.gh_worker = None
+        self.local_worker = None
+        self.apply_worker = None
+        self.gh_result = {}
+        self.local_result = {}
+        self.settings = QSettings("TerryTools", "NasGitConnector")
+        self.setWindowTitle("來源批次比對")
+        self.resize(780, 560)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "用 GitHub 帳號的 fork 狀態、加上本機專案殘留的來源 remote，幫還沒分類的倉庫給建議。\n"
+            "只是建議，逐列確認/可改分類後按「套用勾選」才會真的寫回 NAS。已是鏡像庫的不會列出。"))
+
+        g = QGridLayout()
+        g.addWidget(QLabel("GitHub 帳號："), 0, 0)
+        self.login_edit = QLineEdit(self.settings.value("github_login", "", type=str))
+        g.addWidget(self.login_edit, 0, 1)
+        g.addWidget(QLabel("Token（選填，拉高額度/讀私有庫）："), 1, 0)
+        self.token_edit = QLineEdit(self.settings.value("github_token", "", type=str))
+        self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        g.addWidget(self.token_edit, 1, 1)
+        self.remember_check = QCheckBox("記住帳號/token（存在本機設定）")
+        self.remember_check.setChecked(bool(self.settings.value("github_login", "", type=str)))
+        g.addWidget(self.remember_check, 2, 1)
+        g.addWidget(QLabel("本機掃描資料夾（分號分隔）："), 3, 0)
+        self.roots_edit = QLineEdit(";".join(CONTAINER_ROOTS))
+        g.addWidget(self.roots_edit, 3, 1)
+        self.browse_btn = QPushButton("瀏覽加入…")
+        self.browse_btn.clicked.connect(self.on_browse_root)
+        g.addWidget(self.browse_btn, 3, 2)
+        lay.addLayout(g)
+
+        row = QHBoxLayout()
+        self.scan_btn = QPushButton("開始比對")
+        self.scan_btn.clicked.connect(self.on_scan)
+        row.addWidget(self.scan_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["套用", "倉庫", "現況", "建議分類", "證據"])
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        lay.addWidget(self.table, stretch=1)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.apply_btn = QPushButton("套用勾選")
+        self.apply_btn.clicked.connect(self.on_apply)
+        self.bb.addButton(self.apply_btn, QDialogButtonBox.ButtonRole.ActionRole)
+        self.bb.rejected.connect(self.reject)
+        lay.addWidget(self.bb)
+
+    def on_browse_root(self):
+        path = QFileDialog.getExistingDirectory(self, "選擇要掃描的資料夾")
+        if path:
+            cur = [p for p in self.roots_edit.text().split(";") if p.strip()]
+            cur.append(path)
+            self.roots_edit.setText(";".join(cur))
+
+    def on_scan(self):
+        login = self.login_edit.text().strip()
+        if not login:
+            self.status.setText("請先填 GitHub 帳號。")
+            return
+        if self.remember_check.isChecked():
+            self.settings.setValue("github_login", login)
+            self.settings.setValue("github_token", self.token_edit.text().strip())
+        else:
+            self.settings.remove("github_login")
+            self.settings.remove("github_token")
+
+        self.scan_btn.setEnabled(False)
+        self.status.setText("掃描 GitHub 中…")
+        self.status.setStyleSheet("")
+        match_names = [r[0][:-4] if r[0].endswith(".git") else r[0] for r in self.all_repos]
+        cfg = dict(self.cfg)
+        cfg["github_login"] = login
+        cfg["github_token"] = self.token_edit.text().strip()
+        cfg["match_names"] = match_names
+        self.gh_worker = Worker(cfg, mode="github_scan")
+        self.gh_worker.hooks.connect(self._on_gh_result)
+        self.gh_worker.done.connect(self._on_gh_done)
+        self.gh_worker.start()
+
+    def _on_gh_result(self, text):
+        try:
+            self.gh_result = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            self.gh_result = {}
+
+    def _on_gh_done(self, ok, msg):
+        if not ok:
+            self.scan_btn.setEnabled(True)
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+            return
+        self.status.setText("掃描本機資料夾中…")
+        roots = [p.strip() for p in self.roots_edit.text().split(";") if p.strip()]
+        cfg = dict(self.cfg)
+        cfg["scan_roots"] = roots
+        self.local_worker = Worker(cfg, mode="local_scan")
+        self.local_worker.hooks.connect(self._on_local_result)
+        self.local_worker.done.connect(self._on_local_done)
+        self.local_worker.start()
+
+    def _on_local_result(self, text):
+        try:
+            self.local_result = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            self.local_result = {}
+
+    def _on_local_done(self, ok, msg):
+        self.scan_btn.setEnabled(True)
+        if not ok:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+            return
+        self.status.setText("比對完成，逐列確認後按「套用勾選」寫回。")
+        self.status.setStyleSheet("color:#1a7f37;")
+        self._build_table()
+
+    def _build_table(self):
+        login = self.login_edit.text().strip().lower()
+        # repo 名比對統一忽略大小寫：本機資料夾名稱/GitHub repo 名跟 NAS 上的 bare repo 名
+        # 可能大小寫不完全一致（例如手動改過資料夾名）。
+        gh_ci = {k.lower(): v for k, v in self.gh_result.items()}
+        local_ci = {k.lower(): v for k, v in self.local_result.items()}
+        self.table.setRowCount(0)
+        for name, status, pol, mirror, size_kb, kind, upstream in self.all_repos:
+            if mirror:
+                continue  # 鏡像庫分類固定由 remote.origin.mirror 決定，不列入建議
+            bare = name[:-4] if name.endswith(".git") else name
+            suggest_kind, suggest_upstream, evidence = "", "", ""
+            gh = gh_ci.get(bare.lower())
+            if gh:
+                if gh.get("is_fork"):
+                    suggest_kind = "fork"
+                    suggest_upstream = gh.get("parent") or ""
+                    evidence = f"GitHub: fork ← {suggest_upstream or '(未知 parent)'}"
+                else:
+                    suggest_kind = "own"
+                    evidence = f"GitHub: {login}/{bare}（非 fork）"
+            else:
+                local_hits = local_ci.get(bare.lower()) or []
+                if local_hits:
+                    h = local_hits[0]
+                    suggest_kind = "clone"
+                    suggest_upstream = h["url"]
+                    evidence = f"本機 {h['remote']} ← {h['url']}"
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            chk = QCheckBox()
+            chk.setChecked(bool(suggest_kind) and not kind)
+            self.table.setCellWidget(row, 0, chk)
+            name_item = QTableWidgetItem(bare)
+            name_item.setData(Qt.ItemDataRole.UserRole, name)
+            self.table.setItem(row, 1, name_item)
+            cur_label = {"own": "自己的", "fork": "fork", "clone": "clone", "": "未分類"}[kind or ""]
+            self.table.setItem(row, 2, QTableWidgetItem(cur_label))
+            combo = QComboBox()
+            combo.addItems(["未分類", "自己的", "我 fork 的", "clone 別人的"])
+            combo.setCurrentIndex({"": 0, "own": 1, "fork": 2, "clone": 3}[suggest_kind])
+            self.table.setCellWidget(row, 3, combo)
+            ev_item = QTableWidgetItem(evidence)
+            ev_item.setData(Qt.ItemDataRole.UserRole, suggest_upstream)
+            self.table.setItem(row, 4, ev_item)
+
+    def on_apply(self):
+        kind_map = {0: "", 1: "own", 2: "fork", 3: "clone"}
+        items = []
+        for row in range(self.table.rowCount()):
+            chk = self.table.cellWidget(row, 0)
+            if not chk.isChecked():
+                continue
+            name = self.table.item(row, 1).data(Qt.ItemDataRole.UserRole)
+            combo = self.table.cellWidget(row, 3)
+            kind = kind_map[combo.currentIndex()]
+            upstream = self.table.item(row, 4).data(Qt.ItemDataRole.UserRole) or ""
+            items.append((name, kind, upstream))
+        if not items:
+            self.status.setText("沒有勾選任何列。")
+            return
+        self.apply_btn.setEnabled(False)
+        self.status.setText("寫回中…")
+        cfg = dict(self.cfg)
+        cfg["kind_items"] = items
+        cfg["kind_src"] = "auto-github"
+        self.apply_worker = Worker(cfg, mode="set_repo_kind")
+        self.apply_worker.done.connect(self._on_applied)
+        self.apply_worker.start()
+
+    def _on_applied(self, ok, msg):
+        self.apply_btn.setEnabled(True)
+        if ok:
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "set_repo_kind",
+                      f"批次比對套用：{msg}")
+            self.status.setText("✔ " + msg)
+            self.status.setStyleSheet("color:#1a7f37;")
+        else:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+
+
+# ============================================================
 # 主視窗
 # ============================================================
 class MainWindow(QMainWindow):
@@ -5323,6 +5874,9 @@ class MainWindow(QMainWindow):
         self.backup_sync_btn = QPushButton("同步離站備份")
         self.backup_sync_btn.setToolTip("對選取的倉庫執行 push --mirror 到其離站備份目的地；沒選就同步全部已設定備份的倉庫。")
         self.backup_sync_btn.clicked.connect(self.on_backup_sync)
+        self.kind_scan_btn = QPushButton("來源批次比對…")
+        self.kind_scan_btn.setToolTip("用 GitHub 帳號 fork 狀態＋本機殘留 remote，幫還沒分類的倉庫批次建議來源分類。")
+        self.kind_scan_btn.clicked.connect(self.on_repo_kind_scan)
 
         top_row.addWidget(self.refresh_btn)
         top_row.addWidget(self.ci_status_btn)
@@ -5337,8 +5891,15 @@ class MainWindow(QMainWindow):
         top_row2.addWidget(self.mirror_reg_btn)
         top_row2.addWidget(self.mirror_sync_btn)
         top_row2.addWidget(self.backup_sync_btn)
+        top_row2.addWidget(self.kind_scan_btn)
         top_row2.addStretch(1)
         bp.addLayout(top_row2)
+
+        self.kind_tabbar = QTabBar()
+        for _, label in REPO_KIND_TABS:
+            self.kind_tabbar.addTab(label)
+        self.kind_tabbar.currentChanged.connect(lambda _=None: self.apply_repo_filter(self.filter_edit.text()))
+        bp.addWidget(self.kind_tabbar)
 
         self.repo_list = QListWidget()
         self.repo_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -5387,6 +5948,11 @@ class MainWindow(QMainWindow):
         self.backup_btn.setToolTip("設定此庫的離站備份目的地（外部 Git 端點，例如 GitHub 私有庫）。")
         self.backup_btn.clicked.connect(self.on_backup_dialog)
         danger_row.addWidget(self.backup_btn)
+        self.kind_btn = QPushButton("來源分類…")
+        self.kind_btn.setEnabled(False)
+        self.kind_btn.setToolTip("標記這個倉庫是自己的原創專案、fork 的、還是單純 clone 別人的（鏡像庫唯讀）。")
+        self.kind_btn.clicked.connect(self.on_repo_kind)
+        danger_row.addWidget(self.kind_btn)
         self.batch_ci_btn = QPushButton("批次設定 CI…")
         self.batch_ci_btn.setEnabled(False)
         self.batch_ci_btn.setToolTip("對『目前選取的多個』倉庫一次套用同一 CI 規則（可按住 Ctrl/Shift 多選）。")
@@ -5892,6 +6458,10 @@ class MainWindow(QMainWindow):
             "remote_root": self.root_edit.text().strip() or "/volume1/Git_Server",
             "password": self.pw_edit.text(),
             "identity_file": self.identity_file_edit.text().strip(),
+            # 只有在「來源批次比對…」勾過「記住」才會有值；沒填就代表串接當下無法判斷
+            # fork/own，只能先記成「clone 別人的」，之後仍可用批次比對補判斷。
+            "github_login": self.settings.value("github_login", "", type=str),
+            "github_token": self.settings.value("github_token", "", type=str),
         }
 
     def toggle_pw_echo(self):
@@ -6006,7 +6576,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_repos(self, items: list):
-        # items: (name, status, policy, mirror_url, size_kb)；容錯舊格式
+        # items: (name, status, policy, mirror_url, size_kb, kind, upstream)；容錯舊格式
         norm = []
         for it in items:
             if isinstance(it, (list, tuple)):
@@ -6018,10 +6588,13 @@ class MainWindow(QMainWindow):
                     size_kb = int(it[4]) if len(it) > 4 else 0
                 except (TypeError, ValueError):
                     size_kb = 0
-                norm.append((name, status, pol, mirror, size_kb))
+                kind = str(it[5]) if len(it) > 5 else ""
+                upstream = str(it[6]) if len(it) > 6 else ""
+                norm.append((name, status, pol, mirror, size_kb, kind, upstream))
             else:
-                norm.append((str(it), "", "none", "", 0))
+                norm.append((str(it), "", "none", "", 0, "", ""))
         self._all_repos = norm
+        self._update_kind_tab_counts()
         self.apply_repo_filter(self.filter_edit.text())
 
     def on_list_done(self, ok: bool, msg: str):
@@ -6036,7 +6609,10 @@ class MainWindow(QMainWindow):
 
     def apply_repo_filter(self, text: str):
         text = (text or "").strip().lower()
+        tab_kind = self._current_kind_tab()
         rows = [r for r in self._all_repos if not text or text in r[0].lower()]
+        if tab_kind != "all":
+            rows = [r for r in rows if effective_repo_kind(r[3], r[5] if len(r) > 5 else "") == tab_kind]
         sort_idx = self.sort_combo.currentIndex() if hasattr(self, "sort_combo") else 0
         if sort_idx == 1:  # 大小（大到小）
             rows.sort(key=lambda r: r[4], reverse=True)
@@ -6048,24 +6624,54 @@ class MainWindow(QMainWindow):
         else:  # 名稱
             rows.sort(key=lambda r: r[0].lower())
         self.repo_list.clear()
-        for name, status, pol, mirror, size_kb in rows:
+        for row in rows:
+            name, status, pol, mirror, size_kb = row[0], row[1], row[2], row[3], row[4]
+            kind = row[5] if len(row) > 5 else ""
+            upstream = row[6] if len(row) > 6 else ""
+            eff_kind = effective_repo_kind(mirror, kind)
             ci = {"soft": "CI:soft", "strict": "CI:strict"}.get(pol, "CI:—")
             parts = [name]
             if status:
                 parts.append(status)
             parts.append(ci)
             parts.append(fmt_size_kb(size_kb))
-            if mirror:
-                parts.append("↺鏡像")
+            if eff_kind in REPO_KIND_MARK:
+                parts.append(REPO_KIND_MARK[eff_kind])
             it = QListWidgetItem("    ·    ".join(parts))
             it.setData(Qt.ItemDataRole.UserRole, name)
             it.setData(Qt.ItemDataRole.UserRole + 1, pol)
             it.setData(Qt.ItemDataRole.UserRole + 2, mirror)
+            it.setData(Qt.ItemDataRole.UserRole + 3, kind)
+            it.setData(Qt.ItemDataRole.UserRole + 4, upstream)
             if mirror:
                 it.setToolTip(f"GitHub 鏡像 ← {mirror}")
+            elif upstream:
+                it.setToolTip(f"來源 ← {upstream}")
             if status.startswith("空庫"):
                 it.setForeground(Qt.GlobalColor.gray)
             self.repo_list.addItem(it)
+
+    def _current_kind_tab(self) -> str:
+        if not hasattr(self, "kind_tabbar"):
+            return "all"
+        idx = self.kind_tabbar.currentIndex()
+        if idx < 0 or idx >= len(REPO_KIND_TABS):
+            return "all"
+        return REPO_KIND_TABS[idx][0]
+
+    def _update_kind_tab_counts(self):
+        if not hasattr(self, "kind_tabbar"):
+            return
+        counts = {k: 0 for k, _ in REPO_KIND_TABS}
+        for r in self._all_repos:
+            eff = effective_repo_kind(r[3], r[5] if len(r) > 5 else "")
+            counts["all"] += 1
+            counts[eff] += 1
+        for i, (kind_key, label) in enumerate(REPO_KIND_TABS):
+            if kind_key == "all":
+                self.kind_tabbar.setTabText(i, f"{label} ({counts['all']})")
+            else:
+                self.kind_tabbar.setTabText(i, f"{label} ({counts.get(kind_key, 0)})")
 
     def _selected_mirror_names(self):
         out = []
@@ -6109,6 +6715,7 @@ class MainWindow(QMainWindow):
         self.desc_btn.setEnabled(has)
         self.branch_protect_btn.setEnabled(has)
         self.backup_btn.setEnabled(has)
+        self.kind_btn.setEnabled(has)
         self.batch_ci_btn.setEnabled(len(self.repo_list.selectedItems()) >= 1)
         self.rename_btn.setEnabled(has)
         self.clone_btn.setEnabled(has)
@@ -6811,6 +7418,33 @@ class MainWindow(QMainWindow):
         self.save_current_profile(silent=True)
         dlg = BackupDialog(self, cfg, name)
         dlg.exec()
+
+    # ---------- 來源分類 ----------
+    def on_repo_kind(self):
+        items = self.repo_list.selectedItems()
+        if not items:
+            self.browse_status.setText("請先在清單選一個倉庫。")
+            return
+        it = items[0]
+        name = it.data(Qt.ItemDataRole.UserRole) or it.text()
+        mirror = it.data(Qt.ItemDataRole.UserRole + 2) or ""
+        kind = it.data(Qt.ItemDataRole.UserRole + 3) or ""
+        upstream = it.data(Qt.ItemDataRole.UserRole + 4) or ""
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = RepoKindDialog(self, cfg, name, mirror, kind, upstream)
+        if dlg.exec():
+            self.on_refresh()
+
+    def on_repo_kind_scan(self):
+        if not self._all_repos:
+            self.browse_status.setText("請先「重新整理」列出倉庫，再開批次比對。")
+            return
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = RepoKindScanDialog(self, cfg, self._all_repos)
+        dlg.exec()
+        self.on_refresh()
 
     def on_backup_sync(self):
         names = self._selected_repo_names()  # 選取中的倉庫；空=同步全部已設定備份的倉庫
