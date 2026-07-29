@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.6.0"
+__version__ = "2.6.1"
 
 import os
 import sys
@@ -2383,7 +2383,7 @@ class Worker(QThread):
             "echo '== git_devs 帳號 SSH 金鑰登入 ACL 檢查 =='",
             "#    DSM 的 sshd 會檢查 home 目錄本身的 Synology ACL，ACL 不乾淨的話會整段無聲",
             "#    忽略 authorized_keys、退回密碼登入，不會報任何錯誤，很難察覺（2026-07-15 實際事故）。",
-            "acl_bad=0",
+            "acl_bad=0; acl_skip=0",
             "gd_members=$(grep '^git_devs:' /etc/group | cut -d: -f4)",
             "old_ifs=$IFS; IFS=','",
             "for u in $gd_members; do",
@@ -2393,6 +2393,7 @@ class Worker(QThread):
             "  acl_line=$(synoacltool -get \"$home\" 2>/dev/null | head -1)",
             "  if [ -z \"$acl_line\" ]; then",
             "    echo \"[  ] $u：無法讀取 $home 的 ACL 狀態（權限不足或指令不存在），略過\"",
+            "    acl_skip=$((acl_skip+1))",
             "  elif echo \"$acl_line\" | grep -q 'No ACL'; then",
             "    :",
             "  else",
@@ -2401,7 +2402,11 @@ class Worker(QThread):
             "  fi",
             "done",
             "IFS=$old_ifs",
-            "[ \"$acl_bad\" = 0 ] && echo '[OK] 所有 git_devs 帳號的 home 目錄 ACL 正常'",
+            "if [ \"$acl_bad\" = 0 ] && [ \"$acl_skip\" = 0 ]; then",
+            "  echo '[OK] 所有 git_devs 帳號的 home 目錄 ACL 正常'",
+            "elif [ \"$acl_bad\" = 0 ]; then",
+            "  echo \"[  ] 有 $acl_skip 個帳號的 home ACL 因權限不足無法確認（非 root 讀不到別人 home 的 ACL，這台 NAS 對這個身份沒開免密碼 sudo，此處無法補 sudo 問到真相），其餘沒發現異常，不代表全部正常\"",
+            "fi",
             "echo",
             "echo '== 日誌 =='",
             "[ -d \"$BASE/logs\" ] && echo '[OK] logs 目錄存在' || echo '[  ] 無 logs 目錄'",
