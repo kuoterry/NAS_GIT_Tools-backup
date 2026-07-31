@@ -67,16 +67,8 @@ ARCHIVE_STALE_DAYS = 90
 # 健康檢查用：單一檔案超過這個大小（bytes）就建議改用 Git LFS，僅提醒不自動處理。
 LFS_SUGGEST_BYTES = 5 * 1024 * 1024
 
-# 新建空倉庫可選套用的 .gitignore 模板（Python 專案常見規則）。
-GITIGNORE_TEMPLATE = """__pycache__/
-*.pyc
-.venv/
-venv/
-build/
-dist/
-*.egg-info/
-.DS_Store
-"""
+# 新建空倉庫可選套用的 .gitignore 模板：直接沿用下方 GITIGNORE_TEXT（單一真相來源，
+# 過去這裡另有一份精簡 Python 版，兩份同用途模板遲早 drift）。定義在 GITIGNORE_TEXT 之後。
 
 # 本機操作稽核 log：這套工具做的破壞性動作（刪 repo、砍 tag、砍 SSH 金鑰、批次清封存、GC 等）
 # NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
@@ -538,6 +530,9 @@ Desktop.ini
 ~$*
 *.tmp
 """
+
+# 新建空倉庫的模板與串接流程共用同一份內容（單一真相來源）
+GITIGNORE_TEMPLATE = GITIGNORE_TEXT
 
 
 # ============================================================
@@ -2948,27 +2943,39 @@ class Worker(QThread):
 
     # --- 封存區：永久刪除 ---
     def _run_archive_purge(self):
+        """永久刪除封存項目。支援單筆（arch_name）與批次（arch_names）——批次在
+        同一條 SSH 連線內迴圈刪除，不再每個項目各開一條連線（20 項省下 ~30 秒握手）。"""
         root = self.cfg["remote_root"]
-        arch = self.cfg.get("arch_name", "")
-        if not self._safe_arch(arch):
-            self.done.emit(False, f"名稱不安全：{arch!r}")
+        names = self.cfg.get("arch_names") or (
+            [self.cfg["arch_name"]] if self.cfg.get("arch_name") else [])
+        bad = [a for a in names if not self._safe_arch(a)]
+        if bad:
+            self.done.emit(False, f"名稱不安全：{bad[0]!r}")
             return
-        self.log.emit(f"--- 永久刪除封存：{arch} ---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
-            f"BASE='{root}'; A=\"$BASE/_archived\"; arch='{arch}'",
-            "e=\"$A/$arch\"",
-            "if [ ! -e \"$e\" ]; then echo NOTFOUND; echo ___END___; exit 0; fi",
-            "rm -rf \"$e\" && echo PURGED",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd)
-        body = self._between(out)
-        if rc == 0 and "PURGED" in body:
-            self.done.emit(True, f"已永久刪除：{arch}")
+        if not names:
+            self.done.emit(False, "沒有要刪除的封存項目。")
+            return
+        self.log.emit(f"--- 永久刪除封存（{len(names)} 個）---")
+        lines = [f"BASE='{root}'; A=\"$BASE/_archived\""]
+        for a in names:
+            lines += [
+                f"e=\"$A/{a}\"",
+                f"if [ ! -e \"$e\" ]; then echo '[NOTFOUND] {a}'",
+                f"elif rm -rf \"$e\"; then echo '[OK] {a}'",
+                f"else echo '[FAIL] {a}'; fi",
+            ]
+        ok, body, hint = self._ssh_block(lines)
+        if not ok:
+            self.done.emit(False, f"刪除失敗：{hint}")
+            return
+        self.hooks.emit(body)
+        nok = body.count("[OK] ")
+        nbad = body.count("[FAIL] ") + body.count("[NOTFOUND] ")
+        if len(names) == 1:
+            self.done.emit(nok == 1, f"已永久刪除：{names[0]}" if nok == 1
+                           else f"刪除失敗（{body.strip() or '權限問題？'}）。")
         else:
-            self.done.emit(False, "刪除失敗（權限問題？）。")
+            self.done.emit(nbad == 0, f"批次清理完成：成功 {nok}、失敗 {nbad}。")
 
     # --- 完整串接 ---
     def _run_connect(self):
@@ -3010,49 +3017,62 @@ class Worker(QThread):
             return
         self.log.emit(f"ℹ git 身分：{name_out} <{email_out}>")
 
-        # Step 1 NAS 建庫
+        # Step 1 NAS 建庫（存在檢查＋建庫＋權限＋hook＋讀既有分類，合併成一條 SSH——
+        # 過去這段拆成 5 條連線，每條 1-2 秒握手，串接一次要白等近十秒）
         self.log.emit("--- 步驟 1：在 NAS 建立裸倉庫 ---")
-        rc, out, _ = self._ssh(f"[ -d '{remote_repo_path}' ] && echo YES || echo NO")
-        if rc != 0:
+        ok, body, hint = self._ssh_block([
+            f"REPO='{remote_repo_path}'; ROOT='{root}'; NAME='{repo_name}'",
+            "if [ -d \"$REPO\" ]; then",
+            "  echo EXISTS",
+            "else",
+            "  if git init --bare \"$REPO\" >/dev/null 2>&1; then",
+            "    echo CREATED",
+            # 讓 git 之後自己建立的物件檔就是群組可寫，避免不同身份交錯 push 時互卡權限
+            "    git --git-dir=\"$REPO\" config core.sharedRepository group",
+            # 權限：sudo -n（免密碼）盡力而為，失敗不中斷
+            f"    if sudo -n chown -R {user}:git_devs \"$REPO\" 2>/dev/null && "
+            f"sudo -n chmod g+s \"$REPO\" 2>/dev/null && sudo -n chmod -R g+rwX \"$REPO\" 2>/dev/null; then",
+            "      echo PERM_OK",
+            "    else",
+            "      echo PERM_MANUAL",
+            "    fi",
+            "  else",
+            "    echo INIT_FAIL",
+            "  fi",
+            "fi",
+            "if [ -d \"$REPO\" ]; then",
+            "  if [ -f \"$ROOT/install_and_monitor_git_hooks.sh\" ]; then",
+            "    \"$ROOT/install_and_monitor_git_hooks.sh\" \"$NAME\"",
+            "  else",
+            "    echo '[WARN] 找不到 install_and_monitor_git_hooks.sh，略過'",
+            "  fi",
+            "  echo \"KIND=$(git --git-dir=\"$REPO\" config --get nasgit.kind 2>/dev/null)\"",
+            "fi",
+        ])
+        if not ok:
             self.done.emit(False, "無法連線 NAS（SSH 驗證或連線問題）。\n"
+                                  f"原因：{hint}\n"
                                   "請確認已設 SSH 金鑰，或填密碼並安裝 PuTTY(plink)。在家可改用內網 IP。")
             return
-
-        if "YES" in out:
+        if "INIT_FAIL" in body:
+            self.done.emit(False, "NAS repo 建立失敗（git init --bare）。")
+            return
+        if "EXISTS" in body:
             self.log.emit(f"[INFO] NAS repo 已存在，跳過建立：{remote_repo_path}")
-        else:
-            rc, _, _ = self._ssh(f"git init --bare '{remote_repo_path}'")
-            if rc != 0:
-                self.done.emit(False, "NAS repo 建立失敗（git init --bare）。")
-                return
-            # 讓 git 之後自己建立的物件檔就是群組可寫，避免不同身份交錯 push 時互卡權限
-            self._ssh(f"git --git-dir='{remote_repo_path}' config core.sharedRepository group")
-            # 權限：sudo -n（免密碼）盡力而為，失敗不中斷
-            perm_cmd = (
-                f"sudo -n chown -R {user}:git_devs '{remote_repo_path}' 2>/dev/null && "
-                f"sudo -n chmod g+s '{remote_repo_path}' 2>/dev/null && "
-                f"sudo -n chmod -R g+rwX '{remote_repo_path}' 2>/dev/null"
+        elif "PERM_OK" in body:
+            self.log.emit(f"[OK] 已建立並設定權限：{remote_repo_path}")
+        elif "PERM_MANUAL" in body:
+            self.log.emit("⚠️ NAS repo 已建立，但權限需手動補完（sudo 未設 NOPASSWD）。")
+            self.log.emit("   請另開視窗執行（會問 NAS 密碼）：")
+            self.log.emit(
+                f'   ssh {ssh_host} "sudo chown -R {user}:git_devs '
+                f"'{remote_repo_path}'; sudo chmod g+s '{remote_repo_path}'; "
+                f"sudo chmod -R g+rwX '{remote_repo_path}'\""
             )
-            rc, _, _ = self._ssh(perm_cmd)
-            if rc == 0:
-                self.log.emit(f"[OK] 已建立並設定權限：{remote_repo_path}")
-            else:
-                self.log.emit("⚠️ NAS repo 已建立，但權限需手動補完（sudo 未設 NOPASSWD）。")
-                self.log.emit("   請另開視窗執行（會問 NAS 密碼）：")
-                self.log.emit(
-                    f'   ssh {ssh_host} "sudo chown -R {user}:git_devs '
-                    f"'{remote_repo_path}'; sudo chmod g+s '{remote_repo_path}'; "
-                    f"sudo chmod -R g+rwX '{remote_repo_path}'\""
-                )
-
-        # 安裝 hook（盡力而為）
-        self.log.emit("👉 安裝 Git hook...")
-        hook_cmd = (
-            f"if [ -f '{root}/install_and_monitor_git_hooks.sh' ]; then "
-            f"'{root}/install_and_monitor_git_hooks.sh' '{repo_name}'; "
-            f"else echo '[WARN] 找不到 install_and_monitor_git_hooks.sh，略過'; fi"
-        )
-        self._ssh(hook_cmd)
+        existing_kind = ""
+        for bl in body.splitlines():
+            if bl.startswith("KIND="):
+                existing_kind = bl[len("KIND="):].strip()
 
         # Step 2 本地就地配置
         self.log.emit("--- 步驟 2：本地就地配置 ---")
@@ -3135,27 +3155,28 @@ class Worker(QThread):
             )
             return
 
-        # 2-7 NAS HEAD 指向本分支
-        rc, _, _ = self._ssh(
-            f"git --git-dir='{remote_repo_path}' symbolic-ref HEAD refs/heads/{shq(branch)}"
-        )
-        if rc == 0:
+        # 2-7 NAS HEAD 指向本分支＋記錄來源分類（合併成一條 SSH；
+        # NAS 上已有 nasgit.kind 就不覆蓋，見 CLAUDE.md）
+        post_lines = [
+            f"repo='{remote_repo_path}'",
+            f"git --git-dir=\"$repo\" symbolic-ref HEAD refs/heads/{shq(branch)} && echo HEAD_OK",
+        ]
+        kind_label = ""
+        if not existing_kind:
+            kind_lines, kind_label = self._repo_kind_config_lines(prev_origin)
+            post_lines += kind_lines
+        ok, body, _hint = self._ssh_block(post_lines)
+        if ok and "HEAD_OK" in body:
             self.log.emit(f"✔ 已將 NAS 預設分支(HEAD)指向 {branch}")
-
-        # 2-8 記錄倉庫來源分類（NAS 上已有 nasgit.kind 就不覆蓋，見 CLAUDE.md）
-        self._record_repo_kind(remote_repo_path, prev_origin)
+        if kind_label:
+            self.log.emit(f"ℹ 來源分類：{kind_label}")
 
         self.done.emit(True, f"完成！專案已就地接上 NAS。\nNAS 倉庫：{remote_repo_path}")
 
-    # --- 串接當下依 prev_origin 判斷來源分類，寫入 nasgit.kind（NAS 已有值就不覆蓋，
-    # 避免蓋掉先前手動分類或批次比對的結果）---
-    def _record_repo_kind(self, remote_repo_path, prev_origin):
-        rc, existing, _ = self._ssh(
-            f"git --git-dir='{remote_repo_path}' config --get nasgit.kind 2>/dev/null; true"
-        )
-        if existing.strip():
-            return
-
+    # --- 串接當下依 prev_origin 判斷來源分類，回傳要併進遠端腳本的 config 行與顯示文字。
+    # 不自己開 SSH 連線：呼叫端（_run_connect）把這些行併進既有的 post-push 腳本一次送出；
+    # 「NAS 已有 nasgit.kind 就不覆蓋」的檢查也由呼叫端用第一條腳本讀回的值把關（見 CLAUDE.md）---
+    def _repo_kind_config_lines(self, prev_origin):
         prev_origin = (prev_origin or "").strip()
         if not prev_origin:
             kind, upstream, src = "own", "", "auto-connect"
@@ -3190,15 +3211,13 @@ class Worker(QThread):
                         )
 
         steps = [
-            f"repo='{remote_repo_path}'",
             f"git --git-dir=\"$repo\" config nasgit.kind {shq(kind)}",
             f"git --git-dir=\"$repo\" config nasgit.kindsrc {shq(src)}",
         ]
         if upstream:
             steps.append(f"git --git-dir=\"$repo\" config nasgit.upstream {shq(upstream)}")
-        self._ssh("\n".join(steps))
         label = {"own": "自己的", "fork": "我 fork 的", "clone": "clone 別人的"}[kind]
-        self.log.emit(f"ℹ 來源分類：{label}" + (f"（來源 {upstream}）" if upstream else ""))
+        return steps, label + (f"（來源 {upstream}）" if upstream else "")
 
 
 # ============================================================
@@ -4232,38 +4251,29 @@ class ArchiveDialog(QDialog):
             f"確定永久刪除以下 {len(names)} 個封存項目？此動作無法復原：\n" + "\n".join(names))
         if r != QMessageBox.StandardButton.Yes:
             return
-        self._purge_queue = list(names)
-        self._purge_ok = 0
-        self._purge_fail = 0
+        # 一條 SSH 連線內批次刪除（過去每項各開一條連線、由 _run_next_purge 佇列驅動）
         self._busy(True)
-        self._run_next_purge()
-
-    def _run_next_purge(self):
-        if not self._purge_queue:
-            self._busy(False)
-            msg = f"批次清理完成：成功 {self._purge_ok}、失敗 {self._purge_fail}。"
-            self.status.setText(("✔ " if self._purge_fail == 0 else "⚠ ") + msg)
-            self.status.setStyleSheet("color:#1a7f37;" if self._purge_fail == 0 else "color:#b06000;")
-            self.refresh()
-            return
-        name = self._purge_queue.pop(0)
-        self._purging_name = name
-        self.status.setText(f"刪除中… {name}（剩 {len(self._purge_queue) + 1} 個）")
+        self.status.setText(f"批次刪除中…（{len(names)} 個）")
         self.status.setStyleSheet("")
         cfg = dict(self.cfg)
-        cfg["arch_name"] = name
+        cfg["arch_names"] = list(names)
         self.worker = Worker(cfg, mode="archive_purge")
-        self.worker.done.connect(self._on_bulk_purge_one_done)
+        self.worker.hooks.connect(self._on_bulk_purge_body)
+        self.worker.done.connect(self._on_bulk_purge_done)
         self.worker.start()
 
-    def _on_bulk_purge_one_done(self, ok, msg):
-        if ok:
-            self._purge_ok += 1
-            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "archive_purge",
-                      getattr(self, "_purging_name", "").replace("\n", " ") + " (批次清理)")
-        else:
-            self._purge_fail += 1
-        self._run_next_purge()
+    def _on_bulk_purge_body(self, body: str):
+        # 逐項補稽核：只記真的刪掉的那些
+        for line in body.splitlines():
+            if line.startswith("[OK] "):
+                audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "archive_purge",
+                          line[len("[OK] "):].strip() + " (批次清理)")
+
+    def _on_bulk_purge_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "⚠ ") + msg)
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b06000;")
+        self.refresh()
 
 
 # ============================================================
@@ -6856,6 +6866,8 @@ class MainWindow(QMainWindow):
             rows.sort(key=activity_key, reverse=True)
         else:  # 名稱
             rows.sort(key=lambda r: r[0].lower())
+        # 重建前記住目前選取；否則打字篩選/重新整理都會把選取（含批次 CI 的多選）清掉
+        selected_names = {i.data(Qt.ItemDataRole.UserRole) for i in self.repo_list.selectedItems()}
         self.repo_list.clear()
         for row in rows:
             name, status, pol, mirror, size_kb = row[0], row[1], row[2], row[3], row[4]
@@ -6883,6 +6895,8 @@ class MainWindow(QMainWindow):
             if status.startswith("空庫"):
                 it.setForeground(Qt.GlobalColor.gray)
             self.repo_list.addItem(it)
+            if name in selected_names:
+                it.setSelected(True)
 
     def _current_kind_tab(self) -> str:
         if not hasattr(self, "kind_tabbar"):
@@ -7037,6 +7051,21 @@ class MainWindow(QMainWindow):
         self.worker.done.connect(self.on_rename_done)
         self.worker.start()
 
+    def _patch_repo_row(self, name, new_name=None, policy=None):
+        """rename/set_ci 完成後直接改本地清單資料並重畫，不再整包 re-list——
+        _run_list 會對每個 repo 跑 du -sk，全量重整是這個畫面最貴的操作。"""
+        for i, r in enumerate(self._all_repos):
+            if r[0] == name:
+                r = list(r)
+                if new_name:
+                    r[0] = new_name
+                if policy is not None:
+                    r[2] = policy
+                self._all_repos[i] = tuple(r)
+                break
+        self._update_kind_tab_counts()
+        self.apply_repo_filter(self.filter_edit.text())
+
     def on_rename_done(self, ok: bool, msg: str):
         self.set_busy(False)
         if ok:
@@ -7044,7 +7073,13 @@ class MainWindow(QMainWindow):
             self.browse_status.setStyleSheet("color:#1a7f37;")
             c = self.collect_identity_cfg()
             audit_log(c.get("user", ""), c.get("host", ""), "rename_repo", msg.replace("\n", " "))
-            self.on_refresh()
+            w = self.sender()
+            old = w.cfg.get("repo_name", "") if w else ""
+            new = w.cfg.get("new_name", "") if w else ""
+            if new and not new.endswith(".git"):
+                new += ".git"
+            if old and new:
+                self._patch_repo_row(old, new_name=new)
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
@@ -7131,10 +7166,12 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
             QMessageBox.information(self, "完成", msg)
-            if self.worker:
+            w = self.sender()
+            if w:
                 c = self.collect_identity_cfg()
-                detail = f"repo={self.worker.cfg.get('repo_name', '')} policy={self.worker.cfg.get('ci_policy', '')}"
+                detail = f"repo={w.cfg.get('repo_name', '')} policy={w.cfg.get('ci_policy', '')}"
                 audit_log(c.get("user", ""), c.get("host", ""), "set_ci", detail)
+                self._patch_repo_row(w.cfg.get("repo_name", ""), policy=w.cfg.get("ci_policy", "none"))
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
@@ -7338,12 +7375,15 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
-            self.on_refresh()  # 重整讓清單 CI 欄更新
-            if self.worker:
+            w = self.sender()
+            if w:
                 c = self.collect_identity_cfg()
-                names = ",".join(self.worker.cfg.get("repo_names", []))
-                detail = f"repos={names} policy={self.worker.cfg.get('ci_policy', '')}"
+                repo_names = w.cfg.get("repo_names", [])
+                pol = w.cfg.get("ci_policy", "none")
+                detail = f"repos={','.join(repo_names)} policy={pol}"
                 audit_log(c.get("user", ""), c.get("host", ""), "set_ci_batch", detail)
+                for rn in repo_names:  # 原地更新 CI 欄，不整包 re-list
+                    self._patch_repo_row(rn, policy=pol)
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
