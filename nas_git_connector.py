@@ -35,6 +35,7 @@ import string
 import json
 import urllib.request
 import urllib.error
+import traceback
 from datetime import datetime, timezone
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
@@ -94,14 +95,39 @@ def save_git_devs_credential(admin_user: str, host: str, new_username: str, pass
         pass
 
 
-def audit_log(user: str, host: str, action: str, detail: str):
+def audit_log(user: str, host: str, action: str, detail: str) -> bool:
+    """把一筆破壞性操作寫進本機稽核 log；寫入失敗回傳 False 並跳一次性警告。
+
+    這個檔案是刪 repo / 砍 tag 等動作唯一的本機紀錄，寫不進去不能靜默吞掉——
+    每個 session 至少要讓使用者知道一次稽核已中斷（之後同 session 不重複跳窗）。
+    """
+    global _AUDIT_LOG_WARNED
     try:
         os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"{ts}\t{user}@{host}\t{action}\t{detail}\n")
-    except OSError:
-        pass
+        return True
+    except OSError as e:
+        if not _AUDIT_LOG_WARNED:
+            _AUDIT_LOG_WARNED = True
+            try:
+                app = QApplication.instance()
+                # audit_log 也會從 Worker 執行緒被呼叫（如 _run_repo_gc），
+                # QMessageBox 只能在 UI 執行緒跳，其餘情況退回 stderr。
+                if app is not None and QThread.currentThread() is app.thread():
+                    QMessageBox.warning(
+                        None, "稽核紀錄寫入失敗",
+                        f"無法寫入本機稽核紀錄：\n{AUDIT_LOG_PATH}\n\n{e}\n\n"
+                        "破壞性操作將不會留下本機紀錄（本次啟動期間只提醒這一次）。")
+                else:
+                    print(f"[WARN] 稽核紀錄寫入失敗：{AUDIT_LOG_PATH}：{e}", file=sys.stderr)
+            except Exception:
+                pass
+        return False
+
+
+_AUDIT_LOG_WARNED = False
 
 # ============================================================
 # 預設身份(Profile)：第一次執行會自動建立。
@@ -640,6 +666,15 @@ class Worker(QThread):
         return None
 
     def run(self):
+        # 任何 _run_* 冒出的例外都必須轉成 done(False)：QThread 若無聲死掉，
+        # done 永遠不發射、set_busy(False) 永遠不執行，整個 UI 會鎖死到砍程式為止。
+        try:
+            self._dispatch()
+        except Exception as e:
+            self.log.emit("[錯誤] 內部例外：\n" + traceback.format_exc().strip())
+            self.done.emit(False, f"內部錯誤：{e}")
+
+    def _dispatch(self):
         if self.mode == "test":
             self._run_test()
         elif self.mode == "list":
@@ -6870,7 +6905,6 @@ class MainWindow(QMainWindow):
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
-            QMessageBox.warning(self, "讀取失敗", msg)
             QMessageBox.warning(self, "讀取失敗", msg)
 
     # ---------- 設定 CI（每 repo 獨立）----------
