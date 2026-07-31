@@ -903,6 +903,38 @@ class Worker(QThread):
         except ValueError:
             return out.strip()
 
+    @staticmethod
+    def _err_hint(err, rc):
+        """把一次失敗的 (stderr, rc) 擠成一句能直接放進使用者訊息的原因。"""
+        if rc == 124:
+            return "逾時無回應"
+        if rc == 125:
+            return "已被使用者中止"
+        tail = (err or "").strip().splitlines()
+        return tail[-1] if tail else f"連線或權限問題（rc={rc}）"
+
+    def _ssh_block(self, lines, timeout=SSH_DEFAULT_TIMEOUT):
+        """執行一段 ___BEGIN___/___END___ 包裝的遠端腳本，回 (ok, body, err_hint)。
+
+        集中三件每個站點都在手工重複的事：包裝標記、_between 濾 banner、
+        失敗時擠出一句可以直接附進使用者訊息的原因（stderr 末行／逾時／中止），
+        讓「連線或權限問題」這種猜謎式錯誤訊息有東西可以附。
+        新寫的 Worker mode 一律用這個，不要再手刻 echo ___BEGIN___。
+        """
+        cmd = "\n".join(["echo ___BEGIN___"] + list(lines) + ["echo ___END___", "true"])
+        rc, out, err = self._ssh(cmd, timeout=timeout)
+        body = self._between(out)
+        if rc == 0:
+            return True, body, ""
+        if rc == 124:
+            hint = f"逾時（超過 {timeout} 秒無回應）"
+        elif rc == 125:
+            hint = "已被使用者中止"
+        else:
+            tail = (err or "").strip().splitlines()
+            hint = tail[-1] if tail else f"rc={rc}"
+        return False, body, hint
+
     # --- 只測 NAS 連線 ---
     def _run_test(self):
         rc, out, _ = self._ssh("echo NAS_OK")
@@ -1129,9 +1161,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 CI 規則失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 CI 規則失敗：" + self._err_hint(err, rc))
             return
         lines = out.splitlines()
         try:
@@ -1177,9 +1209,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 CI 狀態總表失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 CI 狀態總表失敗：" + self._err_hint(err, rc))
             return
         lines = out.splitlines()
         try:
@@ -1352,9 +1384,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取明細失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取明細失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {name} 明細。")
@@ -1374,9 +1406,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取描述失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取描述失敗：" + self._err_hint(err, rc))
             return
         text = self._between(out)
         if text.startswith("Unnamed repository"):
@@ -1421,9 +1453,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取分支保護設定失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取分支保護設定失敗：" + self._err_hint(err, rc))
             return
         lines = self._between(out).splitlines()
         deny_del = lines[0].strip() if len(lines) > 0 else "false"
@@ -1483,9 +1515,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取檔案列表失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取檔案列表失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out)
         branch = ""
@@ -1522,9 +1554,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取檔案內容失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取檔案內容失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {path}。")
@@ -1547,19 +1579,21 @@ class Worker(QThread):
             "  name=$(basename \"$repo\")",
             "  case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac",
             "  before=$(du -sh \"$repo\" 2>/dev/null | cut -f1)",
-            "  if git --git-dir=\"$repo\" gc --quiet >/dev/null 2>&1; then",
+            "  if err=$(git --git-dir=\"$repo\" gc --quiet 2>&1 >/dev/null); then",
             "    after=$(du -sh \"$repo\" 2>/dev/null | cut -f1)",
             "    echo \"[OK]   $name  $before -> $after\"",
             "  else",
             "    echo \"[FAIL] $name\"",
+            "    echo \"$err\" | tail -n 3 | sed 's/^/       /'",
             "  fi",
             "done",
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd, timeout=3600)
+        rc, out, err = self._ssh(cmd, timeout=3600)
         if rc != 0:
-            self.done.emit(False, "GC 失敗（連線或權限問題）。")
+            tail = (err or "").strip().splitlines()
+            self.done.emit(False, "GC 失敗：" + (tail[-1] if tail else f"rc={rc}"))
             return
         body = self._between(out)
         self.hooks.emit(body)
@@ -1604,9 +1638,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd, timeout=3600)
+        rc, out, err = self._ssh(cmd, timeout=3600)
         if rc != 0:
-            self.done.emit(False, "完整性檢查失敗（連線或權限問題）。")
+            self.done.emit(False, "完整性檢查失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out)
         self.hooks.emit(body)
@@ -1637,9 +1671,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 log 失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 log 失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {name}（{branch}）最近 {count} 筆 commit。")
@@ -1697,9 +1731,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取已合併分支失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取已合併分支失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {name} 的已合併分支清單。")
@@ -1774,9 +1808,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "比較失敗（連線或權限問題）。")
+            self.done.emit(False, "比較失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out)
         self.hooks.emit(body or "（沒有差異）")
@@ -1892,9 +1926,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 blame 失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 blame 失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {path} 的 blame。")
@@ -2000,9 +2034,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "查詢失敗（連線或權限問題）。")
+            self.done.emit(False, "查詢失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out)
         exists = "EXISTS:YES" in body
@@ -2116,28 +2150,27 @@ class Worker(QThread):
             self.done.emit(False, "GitHub URL 格式不合規（僅允許 https:// / git@ / ssh:// / file:// 開頭的正常網址）。")
             return
         self.log.emit(f"--- 建立 GitHub 鏡像：{name} ← {url} ---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
+        ok, body, hint = self._ssh_block([
             f"BASE='{root}'; name='{name}'; url='{url}'",
             "repo=\"$BASE/$name\"",
             "if [ -e \"$repo\" ]; then echo EXISTS; echo ___END___; exit 0; fi",
-            "if git clone --mirror \"$url\" \"$repo\" >/dev/null 2>&1; then",
+            # 保留 clone 的 stderr：失敗時使用者才知道是 DNS、認證還是私有庫問題，不用猜。
+            "if err=$(git clone --mirror \"$url\" \"$repo\" 2>&1 >/dev/null); then",
             "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null",
             "  echo ___OK___",
             "else",
             "  rm -rf \"$repo\"; echo CLONE_FAIL",
+            "  echo \"$err\" | tail -n 5",
             "fi",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd, timeout=3600)
-        if "EXISTS" in out:
+        ], timeout=3600)
+        if "EXISTS" in body:
             self.done.emit(False, f"倉庫已存在，未建立：{name}")
-        elif rc == 0 and "___OK___" in out:
+        elif ok and "___OK___" in body:
             clone_url = f"{c['user']}@{c['host']}:{root}/{name}"
             self.done.emit(True, f"已建立鏡像：{name}\n上游：{url}\n本地 Clone URL：{clone_url}\n（日後用『同步鏡像』或排程更新）")
         else:
-            self.done.emit(False, "建立鏡像失敗（NAS 連不到 GitHub？私有庫需在 NAS 設金鑰/token？）。")
+            detail = "\n".join(body.splitlines()[1:]) if "CLONE_FAIL" in body else hint
+            self.done.emit(False, "建立鏡像失敗。" + (f"\n原因：\n{detail}" if detail else ""))
 
     # --- 同步鏡像（remote update --prune）；names 空則同步全部鏡像 ---
     def _run_sync_mirrors(self):
@@ -2145,8 +2178,7 @@ class Worker(QThread):
         names = [n for n in self.cfg.get("mirror_names", []) if is_safe_name(n)]
         flt = ("".join(" " + n + " " for n in names)) if names else ""
         self.log.emit(f"--- 同步鏡像（{'選取 ' + str(len(names)) + ' 個' if names else '全部'}）---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
+        ok, body, hint = self._ssh_block([
             f"BASE='{root}'; FILTER='{flt}'",
             "n=0",
             "for repo in \"$BASE\"/*.git; do",
@@ -2155,21 +2187,19 @@ class Worker(QThread):
             "  [ \"$(git --git-dir=\"$repo\" config --get remote.origin.mirror 2>/dev/null)\" = true ] || continue",
             "  if [ -n \"$FILTER\" ]; then case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac; fi",
             "  n=$((n+1))",
-            "  if git --git-dir=\"$repo\" remote update --prune >/dev/null 2>&1; then",
+            # 保留每庫的 stderr 末幾行：失敗清單才有可診斷的原因，不再只有 [FAIL] 三個字。
+            "  if err=$(git --git-dir=\"$repo\" remote update --prune 2>&1 >/dev/null); then",
             "    echo \"[OK]   $name\"",
             "  else",
             "    echo \"[FAIL] $name\"",
+            "    echo \"$err\" | tail -n 3 | sed 's/^/       /'",
             "  fi",
             "done",
             "[ \"$n\" = 0 ] && echo '（沒有符合的鏡像庫）'",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd, timeout=3600)
-        if rc != 0:
-            self.done.emit(False, "同步失敗（連線或權限問題）。")
+        ], timeout=3600)
+        if not ok:
+            self.done.emit(False, f"同步失敗：{hint}")
             return
-        body = self._between(out)
         self.hooks.emit(body)
         nfail = body.count("[FAIL]")
         nok = body.count("[OK]")
@@ -2190,9 +2220,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out).strip()
         self.hooks.emit(body)
@@ -2236,8 +2266,7 @@ class Worker(QThread):
         names = [n for n in self.cfg.get("backup_repo_names", []) if is_safe_name(n)]
         flt = ("".join(" " + n + " " for n in names)) if names else ""
         self.log.emit(f"--- 同步離站備份（{'選取 ' + str(len(names)) + ' 個' if names else '全部已設定'}）---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
+        script = [
             f"BASE='{root}'; FILTER='{flt}'",
             "n=0",
             "for repo in \"$BASE\"/*.git; do",
@@ -2247,21 +2276,21 @@ class Worker(QThread):
             "  [ -n \"$url\" ] || continue",
             "  if [ -n \"$FILTER\" ]; then case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac; fi",
             "  n=$((n+1))",
-            "  if git --git-dir=\"$repo\" push --mirror offsite-backup >/dev/null 2>&1; then",
+            "  if err=$(git --git-dir=\"$repo\" push --mirror offsite-backup 2>&1 >/dev/null); then",
             "    echo \"[OK]   $name\"",
+            # 成功才蓋時戳：健檢用它找「設了備份卻從沒推成功過」的倉庫。
+            "    git --git-dir=\"$repo\" config nasgit.lastbackup \"$(date +%s)\" 2>/dev/null",
             "  else",
             "    echo \"[FAIL] $name\"",
+            "    echo \"$err\" | tail -n 3 | sed 's/^/       /'",
             "  fi",
             "done",
             "[ \"$n\" = 0 ] && echo '（沒有設定離站備份的倉庫）'",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd, timeout=3600)
-        if rc != 0:
-            self.done.emit(False, "同步失敗（連線或權限問題）。")
+        ]
+        ok, body, hint = self._ssh_block(script, timeout=3600)
+        if not ok:
+            self.done.emit(False, f"同步失敗：{hint}")
             return
-        body = self._between(out)
         self.hooks.emit(body)
         nfail = body.count("[FAIL]")
         nok = body.count("[OK]")
@@ -2560,9 +2589,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd, timeout=3600)
+        rc, out, err = self._ssh(cmd, timeout=3600)
         if rc != 0:
-            self.done.emit(False, "健康檢查失敗（連線或權限問題）。")
+            self.done.emit(False, "健康檢查失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, "健康檢查完成。")
@@ -2585,9 +2614,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取伺服器空間資訊失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取伺服器空間資訊失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, "已讀取伺服器空間總覽。")
@@ -2609,9 +2638,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 Telegram 通知設定失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 Telegram 通知設定失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, "已讀取 Telegram 通知設定。")
@@ -2648,9 +2677,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取跨機器身份設定失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取跨機器身份設定失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out).strip() or "{}")
         self.done.emit(True, "已讀取跨機器身份設定。")
@@ -2724,9 +2753,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取日誌失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取日誌失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {logfile}。")
@@ -2840,9 +2869,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "自我測試失敗（連線或權限問題）。")
+            self.done.emit(False, "自我測試失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已對 {name} 完成 CI 自我測試。")
@@ -2864,9 +2893,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取封存區失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取封存區失敗：" + self._err_hint(err, rc))
             return
         entries = []
         for ln in self._between(out).splitlines():
