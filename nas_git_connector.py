@@ -2824,10 +2824,15 @@ class Worker(QThread):
 
     # --- 一鍵修復（套用 template hook + 修群組權限）---
     def _run_repair(self):
+        """一鍵修復；cfg["dry_run"] 為真時只檢查回報 [WOULD-FIX]/[OK]，不改動任何東西。
+
+        全量覆蓋版的舊回報每個 repo 都印 [FIX]，分不出「本來就好」跟「真的修了什麼」；
+        試跑模式讓人敢常態跑，確認有東西要修再按真的執行。
+        """
         root = self.cfg["remote_root"]
-        self.log.emit("--- 一鍵修復：套用 template hook + 修群組 ---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
+        dry = bool(self.cfg.get("dry_run"))
+        self.log.emit("--- 一鍵修復" + ("（試跑，不改動）" if dry else "：套用 template hook + 修群組 ---"))
+        common_head = [
             f"BASE='{root}'",
             "PRE=\"$BASE/hooks_template/pre-receive.stub\"",
             "POST=\"$BASE/hooks_template/post-receive\"",
@@ -2835,25 +2840,44 @@ class Worker(QThread):
             "for repo in \"$BASE\"/*.git; do",
             "  [ -d \"$repo\" ] || continue",
             "  n=$(basename \"$repo\")",
-            "  mkdir -p \"$repo/hooks\"",
-            "  [ -f \"$PRE\" ] && { cp \"$PRE\" \"$repo/hooks/pre-receive\"; chmod 750 \"$repo/hooks/pre-receive\"; }",
-            "  [ -f \"$POST\" ] && { cp \"$POST\" \"$repo/hooks/post-receive\"; chmod 750 \"$repo/hooks/post-receive\"; }",
-            "  git --git-dir=\"$repo\" config core.sharedRepository group 2>/dev/null",
-            "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
-            "  echo \"[FIX] $n\"",
-            "  fixed=$((fixed+1))",
-            "done",
-            "echo \"共處理 $fixed 個 repo\"",
-            "echo ___OK___",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd, timeout=3600)
-        if rc != 0 or "___OK___" not in out:
-            self.done.emit(False, "修復失敗（權限問題？需以 git_devs 帳號執行）。")
+        ]
+        if dry:
+            body_lines = common_head + [
+                "  why=''",
+                "  [ -f \"$PRE\" ] && ! cmp -s \"$PRE\" \"$repo/hooks/pre-receive\" 2>/dev/null && why=\"$why pre-receive不同步\"",
+                "  [ -f \"$POST\" ] && ! cmp -s \"$POST\" \"$repo/hooks/post-receive\" 2>/dev/null && why=\"$why post-receive不同步\"",
+                "  [ \"$(git --git-dir=\"$repo\" config --get core.sharedRepository 2>/dev/null)\" = group ] || why=\"$why 缺sharedRepository=group\"",
+                "  ng=$(find \"$repo\" -not -group git_devs 2>/dev/null | head -1)",
+                "  [ -n \"$ng\" ] && why=\"$why 有非git_devs群組的檔案\"",
+                "  if [ -n \"$why\" ]; then",
+                "    echo \"[WOULD-FIX] $n：$why\"",
+                "    fixed=$((fixed+1))",
+                "  else",
+                "    echo \"[OK] $n\"",
+                "  fi",
+                "done",
+                "echo \"共 $fixed 個 repo 需要修復（試跑，未改動任何東西）\"",
+                "echo ___OK___",
+            ]
+        else:
+            body_lines = common_head + [
+                "  mkdir -p \"$repo/hooks\"",
+                "  [ -f \"$PRE\" ] && { cp \"$PRE\" \"$repo/hooks/pre-receive\"; chmod 750 \"$repo/hooks/pre-receive\"; }",
+                "  [ -f \"$POST\" ] && { cp \"$POST\" \"$repo/hooks/post-receive\"; chmod 750 \"$repo/hooks/post-receive\"; }",
+                "  git --git-dir=\"$repo\" config core.sharedRepository group 2>/dev/null",
+                "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
+                "  echo \"[FIX] $n\"",
+                "  fixed=$((fixed+1))",
+                "done",
+                "echo \"共處理 $fixed 個 repo\"",
+                "echo ___OK___",
+            ]
+        ok, body, hint = self._ssh_block(body_lines, timeout=3600)
+        if not ok or "___OK___" not in body:
+            self.done.emit(False, f"修復{'試跑' if dry else ''}失敗：{hint or '權限問題？需以 git_devs 帳號執行'}")
             return
-        self.hooks.emit(self._between(out))
-        self.done.emit(True, "一鍵修復完成。")
+        self.hooks.emit(body.replace("___OK___", "").strip())
+        self.done.emit(True, "試跑完成（未改動任何東西）。" if dry else "一鍵修復完成。")
 
     # --- 部署排程腳本到 NAS $BASE/tools/（同 upgrade_engine 的 base64 傳輸＋備份換檔慣例）---
     def _run_deploy_tools(self):
@@ -7421,16 +7445,24 @@ class MainWindow(QMainWindow):
         self._start_maint("healthcheck", "健康檢查")
 
     def on_repair(self):
-        r = QMessageBox.question(
-            self, "一鍵修復",
+        box = QMessageBox(self)
+        box.setWindowTitle("一鍵修復")
+        box.setText(
             "將對所有 repo：\n"
             "・以 hooks_template 的 pre-receive.stub / post-receive 覆蓋各 repo 的 hook\n"
             "・chmod 750 hook、chgrp -R git_devs、chmod -R g+rwX\n\n"
-            "這會統一全庫 hook 與權限。確定執行嗎？",
-        )
-        if r != QMessageBox.StandardButton.Yes:
-            return
-        self._start_maint("repair", "一鍵修復")
+            "「試跑」只檢查並列出哪些 repo 需要修（不改動任何東西），\n"
+            "「直接執行」才會真的覆蓋 hook 與權限。")
+        dry_btn = box.addButton("試跑（只檢查）", QMessageBox.ButtonRole.ActionRole)
+        run_btn = box.addButton("直接執行", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(dry_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is dry_btn:
+            self._start_maint("repair", "一鍵修復（試跑）", extra={"dry_run": True})
+        elif clicked is run_btn:
+            self._start_maint("repair", "一鍵修復")
 
     def on_disk_usage(self):
         self._start_maint("disk_usage", "伺服器空間總覽")
