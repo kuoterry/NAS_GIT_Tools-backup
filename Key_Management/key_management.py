@@ -796,6 +796,49 @@ def merge_registries(local: dict, remote: dict, hostname: str):
     return merged
 
 
+def keep_worker_alive(owner):
+    """換手前把還在跑的舊 Worker 收進 owner._retired_workers，等它 finished 再釋放。
+
+    在 done handler 裡直接 self.worker = Worker(...) 會丟掉「可能還沒完全收尾」的
+    QThread 的最後一個引用 → 'QThread: Destroyed while thread is still running'
+    整個程式中止，且時機相依、極難重現。每次重派 self.worker 前先呼叫這個。"""
+    old = getattr(owner, "worker", None)
+    if old is None or not old.isRunning():
+        return
+    pool = getattr(owner, "_retired_workers", None)
+    if pool is None:
+        pool = owner._retired_workers = []
+    pool.append(old)
+    old.finished.connect(lambda o=old, p=pool: p.remove(o) if o in p else None)
+
+
+def confirm_close_ok(widget) -> bool:
+    """回傳是否允許關閉：沒有跑中的 Worker → True；有 → 問過使用者，同意才等收尾。"""
+    workers = [getattr(widget, "worker", None)] + list(getattr(widget, "_retired_workers", []))
+    running = [w for w in workers if w is not None and w.isRunning()]
+    if not running:
+        return True
+    r = QMessageBox.question(
+        widget, "操作進行中",
+        "還有背景操作在執行中，現在關閉可能讓動作做到一半（且不會留稽核紀錄）。\n確定要離開嗎？",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No)
+    if r != QMessageBox.StandardButton.Yes:
+        return False
+    for w in running:
+        w.wait(8000)
+    return True
+
+
+def confirm_close_with_worker(widget, event) -> None:
+    """closeEvent 共用邏輯（QMainWindow 用）：還有 Worker 在跑就先確認，同意才關。
+    QDialog 請改覆寫 done()（accept()/Esc 不會經過 closeEvent）。"""
+    if confirm_close_ok(widget):
+        event.accept()
+    else:
+        event.ignore()
+
+
 # ============================================================
 # 背景工作執行緒：所有檔案系統/subprocess 動作都走這裡，避免卡住 UI
 # ============================================================
@@ -1210,6 +1253,12 @@ class ArchiveManageDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
+    def done(self, result):
+        # accept()/reject()/Esc/關閉鈕全都經過 done()；closeEvent 只涵蓋視窗 X
+        if not confirm_close_ok(self):
+            return
+        super().done(result)
+
     def _busy(self, b):
         for x in (self.refresh_b, self.restore_b, self.purge_b):
             x.setEnabled(not b)
@@ -1217,6 +1266,7 @@ class ArchiveManageDialog(QDialog):
     def refresh(self):
         self.list.clear()
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("list_archive")
         self.worker.result.connect(self.on_entries)
         self.worker.done.connect(self.on_done)
@@ -1248,6 +1298,7 @@ class ArchiveManageDialog(QDialog):
         if not d:
             return
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("restore_archive", {"name": name, "target_dir": d})
         self.worker.done.connect(self._on_action_done)
         self.worker.start()
@@ -1261,6 +1312,7 @@ class ArchiveManageDialog(QDialog):
         if r != QMessageBox.StandardButton.Yes:
             return
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("purge_archive", {"name": name})
         self.worker.done.connect(self._on_action_done)
         self.worker.start()
@@ -1323,6 +1375,12 @@ class KnownHostsDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
+    def done(self, result):
+        # accept()/reject()/Esc/關閉鈕全都經過 done()；closeEvent 只涵蓋視窗 X
+        if not confirm_close_ok(self):
+            return
+        super().done(result)
+
     def _busy(self, b):
         for x in (self.refresh_b, self.delete_b):
             x.setEnabled(not b)
@@ -1330,6 +1388,7 @@ class KnownHostsDialog(QDialog):
     def refresh(self):
         self.list.clear()
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("list_known_hosts")
         self.worker.result.connect(self.on_entries)
         self.worker.done.connect(self.on_done)
@@ -1359,6 +1418,7 @@ class KnownHostsDialog(QDialog):
         if r != QMessageBox.StandardButton.Yes:
             return
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("delete_known_hosts_entry", {"line_no": line_no})
         self.worker.done.connect(self._on_delete_done)
         self.worker.start()
@@ -1499,6 +1559,12 @@ class SyncOverviewDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh_from_local()
 
+    def done(self, result):
+        # accept()/reject()/Esc/關閉鈕全都經過 done()；closeEvent 只涵蓋視窗 X
+        if not confirm_close_ok(self):
+            return
+        super().done(result)
+
     def refresh_from_local(self):
         self._populate(load_registry())
 
@@ -1531,6 +1597,7 @@ class SyncOverviewDialog(QDialog):
         self.sync_b.setEnabled(False)
         self.status.setText("同步中…")
         self.status.setStyleSheet("")
+        keep_worker_alive(self)
         self.worker = Worker("sync_registry", {"sync_cfg": sync_cfg})
         self.worker.result.connect(self._populate)
         self.worker.done.connect(self.on_sync_done)
@@ -1648,9 +1715,13 @@ class MainWindow(QMainWindow):
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
+    def closeEvent(self, event):
+        confirm_close_with_worker(self, event)
+
     def _busy(self, b):
         for x in (self.scan_b, self.gen_b, self.archive_mgmt_b, self.audit_b, self.export_b,
-                  self.archive_del_b, self.hard_del_b, self.backup_b, self.view_raw_b):
+                  self.archive_del_b, self.hard_del_b, self.backup_b, self.view_raw_b,
+                  self.known_hosts_b, self.sync_config_b, self.sync_overview_b):
             x.setEnabled(not b)
         if not b:
             self.on_selection_changed()
@@ -1674,6 +1745,7 @@ class MainWindow(QMainWindow):
         self._busy(True)
         self.status.setText("掃描中…")
         self.status.setStyleSheet("")
+        keep_worker_alive(self)
         self.worker = Worker("scan", {"folders": folders})
         self.worker.result.connect(self.on_scan_result)
         self.worker.done.connect(self.on_scan_done)
@@ -1752,6 +1824,7 @@ class MainWindow(QMainWindow):
         self._busy(True)
         self.status.setText("產生金鑰中…")
         self.status.setStyleSheet("")
+        keep_worker_alive(self)
         self.worker = Worker("generate", vals)
         self.worker.done.connect(self._on_generate_done)
         self.worker.start()
@@ -1777,6 +1850,7 @@ class MainWindow(QMainWindow):
             return
         self._busy(True)
         self.status.setText("封存中…")
+        keep_worker_alive(self)
         self.worker = Worker("delete", {
             "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "hard": False})
         self.worker.done.connect(self._on_delete_done)
@@ -1794,6 +1868,7 @@ class MainWindow(QMainWindow):
             return
         self._busy(True)
         self.status.setText("永久刪除中…")
+        keep_worker_alive(self)
         self.worker = Worker("delete", {
             "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "hard": True})
         self.worker.done.connect(self._on_delete_done)
@@ -1816,6 +1891,7 @@ class MainWindow(QMainWindow):
             return
         self._busy(True)
         self.status.setText("備份中…")
+        keep_worker_alive(self)
         self.worker = Worker("backup", {
             "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "dest_dir": d})
         self.worker.done.connect(self._on_backup_done)
@@ -1838,6 +1914,7 @@ class MainWindow(QMainWindow):
         if r != QMessageBox.StandardButton.Yes:
             return
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("read_private_raw", {"path": rec["priv_path"]})
         self.worker.result.connect(self._show_raw)
         self.worker.done.connect(self._on_view_raw_done)
