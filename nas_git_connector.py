@@ -2367,11 +2367,18 @@ class Worker(QThread):
         page = 1
         try:
             while True:
-                batch = _get(f"https://api.github.com/users/{login}/repos?per_page=100&page={page}&type=owner")
-                if not batch:
-                    break
+                if token:
+                    # 有 token 走 /user/repos 才看得到私有庫（/users/<login>/repos 只回公開庫）；
+                    # 回傳是 token 本人的倉庫，再用 owner.login 過濾成輸入的帳號。
+                    raw = _get(f"https://api.github.com/user/repos?per_page=100&page={page}&affiliation=owner")
+                    batch = [r for r in (raw or [])
+                             if (r.get("owner") or {}).get("login", "").lower() == login.lower()]
+                else:
+                    raw = _get(f"https://api.github.com/users/{login}/repos?per_page=100&page={page}&type=owner")
+                    batch = raw or []
                 repos.extend(batch)
-                if len(batch) < 100:
+                # 分頁判斷要看 API 原始回傳筆數，不能看過濾後的（過濾可能把整頁濾光）
+                if not raw or len(raw) < 100:
                     break
                 page += 1
         except urllib.error.HTTPError as e:
@@ -5688,7 +5695,7 @@ class RepoKindScanDialog(QDialog):
         self.token_edit = QLineEdit(self.settings.value("github_token", "", type=str))
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         g.addWidget(self.token_edit, 1, 1)
-        self.remember_check = QCheckBox("記住帳號/token（存在本機設定）")
+        self.remember_check = QCheckBox("記住帳號/token（明碼存於本機登錄檔，token 可讀你所有私有庫，請自行評估）")
         self.remember_check.setChecked(bool(self.settings.value("github_login", "", type=str)))
         g.addWidget(self.remember_check, 2, 1)
         g.addWidget(QLabel("本機掃描資料夾（分號分隔）："), 3, 0)
@@ -5743,17 +5750,27 @@ class RepoKindScanDialog(QDialog):
             self.settings.remove("github_token")
 
         self.scan_btn.setEnabled(False)
-        self.status.setText("掃描 GitHub 中…")
+        self.status.setText("掃描 GitHub 與本機資料夾中…（兩者並行）")
         self.status.setStyleSheet("")
         match_names = [r[0][:-4] if r[0].endswith(".git") else r[0] for r in self.all_repos]
         cfg = dict(self.cfg)
         cfg["github_login"] = login
         cfg["github_token"] = self.token_edit.text().strip()
         cfg["match_names"] = match_names
+        # GitHub API 掃描與本機磁碟掃描互不相依，並行跑省掉一半等待
+        self._scan_pending = 2
+        self._scan_errors = []
         self.gh_worker = Worker(cfg, mode="github_scan")
         self.gh_worker.hooks.connect(self._on_gh_result)
         self.gh_worker.done.connect(self._on_gh_done)
+        roots = [p.strip() for p in self.roots_edit.text().split(";") if p.strip()]
+        cfg2 = dict(self.cfg)
+        cfg2["scan_roots"] = roots
+        self.local_worker = Worker(cfg2, mode="local_scan")
+        self.local_worker.hooks.connect(self._on_local_result)
+        self.local_worker.done.connect(self._on_local_done)
         self.gh_worker.start()
+        self.local_worker.start()
 
     def _on_gh_result(self, text):
         try:
@@ -5763,18 +5780,8 @@ class RepoKindScanDialog(QDialog):
 
     def _on_gh_done(self, ok, msg):
         if not ok:
-            self.scan_btn.setEnabled(True)
-            self.status.setText("❌ " + msg)
-            self.status.setStyleSheet("color:#b00020;")
-            return
-        self.status.setText("掃描本機資料夾中…")
-        roots = [p.strip() for p in self.roots_edit.text().split(";") if p.strip()]
-        cfg = dict(self.cfg)
-        cfg["scan_roots"] = roots
-        self.local_worker = Worker(cfg, mode="local_scan")
-        self.local_worker.hooks.connect(self._on_local_result)
-        self.local_worker.done.connect(self._on_local_done)
-        self.local_worker.start()
+            self._scan_errors.append("GitHub：" + msg)
+        self._scan_finish_one()
 
     def _on_local_result(self, text):
         try:
@@ -5783,13 +5790,22 @@ class RepoKindScanDialog(QDialog):
             self.local_result = {}
 
     def _on_local_done(self, ok, msg):
-        self.scan_btn.setEnabled(True)
         if not ok:
-            self.status.setText("❌ " + msg)
-            self.status.setStyleSheet("color:#b00020;")
+            self._scan_errors.append("本機：" + msg)
+        self._scan_finish_one()
+
+    def _scan_finish_one(self):
+        self._scan_pending -= 1
+        if self._scan_pending > 0:
             return
-        self.status.setText("比對完成，逐列確認後按「套用勾選」寫回。")
-        self.status.setStyleSheet("color:#1a7f37;")
+        self.scan_btn.setEnabled(True)
+        if self._scan_errors:
+            # 一邊失敗另一邊的證據還是有用，照樣列表，但把失敗原因標出來
+            self.status.setText("⚠ 部分掃描失敗（僅以成功那邊的證據建議）：" + "；".join(self._scan_errors))
+            self.status.setStyleSheet("color:#b06000;")
+        else:
+            self.status.setText("比對完成，逐列確認後按「套用勾選」寫回。")
+            self.status.setStyleSheet("color:#1a7f37;")
         self._build_table()
 
     def _build_table(self):
