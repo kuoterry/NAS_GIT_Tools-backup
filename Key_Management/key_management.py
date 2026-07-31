@@ -164,8 +164,12 @@ def parse_pubkey_file(path: str):
     stripped = content.strip()
     if stripped.startswith("---- BEGIN SSH2 PUBLIC KEY"):
         return parse_rfc4716_pubkey(content)
-    first_line = content.splitlines()[0] if content.splitlines() else ""
-    return parse_pubkey_line(first_line)
+    # 跳過開頭空行/註解行，不能只看第一行——編輯器多存一個換行就整個檔案默默解析失敗
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return parse_pubkey_line(line)
+    return None
 
 
 def ssh_fingerprint(blob: bytes) -> str:
@@ -1002,22 +1006,40 @@ class Worker(QThread):
         if not targets:
             self.done.emit(False, "找不到要處理的檔案。")
             return
+        # 部分失敗（第一個刪掉、第二個炸掉）也要有稽核紀錄——逐檔記結果，
+        # 不能等全部成功才記一筆（那正好在最需要紀錄的時候什麼都沒留）。
         if hard:
+            done_list, fail_list = [], []
             for p in targets:
-                os.remove(p)
-            audit_log("delete_hard", "; ".join(targets))
-            self.done.emit(True, "已永久刪除：\n" + "\n".join(targets))
+                try:
+                    os.remove(p)
+                    done_list.append(p)
+                except OSError as e:
+                    fail_list.append(f"{p}（{e}）")
+            aud_ok = audit_log("delete_hard", "; ".join(done_list) or "(none)")
+            if fail_list:
+                self.done.emit(False, "部分刪除失敗：\n已刪：" + ("\n".join(done_list) or "無") +
+                               "\n失敗：" + "\n".join(fail_list) + audit_failed_note(aud_ok))
+            else:
+                self.done.emit(True, "已永久刪除：\n" + "\n".join(done_list) + audit_failed_note(aud_ok))
         else:
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             dest_dir = os.path.join(ARCHIVE_DIR, ts)
             os.makedirs(dest_dir, exist_ok=True)
-            moved = []
+            moved, fail_list = [], []
             for p in targets:
                 dest = os.path.join(dest_dir, os.path.basename(p))
-                shutil.move(p, dest)
-                moved.append(dest)
-            audit_log("archive", f"{'; '.join(targets)} -> {dest_dir}")
-            self.done.emit(True, f"已封存到：\n{dest_dir}")
+                try:
+                    shutil.move(p, dest)
+                    moved.append(dest)
+                except OSError as e:
+                    fail_list.append(f"{p}（{e}）")
+            aud_ok = audit_log("archive", f"{'; '.join(moved) or '(none)'} -> {dest_dir}")
+            if fail_list:
+                self.done.emit(False, "部分封存失敗：\n已搬：" + ("\n".join(moved) or "無") +
+                               "\n失敗：" + "\n".join(fail_list) + audit_failed_note(aud_ok))
+            else:
+                self.done.emit(True, f"已封存到：\n{dest_dir}" + audit_failed_note(aud_ok))
 
     def _run_backup(self):
         pub_path = self.params.get("pub_path")
@@ -1026,17 +1048,27 @@ class Worker(QThread):
         if not dest_dir:
             self.done.emit(False, "缺少備份目標資料夾。")
             return
-        copied = []
+        copied, skipped = [], []
         for p in (pub_path, priv_path):
             if p and os.path.exists(p):
                 dest = os.path.join(dest_dir, os.path.basename(p))
+                # 不覆蓋既有備份：兩個資料夾各有一把 id_rsa 備到同個目的地，
+                # 後備的默默蓋掉先備的正是備份最不該做的事。
+                if os.path.exists(dest):
+                    skipped.append(dest)
+                    continue
                 shutil.copy2(p, dest)
                 copied.append(dest)
-        if not copied:
+        if not copied and not skipped:
             self.done.emit(False, "找不到要備份的檔案。")
             return
-        audit_log("backup", "; ".join(copied))
-        self.done.emit(True, "已備份：\n" + "\n".join(copied))
+        aud_ok = audit_log("backup", "; ".join(copied) or "(all skipped)")
+        msg = ""
+        if copied:
+            msg += "已備份：\n" + "\n".join(copied)
+        if skipped:
+            msg += ("\n" if msg else "") + "⚠ 目的地已有同名檔案、未覆蓋：\n" + "\n".join(skipped)
+        self.done.emit(not skipped, msg + audit_failed_note(aud_ok))
 
     def _run_list_archive(self):
         items = []
@@ -1056,15 +1088,18 @@ class Worker(QThread):
         if not name or not os.path.isdir(src_dir):
             self.done.emit(False, "找不到這筆封存紀錄。")
             return
+        # 先驗證「全部」目的地都沒有同名檔案再動手——邊搬邊檢查會在第二個檔
+        # 撞名時留下搬到一半的封存目錄，還回報「未還原」誤導使用者。
+        names = os.listdir(src_dir)
+        conflicts = [os.path.join(target_dir, fn) for fn in names
+                     if os.path.exists(os.path.join(target_dir, fn))]
+        if conflicts:
+            self.done.emit(False, "目標已存在同名檔案，整筆未還原：\n" + "\n".join(conflicts))
+            return
         restored = []
-        for fn in os.listdir(src_dir):
-            src = os.path.join(src_dir, fn)
-            dest = os.path.join(target_dir, fn)
-            if os.path.exists(dest):
-                self.done.emit(False, f"目標已存在同名檔案，未還原：{dest}")
-                return
-            shutil.move(src, dest)
-            restored.append(dest)
+        for fn in names:
+            shutil.move(os.path.join(src_dir, fn), os.path.join(target_dir, fn))
+            restored.append(os.path.join(target_dir, fn))
         try:
             os.rmdir(src_dir)
         except OSError:
@@ -1949,6 +1984,17 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "備份到哪個資料夾")
         if not d:
             return
+        # 備份是唯一會把私鑰檔複製到任意使用者選定資料夾（可能是雲端同步資料夾）
+        # 的路徑——CSV 匯出含私鑰前會問，這裡比照，含私鑰就先確認一次。
+        if rec.get("priv_path"):
+            r = QMessageBox.question(
+                self, "備份包含私鑰",
+                f"備份會把「私鑰檔」複製到：\n{d}\n\n"
+                "若該資料夾會同步到雲端（OneDrive/Dropbox 等），私鑰等同外流。\n確定要備份？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
         self._busy(True)
         self.status.setText("備份中…")
         keep_worker_alive(self)
@@ -2008,14 +2054,27 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText(content)
             self.status.setText("已複製公鑰內容到剪貼簿。")
             self.status.setStyleSheet("color:#1a7f37;")
+        else:
+            self.status.setText("❌ 讀不到公鑰內容（檔案不存在或無法讀取），未複製。")
+            self.status.setStyleSheet("color:#b00020;")
 
     def on_open_folder(self):
         rec = self._selected_record()
         if not rec:
             return
         path = rec.get("priv_path") or rec.get("pub_path")
-        if path and os.path.exists(path):
-            subprocess.run(["explorer", "/select,", os.path.normpath(path)])
+        if not (path and os.path.exists(path)):
+            return
+        if os.name != "nt":
+            self.status.setText("開啟資料夾功能目前只支援 Windows。")
+            return
+        try:
+            # Qt slot 內未攔截的例外會讓 PyQt6 直接中止程式，這裡不能裸呼叫
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)],
+                             creationflags=_NO_WINDOW)
+        except OSError as e:
+            self.status.setText(f"❌ 開啟檔案總管失敗：{e}")
+            self.status.setStyleSheet("color:#b00020;")
 
     # ---------- 封存區 / 稽核紀錄 ----------
     def on_archive_mgmt(self):
