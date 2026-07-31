@@ -48,7 +48,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
