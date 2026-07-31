@@ -48,7 +48,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -164,8 +164,12 @@ def parse_pubkey_file(path: str):
     stripped = content.strip()
     if stripped.startswith("---- BEGIN SSH2 PUBLIC KEY"):
         return parse_rfc4716_pubkey(content)
-    first_line = content.splitlines()[0] if content.splitlines() else ""
-    return parse_pubkey_line(first_line)
+    # 跳過開頭空行/註解行，不能只看第一行——編輯器多存一個換行就整個檔案默默解析失敗
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return parse_pubkey_line(line)
+    return None
 
 
 def ssh_fingerprint(blob: bytes) -> str:
@@ -262,15 +266,20 @@ def parse_ppk_pubkey(path: str):
     key_type = None
     comment = ""
     pub_b64_lines = []
-    for i, ln in enumerate(lines):
-        if ln.startswith("PuTTY-User-Key-File-"):
-            key_type = ln.split(":", 1)[1].strip()
-        elif ln.startswith("Comment:"):
-            comment = ln.split(":", 1)[1].strip()
-        elif ln.startswith("Public-Lines:"):
-            count = int(ln.split(":", 1)[1].strip())
-            pub_b64_lines = lines[i + 1:i + 1 + count]
-            break
+    try:
+        # 整段解析都在 try 裡：一個被截斷/手改壞的 .ppk 只該讓「這個檔」解析失敗，
+        # 不能讓 int()/IndexError 炸穿 build_records 導致整次掃描零筆結果。
+        for i, ln in enumerate(lines):
+            if ln.startswith("PuTTY-User-Key-File-"):
+                key_type = ln.split(":", 1)[1].strip()
+            elif ln.startswith("Comment:"):
+                comment = ln.split(":", 1)[1].strip()
+            elif ln.startswith("Public-Lines:"):
+                count = int(ln.split(":", 1)[1].strip())
+                pub_b64_lines = lines[i + 1:i + 1 + count]
+                break
+    except (ValueError, IndexError):
+        return None
     if not key_type or not pub_b64_lines:
         return None
     try:
@@ -281,7 +290,12 @@ def parse_ppk_pubkey(path: str):
 
 
 def derive_pubkey_via_sshkeygen(path: str):
-    """只對「已確認未加密」的私鑰呼叫，純本機執行，不會把檔案內容傳到任何地方。"""
+    """只對「已確認未加密」的私鑰呼叫，純本機執行，不會把檔案內容傳到任何地方。
+
+    回傳 (公鑰行或 None, 失敗原因字串)——「沒裝 ssh-keygen」「逾時」「金鑰壞了」是
+    三種不同的問題，全部折成同一句「無法自動推導」會讓使用者無從下手。"""
+    if not shutil.which("ssh-keygen"):
+        return None, "找不到 ssh-keygen（未安裝 OpenSSH 用戶端）"
     try:
         cp = subprocess.run(
             ["ssh-keygen", "-y", "-f", path],
@@ -289,16 +303,33 @@ def derive_pubkey_via_sshkeygen(path: str):
             creationflags=_NO_WINDOW,
         )
         if cp.returncode == 0 and cp.stdout.strip():
-            return cp.stdout.strip()
-    except Exception:
-        pass
-    return None
+            return cp.stdout.strip(), ""
+        return None, (cp.stderr or "").strip().splitlines()[-1] if (cp.stderr or "").strip() else f"rc={cp.returncode}"
+    except subprocess.TimeoutExpired:
+        return None, "ssh-keygen 逾時（可能在等 passphrase？）"
+    except OSError as e:
+        return None, str(e)
 
 
-def scan_folder(folder: str):
-    """遞迴掃描資料夾，依副檔名/內容判斷分成公鑰／私鑰／ppk 三類路徑清單。"""
+# 掃描時直接跳過的大型雜訊目錄（加大資料夾如 Documents 時不用每檔讀 16KB）
+SKIP_DIRNAMES = {".git", "node_modules", "__pycache__", ".venv", "venv", "$RECYCLE.BIN"}
+
+
+def scan_folder(folder: str, errors: list = None):
+    """遞迴掃描資料夾，依副檔名/內容判斷分成公鑰／私鑰／ppk 三類。
+
+    回傳 (pub_files, priv_files, ppk_files, priv_info)：priv_info 是
+    {path: classify_private_key_file() 結果}，讓 build_records 不用對同一個
+    私鑰檔再讀第二次。讀不進去的子目錄記到 errors（不再無聲跳過）。"""
     pub_files, priv_files, ppk_files = [], [], []
-    for root, _dirs, files in os.walk(folder):
+    priv_info = {}
+
+    def _on_walk_error(err):
+        if errors is not None:
+            errors.append(f"{getattr(err, 'filename', '?')}：{getattr(err, 'strerror', err)}")
+
+    for root, dirs, files in os.walk(folder, onerror=_on_walk_error):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRNAMES]
         for name in files:
             if name in SKIP_FILENAMES:
                 continue
@@ -308,9 +339,11 @@ def scan_folder(folder: str):
             elif name.endswith(".ppk"):
                 ppk_files.append(path)
             else:
-                if classify_private_key_file(path):
+                info = classify_private_key_file(path)
+                if info:
                     priv_files.append(path)
-    return pub_files, priv_files, ppk_files
+                    priv_info[path] = info
+    return pub_files, priv_files, ppk_files, priv_info
 
 
 def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict = None, this_host: str = "") -> str:
@@ -333,7 +366,8 @@ def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict 
         if rec.get("priv_encrypted"):
             notes.append("ℹ 私鑰已加密且找不到公鑰，需密碼才能取得指紋")
         else:
-            notes.append("⚠ 找不到公鑰且無法自動推導")
+            reason = rec.get("derive_error", "")
+            notes.append("⚠ 找不到公鑰且無法自動推導" + (f"（{reason}）" if reason else ""))
     if rec.get("derived"):
         notes.append("✔ 已自動從私鑰推導出公鑰")
     mtime = rec.get("mtime")
@@ -502,16 +536,35 @@ def delete_known_hosts_entry(line_no: int, path: str = KNOWN_HOSTS_PATH):
     return True, f"已刪除第 {line_no + 1} 行（原檔已備份到 {backup_path}）"
 
 
-def build_records(folders):
-    """掃描所有資料夾，配對公私鑰、補齊指紋/強度/時間/建議，回傳紀錄清單。"""
-    all_pub, all_priv, all_ppk = [], [], []
+def build_records(folders, errors: list = None):
+    """掃描所有資料夾，配對公私鑰、補齊指紋/強度/時間/建議，回傳紀錄清單。
+
+    folders 先正規化去重、並丟掉已被其他選取資料夾涵蓋的巢狀資料夾——同一資料夾
+    加兩次（或同時加 ~ 和 ~/.ssh）會讓 .ppk 出現幽靈重複紀錄，還觸發假的
+    「指紋相同」警告。errors 收 os.walk 讀不進去的子目錄清單。"""
+    normed = []
     for folder in folders:
         if not os.path.isdir(folder):
             continue
-        p, pr, pk = scan_folder(folder)
+        nf = _norm_path(folder)
+        if nf not in normed:
+            normed.append(nf)
+    roots = [f for f in normed
+             if not any(f != g and (f + os.sep).startswith(g + os.sep) for g in normed)]
+
+    all_pub, all_priv, all_ppk = [], [], []
+    priv_info_map = {}
+    seen_ppk = set()
+    for folder in roots:
+        p, pr, pk, pinfo = scan_folder(folder, errors=errors)
         all_pub += p
         all_priv += pr
-        all_ppk += pk
+        priv_info_map.update(pinfo)
+        for x in pk:
+            nx = _norm_path(x)
+            if nx not in seen_ppk:
+                seen_ppk.add(nx)
+                all_ppk.append(x)
 
     def base_key(path):
         d = os.path.dirname(path)
@@ -534,16 +587,18 @@ def build_records(folders):
             if parsed:
                 rec.update(type=parsed["type"], blob=parsed["blob"], comment=parsed["comment"])
         if priv_path:
-            priv_info = classify_private_key_file(priv_path)
+            priv_info = priv_info_map.get(priv_path) or classify_private_key_file(priv_path)
             rec["priv_format"] = priv_info["format"] if priv_info else "?"
             rec["priv_encrypted"] = priv_info["encrypted"] if priv_info else None
             if not pub_path and priv_info and priv_info["encrypted"] is False:
-                derived = derive_pubkey_via_sshkeygen(priv_path)
+                derived, derive_err = derive_pubkey_via_sshkeygen(priv_path)
                 if derived:
                     parsed = parse_pubkey_line(derived)
                     if parsed:
                         rec.update(type=parsed["type"], blob=parsed["blob"],
                                    comment=parsed["comment"], derived=True)
+                else:
+                    rec["derive_error"] = derive_err
         records.append(rec)
 
     for ppk_path in all_ppk:
@@ -598,18 +653,41 @@ def build_records(folders):
 # 本機金鑰名冊（持久化歷史紀錄，即使金鑰被刪除也保留曾經存在過的記錄）
 # ============================================================
 
+HISTORY_CAP = 200  # 每個條目的 history 事件上限，超過丟最舊的（防止名冊與同步 payload 無限成長）
+
+
+def _cap_history(history: list) -> list:
+    return history[-HISTORY_CAP:] if len(history) > HISTORY_CAP else history
+
+
 def load_registry():
+    """讀名冊。檔案損壞時把原檔改名保留（.corrupt-時戳）再回空 dict——
+    不然下一次 save_registry 會直接用「只剩本次掃描」的內容蓋掉整份歷史，
+    使用者完全不會知道曾經有一份更完整的紀錄存在過。"""
     try:
         with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        try:
+            os.replace(REGISTRY_PATH, REGISTRY_PATH + f".corrupt-{ts}")
+            audit_log("registry_corrupt", f"registry.json 無法解析，已改名保留為 registry.json.corrupt-{ts}")
+        except OSError:
+            pass
+        return {}
+    except OSError:
         return {}
 
 
 def save_registry(reg: dict):
+    """原子寫入：先寫暫存檔再 os.replace，中途斷電/當機不會留下半份 JSON。"""
     os.makedirs(APP_DIR, exist_ok=True)
-    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+    tmp = REGISTRY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, REGISTRY_PATH)
 
 
 def update_registry_from_scan(records):
@@ -634,12 +712,27 @@ def update_registry_from_scan(records):
             "priv_encrypted": rec.get("priv_encrypted"),
             "status": "active",
         })
-        entry.setdefault("history", []).append({"ts": now, "action": "scanned"})
+        hist = entry.setdefault("history", [])
+        # 「每次掃描都記一筆 scanned」會讓 history 無限成長、同步 payload 跟著爆炸；
+        # 只在狀態有意義變化時記（第一次看到、或從 missing 回到 active）。
+        if not hist or hist[-1].get("action") != "scanned":
+            hist.append({"ts": now, "action": "scanned"})
+        entry["history"] = _cap_history(hist)
         reg[key] = entry
+    hostname = socket.gethostname() or "UNKNOWN"
     for key, entry in reg.items():
-        if key not in seen_keys and entry.get("status") == "active":
-            entry["status"] = "missing"
-            entry.setdefault("history", []).append({"ts": now, "action": "missing_from_scan"})
+        if key in seen_keys or entry.get("status") != "active":
+            continue
+        # 從別台機器同步進來的條目本機本來就掃不到，不能翻成 missing——
+        # 否則每次掃描都把外機金鑰標失蹤再推回 NAS，跨機器狀態整個爛掉。
+        hosts = entry.get("seen_hosts") or {}
+        if hosts and hostname not in hosts:
+            continue
+        entry["status"] = "missing"
+        hist = entry.setdefault("history", [])
+        if not hist or hist[-1].get("action") != "missing_from_scan":
+            hist.append({"ts": now, "action": "missing_from_scan"})
+        entry["history"] = _cap_history(hist)
     save_registry(reg)
     return reg
 
@@ -682,7 +775,7 @@ def read_nas_git_connector_profiles():
     return result
 
 
-def _sync_ssh(sync_cfg: dict, remote_cmd: str):
+def _sync_ssh(sync_cfg: dict, remote_cmd: str, input_text: str = ""):
     """對 NAS 執行遠端指令，只走 SSH 金鑰登入，不支援密碼——這支工具本來就只有
     ssh-keygen 這一個 subprocess 依賴，刻意不加 plink/密碼分支，比照
     nas_git_connector.py 的 _ssh() 但精簡到只剩同步需要的這一條路徑。"""
@@ -698,7 +791,7 @@ def _sync_ssh(sync_cfg: dict, remote_cmd: str):
     ]
     try:
         cp = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=30,
+                             errors="replace", timeout=60, input=input_text,
                              creationflags=_NO_WINDOW if os.name == "nt" else 0)
         return cp.returncode, cp.stdout, cp.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -715,10 +808,17 @@ def _between(text: str) -> str:
     return text[start + len("___BEGIN___"):end].strip("\n")
 
 
+# 描述「這台機器的磁碟現況」的欄位——合併時永遠以本機值為準，不能被另一台
+# 機器「較新的 last_seen」整筆蓋掉：路徑/格式/狀態在別台機器上是另一回事，
+# 蓋過來會讓報表指向不存在的檔案，連帶弄壞 nas_git_connector 讀 pub_path 的匯入橋。
+MACHINE_LOCAL_FIELDS = ("pub_path", "priv_path", "priv_format", "priv_encrypted", "status")
+
+
 def merge_registries(local: dict, remote: dict, hostname: str):
     """合併本機與雲端的金鑰名冊。key 選法跟 update_registry_from_scan 一致（指紋或路徑
-    後備）。每筆依 last_seen 較新的欄位為準；history 串接去重；seen_hosts（這把鑰匙在
-    哪些電腦出現過）一律聯集、只加不減，本機這次同步時把自己也蓋進去。"""
+    後備）。中繼欄位依 last_seen 較新者為準，但 MACHINE_LOCAL_FIELDS 一律保留本機值；
+    history 串接去重（上限 HISTORY_CAP）；seen_hosts（這把鑰匙在哪些電腦出現過）一律
+    聯集、只加不減，本機這次同步時把自己也蓋進去。"""
     merged = {}
     for key in set(local) | set(remote):
         l, r = local.get(key), remote.get(key)
@@ -728,6 +828,9 @@ def merge_registries(local: dict, remote: dict, hostname: str):
             entry = dict(r)
         else:
             entry = dict(r if (r.get("last_seen") or "") > (l.get("last_seen") or "") else l)
+            for fld in MACHINE_LOCAL_FIELDS:
+                if fld in l:
+                    entry[fld] = l[fld]
             firsts = [x for x in (l.get("first_seen"), r.get("first_seen")) if x]
             if firsts:
                 entry["first_seen"] = min(firsts)
@@ -738,7 +841,7 @@ def merge_registries(local: dict, remote: dict, hostname: str):
                 if pair not in seen_pairs:
                     history.append(h)
                     seen_pairs.add(pair)
-            entry["history"] = history
+            entry["history"] = _cap_history(history)
         seen_hosts = dict((l or {}).get("seen_hosts") or {})
         seen_hosts.update((r or {}).get("seen_hosts") or {})
         if l:
@@ -746,6 +849,49 @@ def merge_registries(local: dict, remote: dict, hostname: str):
         entry["seen_hosts"] = seen_hosts
         merged[key] = entry
     return merged
+
+
+def keep_worker_alive(owner):
+    """換手前把還在跑的舊 Worker 收進 owner._retired_workers，等它 finished 再釋放。
+
+    在 done handler 裡直接 self.worker = Worker(...) 會丟掉「可能還沒完全收尾」的
+    QThread 的最後一個引用 → 'QThread: Destroyed while thread is still running'
+    整個程式中止，且時機相依、極難重現。每次重派 self.worker 前先呼叫這個。"""
+    old = getattr(owner, "worker", None)
+    if old is None or not old.isRunning():
+        return
+    pool = getattr(owner, "_retired_workers", None)
+    if pool is None:
+        pool = owner._retired_workers = []
+    pool.append(old)
+    old.finished.connect(lambda o=old, p=pool: p.remove(o) if o in p else None)
+
+
+def confirm_close_ok(widget) -> bool:
+    """回傳是否允許關閉：沒有跑中的 Worker → True；有 → 問過使用者，同意才等收尾。"""
+    workers = [getattr(widget, "worker", None)] + list(getattr(widget, "_retired_workers", []))
+    running = [w for w in workers if w is not None and w.isRunning()]
+    if not running:
+        return True
+    r = QMessageBox.question(
+        widget, "操作進行中",
+        "還有背景操作在執行中，現在關閉可能讓動作做到一半（且不會留稽核紀錄）。\n確定要離開嗎？",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No)
+    if r != QMessageBox.StandardButton.Yes:
+        return False
+    for w in running:
+        w.wait(8000)
+    return True
+
+
+def confirm_close_with_worker(widget, event) -> None:
+    """closeEvent 共用邏輯（QMainWindow 用）：還有 Worker 在跑就先確認，同意才關。
+    QDialog 請改覆寫 done()（accept()/Esc 不會經過 closeEvent）。"""
+    if confirm_close_ok(widget):
+        event.accept()
+    else:
+        event.ignore()
 
 
 # ============================================================
@@ -793,10 +939,20 @@ class Worker(QThread):
     def _run_scan(self):
         folders = self.params.get("folders", [])
         self.log.emit(f"掃描 {len(folders)} 個資料夾中…")
-        records = build_records(folders)
-        update_registry_from_scan(records)
+        walk_errors = []
+        records = build_records(folders, errors=walk_errors)
+        for we in walk_errors[:20]:
+            self.log.emit(f"⚠ 讀不到：{we}")
+        if len(walk_errors) > 20:
+            self.log.emit(f"⚠ 共 {len(walk_errors)} 個位置讀不到（僅列前 20）")
+        # 名冊更新失敗（磁碟滿/權限）不該吃掉整份掃描結果——表格照樣顯示，訊息帶警語
+        reg_note = ""
+        try:
+            update_registry_from_scan(records)
+        except OSError as e:
+            reg_note = f"\n⚠ 名冊 registry.json 更新失敗（{e}），本次掃描結果只顯示、未記錄。"
         self.result.emit(records)
-        self.done.emit(True, f"掃描完成，共找到 {len(records)} 組金鑰。")
+        self.done.emit(True, f"掃描完成，共找到 {len(records)} 組金鑰。" + reg_note)
 
     def _run_generate(self):
         path = self.params.get("path", "")
@@ -809,6 +965,10 @@ class Worker(QThread):
             return
         if os.path.exists(path) or os.path.exists(path + ".pub"):
             self.done.emit(False, f"檔案已存在，未覆蓋：{path}")
+            return
+        if not shutil.which("ssh-keygen"):
+            self.done.emit(False, "找不到 ssh-keygen——請先安裝 Windows 內建 OpenSSH 用戶端"
+                                  "（設定 → 應用程式 → 選用功能），再重試。")
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         args = ["ssh-keygen", "-t", key_type, "-N", passphrase, "-C", comment, "-f", path]
@@ -846,22 +1006,40 @@ class Worker(QThread):
         if not targets:
             self.done.emit(False, "找不到要處理的檔案。")
             return
+        # 部分失敗（第一個刪掉、第二個炸掉）也要有稽核紀錄——逐檔記結果，
+        # 不能等全部成功才記一筆（那正好在最需要紀錄的時候什麼都沒留）。
         if hard:
+            done_list, fail_list = [], []
             for p in targets:
-                os.remove(p)
-            audit_log("delete_hard", "; ".join(targets))
-            self.done.emit(True, "已永久刪除：\n" + "\n".join(targets))
+                try:
+                    os.remove(p)
+                    done_list.append(p)
+                except OSError as e:
+                    fail_list.append(f"{p}（{e}）")
+            aud_ok = audit_log("delete_hard", "; ".join(done_list) or "(none)")
+            if fail_list:
+                self.done.emit(False, "部分刪除失敗：\n已刪：" + ("\n".join(done_list) or "無") +
+                               "\n失敗：" + "\n".join(fail_list) + audit_failed_note(aud_ok))
+            else:
+                self.done.emit(True, "已永久刪除：\n" + "\n".join(done_list) + audit_failed_note(aud_ok))
         else:
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             dest_dir = os.path.join(ARCHIVE_DIR, ts)
             os.makedirs(dest_dir, exist_ok=True)
-            moved = []
+            moved, fail_list = [], []
             for p in targets:
                 dest = os.path.join(dest_dir, os.path.basename(p))
-                shutil.move(p, dest)
-                moved.append(dest)
-            audit_log("archive", f"{'; '.join(targets)} -> {dest_dir}")
-            self.done.emit(True, f"已封存到：\n{dest_dir}")
+                try:
+                    shutil.move(p, dest)
+                    moved.append(dest)
+                except OSError as e:
+                    fail_list.append(f"{p}（{e}）")
+            aud_ok = audit_log("archive", f"{'; '.join(moved) or '(none)'} -> {dest_dir}")
+            if fail_list:
+                self.done.emit(False, "部分封存失敗：\n已搬：" + ("\n".join(moved) or "無") +
+                               "\n失敗：" + "\n".join(fail_list) + audit_failed_note(aud_ok))
+            else:
+                self.done.emit(True, f"已封存到：\n{dest_dir}" + audit_failed_note(aud_ok))
 
     def _run_backup(self):
         pub_path = self.params.get("pub_path")
@@ -870,17 +1048,27 @@ class Worker(QThread):
         if not dest_dir:
             self.done.emit(False, "缺少備份目標資料夾。")
             return
-        copied = []
+        copied, skipped = [], []
         for p in (pub_path, priv_path):
             if p and os.path.exists(p):
                 dest = os.path.join(dest_dir, os.path.basename(p))
+                # 不覆蓋既有備份：兩個資料夾各有一把 id_rsa 備到同個目的地，
+                # 後備的默默蓋掉先備的正是備份最不該做的事。
+                if os.path.exists(dest):
+                    skipped.append(dest)
+                    continue
                 shutil.copy2(p, dest)
                 copied.append(dest)
-        if not copied:
+        if not copied and not skipped:
             self.done.emit(False, "找不到要備份的檔案。")
             return
-        audit_log("backup", "; ".join(copied))
-        self.done.emit(True, "已備份：\n" + "\n".join(copied))
+        aud_ok = audit_log("backup", "; ".join(copied) or "(all skipped)")
+        msg = ""
+        if copied:
+            msg += "已備份：\n" + "\n".join(copied)
+        if skipped:
+            msg += ("\n" if msg else "") + "⚠ 目的地已有同名檔案、未覆蓋：\n" + "\n".join(skipped)
+        self.done.emit(not skipped, msg + audit_failed_note(aud_ok))
 
     def _run_list_archive(self):
         items = []
@@ -900,15 +1088,18 @@ class Worker(QThread):
         if not name or not os.path.isdir(src_dir):
             self.done.emit(False, "找不到這筆封存紀錄。")
             return
+        # 先驗證「全部」目的地都沒有同名檔案再動手——邊搬邊檢查會在第二個檔
+        # 撞名時留下搬到一半的封存目錄，還回報「未還原」誤導使用者。
+        names = os.listdir(src_dir)
+        conflicts = [os.path.join(target_dir, fn) for fn in names
+                     if os.path.exists(os.path.join(target_dir, fn))]
+        if conflicts:
+            self.done.emit(False, "目標已存在同名檔案，整筆未還原：\n" + "\n".join(conflicts))
+            return
         restored = []
-        for fn in os.listdir(src_dir):
-            src = os.path.join(src_dir, fn)
-            dest = os.path.join(target_dir, fn)
-            if os.path.exists(dest):
-                self.done.emit(False, f"目標已存在同名檔案，未還原：{dest}")
-                return
-            shutil.move(src, dest)
-            restored.append(dest)
+        for fn in names:
+            shutil.move(os.path.join(src_dir, fn), os.path.join(target_dir, fn))
+            restored.append(os.path.join(target_dir, fn))
         try:
             os.rmdir(src_dir)
         except OSError:
@@ -958,6 +1149,9 @@ class Worker(QThread):
         if not remote_root:
             self.done.emit(False, "同步設定未填 remote_root，請先到「⚙ 雲端同步設定…」設定。")
             return
+        if "'" in remote_root or "\n" in remote_root:
+            self.done.emit(False, "remote_root 含引號/換行等不安全字元，請修正同步設定。")
+            return
         hostname = socket.gethostname() or "UNKNOWN"
         self.log.emit("--- 跨機器同步金鑰名冊 ---")
 
@@ -979,19 +1173,29 @@ class Worker(QThread):
 
         local_reg = load_registry()
         merged = merge_registries(local_reg, remote_reg, hostname)
+        # 合併結果要蓋掉本機名冊前先留一份備份——遠端那份若是壞的/舊的/別台機器
+        # 誤推的，這是唯一能把本機歷史找回來的路（NAS 端推送本來就有 .bak，本機比照）。
+        if os.path.isfile(REGISTRY_PATH):
+            try:
+                shutil.copy2(REGISTRY_PATH, REGISTRY_PATH + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+            except OSError as e:
+                self.done.emit(False, f"本機名冊備份失敗（{e}），為安全起見中止同步。")
+                return
         save_registry(merged)
 
         payload = json.dumps(merged, ensure_ascii=False)
         b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        # b64 從 stdin 餵進去，不放 argv——名冊會隨 history 成長，Windows 命令列
+        # 有 32767 字元上限，塞 argv 遲早在某次掃描後永久炸掉同步。
         push_cmd = "\n".join([
             f"d='{remote_root}/config'; f=\"$d/km_registry_sync.json\"",
             "mkdir -p \"$d\"",
             "[ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
-            f"printf '%s' '{b64}' | base64 -d > \"$f\"",
+            "base64 -d > \"$f.new\" && [ -s \"$f.new\" ] && mv \"$f.new\" \"$f\"",
             "chmod 600 \"$f\"",
             "echo ___OK___",
         ])
-        rc2, out2, err2 = _sync_ssh(sync_cfg, push_cmd)
+        rc2, out2, err2 = _sync_ssh(sync_cfg, push_cmd, input_text=b64)
         if rc2 != 0 or "___OK___" not in out2:
             self.done.emit(False, f"推送雲端金鑰名冊失敗：{(err2 or out2).strip()}")
             return
@@ -1144,6 +1348,12 @@ class ArchiveManageDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
+    def done(self, result):
+        # accept()/reject()/Esc/關閉鈕全都經過 done()；closeEvent 只涵蓋視窗 X
+        if not confirm_close_ok(self):
+            return
+        super().done(result)
+
     def _busy(self, b):
         for x in (self.refresh_b, self.restore_b, self.purge_b):
             x.setEnabled(not b)
@@ -1151,6 +1361,7 @@ class ArchiveManageDialog(QDialog):
     def refresh(self):
         self.list.clear()
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("list_archive")
         self.worker.result.connect(self.on_entries)
         self.worker.done.connect(self.on_done)
@@ -1182,6 +1393,7 @@ class ArchiveManageDialog(QDialog):
         if not d:
             return
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("restore_archive", {"name": name, "target_dir": d})
         self.worker.done.connect(self._on_action_done)
         self.worker.start()
@@ -1195,6 +1407,7 @@ class ArchiveManageDialog(QDialog):
         if r != QMessageBox.StandardButton.Yes:
             return
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("purge_archive", {"name": name})
         self.worker.done.connect(self._on_action_done)
         self.worker.start()
@@ -1203,6 +1416,81 @@ class ArchiveManageDialog(QDialog):
         self.on_done(ok, msg)
         if ok:
             self.refresh()
+
+
+class RegistryDialog(QDialog):
+    """金鑰名冊檢視：報表表格只看得到「這次掃描找到的」，名冊才記得「曾經存在過的」。
+    這裡把 status=missing 的條目、first_seen、最近歷史事件攤開來看，並提供清除
+    過時條目的入口（唯一會縮小 registry.json 的地方，走確認＋稽核）。"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("金鑰名冊歷史（含已消失的金鑰）")
+        self.resize(920, 480)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            f"檔案：{REGISTRY_PATH}\n"
+            "「missing」＝以前掃到過、最近一次掃描沒找到（被刪/搬走/資料夾沒加入掃描）。"
+            "從別台電腦同步來的條目不會被本機掃描標成 missing。"))
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["狀態", "指紋", "備註(comment)", "類型", "首次記錄", "最後看到", "最近事件"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self.table, stretch=1)
+        row = QHBoxLayout()
+        self.prune_b = QPushButton("刪除選取條目（僅名冊紀錄，不動檔案）…")
+        self.prune_b.clicked.connect(self.on_prune)
+        close_b = QPushButton("關閉")
+        close_b.clicked.connect(self.accept)
+        row.addWidget(self.prune_b)
+        row.addStretch(1)
+        row.addWidget(close_b)
+        lay.addLayout(row)
+        self.refresh()
+
+    def refresh(self):
+        self.reg = load_registry()
+        rows = sorted(self.reg.items(), key=lambda kv: kv[1].get("last_seen", ""), reverse=True)
+        self._row_keys = [k for k, _ in rows]
+        self.table.setRowCount(len(rows))
+        for i, (_key, e) in enumerate(rows):
+            hist = e.get("history", [])
+            recent = "；".join(f"{h.get('ts', '')} {h.get('action', '')}" for h in hist[-3:])
+            status = e.get("status", "")
+            vals = [status, e.get("fingerprint", "") or _key, e.get("comment", ""),
+                    e.get("type", ""), e.get("first_seen", ""), e.get("last_seen", ""), recent]
+            for col, val in enumerate(vals):
+                it = QTableWidgetItem(str(val))
+                if status == "missing" and col == 0:
+                    it.setForeground(Qt.GlobalColor.red)
+                self.table.setItem(i, col, it)
+
+    def on_prune(self):
+        picked = sorted({ix.row() for ix in self.table.selectedIndexes()})
+        if not picked:
+            return
+        keys = [self._row_keys[r] for r in picked]
+        r = QMessageBox.question(
+            self, "刪除名冊條目",
+            f"確定從名冊刪除 {len(keys)} 筆紀錄？\n只刪除歷史紀錄本身，不會動到任何金鑰檔案。\n"
+            "注意：若之後執行跨機器同步，已同步到雲端的同一筆條目會再被合併回來。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        for k in keys:
+            self.reg.pop(k, None)
+        try:
+            save_registry(self.reg)
+        except OSError as e:
+            QMessageBox.warning(self, "寫入失敗", f"名冊寫入失敗：{e}")
+            return
+        aud_ok = audit_log("registry_prune", "; ".join(keys))
+        self.refresh()
+        if not aud_ok:
+            QMessageBox.warning(self, "稽核失敗", "條目已刪除，但稽核紀錄寫入失敗（audit.log 不可寫）。")
 
 
 class AuditLogDialog(QDialog):
@@ -1257,6 +1545,12 @@ class KnownHostsDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh()
 
+    def done(self, result):
+        # accept()/reject()/Esc/關閉鈕全都經過 done()；closeEvent 只涵蓋視窗 X
+        if not confirm_close_ok(self):
+            return
+        super().done(result)
+
     def _busy(self, b):
         for x in (self.refresh_b, self.delete_b):
             x.setEnabled(not b)
@@ -1264,6 +1558,7 @@ class KnownHostsDialog(QDialog):
     def refresh(self):
         self.list.clear()
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("list_known_hosts")
         self.worker.result.connect(self.on_entries)
         self.worker.done.connect(self.on_done)
@@ -1293,6 +1588,7 @@ class KnownHostsDialog(QDialog):
         if r != QMessageBox.StandardButton.Yes:
             return
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("delete_known_hosts_entry", {"line_no": line_no})
         self.worker.done.connect(self._on_delete_done)
         self.worker.start()
@@ -1433,6 +1729,12 @@ class SyncOverviewDialog(QDialog):
         self.close_b.clicked.connect(self.accept)
         self.refresh_from_local()
 
+    def done(self, result):
+        # accept()/reject()/Esc/關閉鈕全都經過 done()；closeEvent 只涵蓋視窗 X
+        if not confirm_close_ok(self):
+            return
+        super().done(result)
+
     def refresh_from_local(self):
         self._populate(load_registry())
 
@@ -1465,6 +1767,7 @@ class SyncOverviewDialog(QDialog):
         self.sync_b.setEnabled(False)
         self.status.setText("同步中…")
         self.status.setStyleSheet("")
+        keep_worker_alive(self)
         self.worker = Worker("sync_registry", {"sync_cfg": sync_cfg})
         self.worker.result.connect(self._populate)
         self.worker.done.connect(self.on_sync_done)
@@ -1503,7 +1806,10 @@ class MainWindow(QMainWindow):
         folder_box = QGroupBox("掃描資料夾")
         fb = QVBoxLayout(folder_box)
         self.folder_list = QListWidget()
-        self.folder_list.addItem(os.path.join(os.path.expanduser("~"), ".ssh"))
+        self.settings = QSettings("TerryTools", "KeyManagement")
+        saved_folders = self.settings.value("scan_folders", [], type=list)
+        for f in (saved_folders or [os.path.join(os.path.expanduser("~"), ".ssh")]):
+            self.folder_list.addItem(f)
         fb.addWidget(self.folder_list)
         frow = QHBoxLayout()
         add_b = QPushButton("新增資料夾…")
@@ -1561,6 +1867,9 @@ class MainWindow(QMainWindow):
         self.archive_mgmt_b.clicked.connect(self.on_archive_mgmt)
         self.audit_b = QPushButton("稽核紀錄…")
         self.audit_b.clicked.connect(self.on_audit_log)
+        self.registry_b = QPushButton("名冊歷史…")
+        self.registry_b.setToolTip("看曾經存在過（含已消失 missing）的金鑰紀錄，可清除過時條目。")
+        self.registry_b.clicked.connect(self.on_registry)
         self.known_hosts_b = QPushButton("known_hosts 管理…")
         self.known_hosts_b.clicked.connect(self.on_known_hosts)
         self.sync_config_b = QPushButton("⚙ 雲端同步設定…")
@@ -1571,6 +1880,7 @@ class MainWindow(QMainWindow):
         self.export_b.clicked.connect(self.on_export_csv)
         brow.addWidget(self.archive_mgmt_b)
         brow.addWidget(self.audit_b)
+        brow.addWidget(self.registry_b)
         brow.addWidget(self.known_hosts_b)
         brow.addWidget(self.sync_config_b)
         brow.addWidget(self.sync_overview_b)
@@ -1582,9 +1892,30 @@ class MainWindow(QMainWindow):
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
+        # 背景動作進度 log：Worker.log 過去是死訊號（emit 了沒人接），大資料夾掃描
+        # 只看得到靜止的「掃描中…」，分不出慢跟卡死。
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFont(QFont("Consolas", 9))
+        self.log_view.setFixedHeight(90)
+        self.log_view.setPlaceholderText("背景動作進度會顯示在這裡（掃描/產生/同步…）")
+        lay.addWidget(self.log_view)
+
+    def append_log(self, line: str):
+        self.log_view.appendPlainText(line)
+
+    def _save_folders(self):
+        self.settings.setValue(
+            "scan_folders",
+            [self.folder_list.item(i).text() for i in range(self.folder_list.count())])
+
+    def closeEvent(self, event):
+        confirm_close_with_worker(self, event)
+
     def _busy(self, b):
         for x in (self.scan_b, self.gen_b, self.archive_mgmt_b, self.audit_b, self.export_b,
-                  self.archive_del_b, self.hard_del_b, self.backup_b, self.view_raw_b):
+                  self.archive_del_b, self.hard_del_b, self.backup_b, self.view_raw_b,
+                  self.known_hosts_b, self.sync_config_b, self.sync_overview_b, self.registry_b):
             x.setEnabled(not b)
         if not b:
             self.on_selection_changed()
@@ -1594,10 +1925,12 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "選擇要掃描的資料夾")
         if d:
             self.folder_list.addItem(d)
+            self._save_folders()
 
     def on_remove_folder(self):
         for it in self.folder_list.selectedItems():
             self.folder_list.takeItem(self.folder_list.row(it))
+        self._save_folders()
 
     # ---------- 掃描 ----------
     def on_scan(self):
@@ -1608,7 +1941,9 @@ class MainWindow(QMainWindow):
         self._busy(True)
         self.status.setText("掃描中…")
         self.status.setStyleSheet("")
+        keep_worker_alive(self)
         self.worker = Worker("scan", {"folders": folders})
+        self.worker.log.connect(self.append_log)
         self.worker.result.connect(self.on_scan_result)
         self.worker.done.connect(self.on_scan_done)
         self.worker.start()
@@ -1686,7 +2021,9 @@ class MainWindow(QMainWindow):
         self._busy(True)
         self.status.setText("產生金鑰中…")
         self.status.setStyleSheet("")
+        keep_worker_alive(self)
         self.worker = Worker("generate", vals)
+        self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_generate_done)
         self.worker.start()
 
@@ -1711,8 +2048,10 @@ class MainWindow(QMainWindow):
             return
         self._busy(True)
         self.status.setText("封存中…")
+        keep_worker_alive(self)
         self.worker = Worker("delete", {
             "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "hard": False})
+        self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_delete_done)
         self.worker.start()
 
@@ -1728,8 +2067,10 @@ class MainWindow(QMainWindow):
             return
         self._busy(True)
         self.status.setText("永久刪除中…")
+        keep_worker_alive(self)
         self.worker = Worker("delete", {
             "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "hard": True})
+        self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_delete_done)
         self.worker.start()
 
@@ -1748,10 +2089,23 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "備份到哪個資料夾")
         if not d:
             return
+        # 備份是唯一會把私鑰檔複製到任意使用者選定資料夾（可能是雲端同步資料夾）
+        # 的路徑——CSV 匯出含私鑰前會問，這裡比照，含私鑰就先確認一次。
+        if rec.get("priv_path"):
+            r = QMessageBox.question(
+                self, "備份包含私鑰",
+                f"備份會把「私鑰檔」複製到：\n{d}\n\n"
+                "若該資料夾會同步到雲端（OneDrive/Dropbox 等），私鑰等同外流。\n確定要備份？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
         self._busy(True)
         self.status.setText("備份中…")
+        keep_worker_alive(self)
         self.worker = Worker("backup", {
             "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "dest_dir": d})
+        self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_backup_done)
         self.worker.start()
 
@@ -1772,7 +2126,9 @@ class MainWindow(QMainWindow):
         if r != QMessageBox.StandardButton.Yes:
             return
         self._busy(True)
+        keep_worker_alive(self)
         self.worker = Worker("read_private_raw", {"path": rec["priv_path"]})
+        self.worker.log.connect(self.append_log)
         self.worker.result.connect(self._show_raw)
         self.worker.done.connect(self._on_view_raw_done)
         self.worker.start()
@@ -1805,14 +2161,27 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText(content)
             self.status.setText("已複製公鑰內容到剪貼簿。")
             self.status.setStyleSheet("color:#1a7f37;")
+        else:
+            self.status.setText("❌ 讀不到公鑰內容（檔案不存在或無法讀取），未複製。")
+            self.status.setStyleSheet("color:#b00020;")
 
     def on_open_folder(self):
         rec = self._selected_record()
         if not rec:
             return
         path = rec.get("priv_path") or rec.get("pub_path")
-        if path and os.path.exists(path):
-            subprocess.run(["explorer", "/select,", os.path.normpath(path)])
+        if not (path and os.path.exists(path)):
+            return
+        if os.name != "nt":
+            self.status.setText("開啟資料夾功能目前只支援 Windows。")
+            return
+        try:
+            # Qt slot 內未攔截的例外會讓 PyQt6 直接中止程式，這裡不能裸呼叫
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)],
+                             creationflags=_NO_WINDOW)
+        except OSError as e:
+            self.status.setText(f"❌ 開啟檔案總管失敗：{e}")
+            self.status.setStyleSheet("color:#b00020;")
 
     # ---------- 封存區 / 稽核紀錄 ----------
     def on_archive_mgmt(self):
@@ -1821,6 +2190,10 @@ class MainWindow(QMainWindow):
 
     def on_audit_log(self):
         dlg = AuditLogDialog(self)
+        dlg.exec()
+
+    def on_registry(self):
+        dlg = RegistryDialog(self)
         dlg.exec()
 
     def on_known_hosts(self):
