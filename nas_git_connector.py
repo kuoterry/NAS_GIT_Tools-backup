@@ -36,6 +36,9 @@ import json
 import urllib.request
 import urllib.error
 import traceback
+import threading
+import time
+import tempfile
 from datetime import datetime, timezone
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
@@ -586,10 +589,19 @@ class Worker(QThread):
     repos = pyqtSignal(list)      # 列出倉庫用：回傳 repo 名稱清單
     hooks = pyqtSignal(str)       # 讀 CI hook 用：回傳 hook 內容文字
 
+    # plink 是否支援 -pwfile（PuTTY 0.77+）。None=未知（先試 -pwfile），False=確定不支援。
+    _plink_pwfile_ok = None
+
     def __init__(self, cfg: dict, mode: str = "connect"):
         super().__init__()
         self.cfg = cfg
         self.mode = mode  # "connect" 串接 / "test" 測連線 / "list" 列出倉庫
+        self._cancel_requested = False
+        self._pw_file = None  # plink -pwfile 用的暫存密碼檔，run() 結束時刪除
+
+    def cancel(self):
+        """要求中止目前操作：正在跑的子程序會被砍掉，_run 回傳 rc=125。"""
+        self._cancel_requested = True
 
     # --- 執行外部指令的統一入口 ---
     def _mask(self, a):
@@ -599,26 +611,100 @@ class Worker(QThread):
             return "****"
         return a
 
-    def _run(self, args, cwd=None, input_bytes=None, env=None):
+    def _run(self, args, cwd=None, input_bytes=None, env=None, timeout=None):
+        """執行子程序：輸出逐行即時 emit（長操作不再整段黑箱等待）、支援逾時與取消。
+
+        回傳 (rc, out, err)。特殊 rc：124=逾時強制結束、125=使用者取消。
+        timeout=None 表示不設限（僅留給本機互動性極低的操作；遠端一律給逾時）。
+        """
         self.log.emit("$ " + " ".join(self._mask(a) for a in args))
         try:
-            cp = subprocess.run(
-                args, cwd=cwd, capture_output=True, input=input_bytes,
-                env=env, creationflags=_NO_WINDOW
+            proc = subprocess.Popen(
+                args, cwd=cwd, env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=_NO_WINDOW,
             )
         except FileNotFoundError as e:
             self.log.emit(f"[錯誤] 找不到執行檔：{e}")
             return 127, "", str(e)
-        out = cp.stdout.decode("utf-8", "replace").strip()
-        err = cp.stderr.decode("utf-8", "replace").strip()
-        if out:
-            self.log.emit(out)
-        if err:
-            self.log.emit(err)
-        return cp.returncode, out, err
+        try:
+            if input_bytes:
+                proc.stdin.write(input_bytes)
+                proc.stdin.flush()
+            proc.stdin.close()
+        except OSError:
+            pass
 
-    def _ssh(self, remote_cmd):
-        """對 NAS 執行遠端指令。有密碼→用 plink -pw；無密碼→用內建 ssh（金鑰，若這個身份
+        out_lines, err_lines = [], []
+
+        def _reader(stream, sink):
+            """把子程序的一條輸出流逐行收進 sink 並即時丟到 log 視窗。"""
+            for raw in iter(stream.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                sink.append(line)
+                if line:
+                    self.log.emit(line)
+            stream.close()
+
+        t_out = threading.Thread(target=_reader, args=(proc.stdout, out_lines), daemon=True)
+        t_err = threading.Thread(target=_reader, args=(proc.stderr, err_lines), daemon=True)
+        t_out.start()
+        t_err.start()
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        killed_reason = None
+        while proc.poll() is None:
+            if self._cancel_requested:
+                killed_reason = "cancel"
+                break
+            if deadline is not None and time.monotonic() > deadline:
+                killed_reason = "timeout"
+                break
+            time.sleep(0.1)
+        if killed_reason:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait()
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+        out = "\n".join(out_lines).strip()
+        err = "\n".join(err_lines).strip()
+        if killed_reason == "cancel":
+            self.log.emit("[中止] 使用者取消，已強制結束子程序")
+            return 125, out, "cancelled"
+        if killed_reason == "timeout":
+            self.log.emit(f"[錯誤] 執行逾時（超過 {timeout} 秒），已強制結束")
+            return 124, out, err or "timeout"
+        return proc.returncode, out, err
+
+    # 遠端指令預設逾時：一般操作 10 分鐘該夠；gc/fsck/同步鏡像等長操作各自傳更大的值。
+    SSH_DEFAULT_TIMEOUT = 600
+
+    def _plink_pw_args(self, pw):
+        """回傳 plink 的密碼參數。優先用 -pwfile（密碼不進命令列，避免同機任何
+        程序用 Win32_Process.CommandLine 直接讀到明碼）；偵測到舊版 plink 不支援
+        時退回 -pw。密碼檔放使用者暫存目錄，run() 結束時刪除。"""
+        if Worker._plink_pwfile_ok is False:
+            return ["-pw", pw]
+        if self._pw_file is None:
+            fd, path = tempfile.mkstemp(prefix="nasgit_pw_")
+            with os.fdopen(fd, "w", encoding="ascii", errors="replace") as f:
+                f.write(pw)
+            self._pw_file = path
+        return ["-pwfile", self._pw_file]
+
+    def _cleanup_pw_file(self):
+        if self._pw_file:
+            try:
+                os.remove(self._pw_file)
+            except OSError:
+                pass
+            self._pw_file = None
+
+    def _ssh(self, remote_cmd, timeout=SSH_DEFAULT_TIMEOUT):
+        """對 NAS 執行遠端指令。有密碼→用 plink；無密碼→用內建 ssh（金鑰，若這個身份
         指定了私鑰檔就明確帶 -i，避免 SSH 只憑預設檔名/agent 猜不到非預設命名的金鑰）。"""
         c = self.cfg
         ssh_host = f"{c['user']}@{c['host']}"
@@ -633,19 +719,31 @@ class Worker(QThread):
                 )
                 return 255, "", "plink-missing"
             # 餵 y\n 以在首次連線時自動接受主機金鑰（之後會被 PuTTY 快取）
-            args = [plink, "-pw", pw, ssh_host, remote_cmd]
-            return self._run(args, input_bytes=b"y\n")
+            args = [plink] + self._plink_pw_args(pw) + [ssh_host, remote_cmd]
+            rc, out, err = self._run(args, input_bytes=b"y\n", timeout=timeout)
+            if rc != 0 and Worker._plink_pwfile_ok is None and "-pwfile" in (err or ""):
+                # 舊版 plink 不認得 -pwfile：記住這件事，這次直接用 -pw 重跑一遍。
+                Worker._plink_pwfile_ok = False
+                self.log.emit("[提示] 此版 plink 不支援 -pwfile，退回 -pw（建議升級 PuTTY ≥ 0.77）")
+                args = [plink, "-pw", pw, ssh_host, remote_cmd]
+                rc, out, err = self._run(args, input_bytes=b"y\n", timeout=timeout)
+            elif rc == 0 and Worker._plink_pwfile_ok is None:
+                Worker._plink_pwfile_ok = True
+            return rc, out, err
         else:
             args = [
                 "ssh",
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ConnectTimeout=10",
+                # 連線後對端死掉（NAS 睡死/斷網）約 60 秒內偵測到，而不是永遠掛住。
+                "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=4",
             ]
             if identity_file:
                 args += ["-i", identity_file, "-o", "IdentitiesOnly=yes"]
             args += [ssh_host, remote_cmd]
-            return self._run(args)
+            return self._run(args, timeout=timeout)
 
     def _git_env(self):
         """本地 git 若要用密碼推送，透過 plink 當 GIT_SSH_COMMAND；若無密碼但這個身份指定了
@@ -657,7 +755,11 @@ class Worker(QThread):
             if not plink:
                 return None
             env = os.environ.copy()
-            env["GIT_SSH_COMMAND"] = f'"{plink}" -pw {pw}'
+            pw_args = self._plink_pw_args(pw)
+            if pw_args[0] == "-pwfile":
+                env["GIT_SSH_COMMAND"] = f'"{plink}" -pwfile "{pw_args[1]}"'
+            else:
+                env["GIT_SSH_COMMAND"] = f'"{plink}" -pw {pw}'
             return env
         if identity_file:
             env = os.environ.copy()
@@ -673,6 +775,8 @@ class Worker(QThread):
         except Exception as e:
             self.log.emit("[錯誤] 內部例外：\n" + traceback.format_exc().strip())
             self.done.emit(False, f"內部錯誤：{e}")
+        finally:
+            self._cleanup_pw_file()
 
     def _dispatch(self):
         if self.mode == "test":
@@ -1453,7 +1557,7 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, _ = self._ssh(cmd, timeout=3600)
         if rc != 0:
             self.done.emit(False, "GC 失敗（連線或權限問題）。")
             return
@@ -1500,7 +1604,7 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, _ = self._ssh(cmd, timeout=3600)
         if rc != 0:
             self.done.emit(False, "完整性檢查失敗（連線或權限問題）。")
             return
@@ -1988,7 +2092,7 @@ class Worker(QThread):
             self.done.emit(False, f"目標資料夾已存在，未動作：\n{target}")
             return
         self.log.emit(f"--- git clone → {target} ---")
-        rc, out, err = self._run(["git", "clone", url, target], env=self._git_env())
+        rc, out, err = self._run(["git", "clone", url, target], env=self._git_env(), timeout=3600)
         if rc == 0:
             self.done.emit(True, f"已 clone 到本地：\n{target}")
         else:
@@ -2026,7 +2130,7 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, _ = self._ssh(cmd, timeout=3600)
         if "EXISTS" in out:
             self.done.emit(False, f"倉庫已存在，未建立：{name}")
         elif rc == 0 and "___OK___" in out:
@@ -2061,7 +2165,7 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, _ = self._ssh(cmd, timeout=3600)
         if rc != 0:
             self.done.emit(False, "同步失敗（連線或權限問題）。")
             return
@@ -2153,7 +2257,7 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, _ = self._ssh(cmd, timeout=3600)
         if rc != 0:
             self.done.emit(False, "同步失敗（連線或權限問題）。")
             return
@@ -2456,7 +2560,7 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, _ = self._ssh(cmd, timeout=3600)
         if rc != 0:
             self.done.emit(False, "健康檢查失敗（連線或權限問題）。")
             return
@@ -2597,7 +2701,7 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, _ = self._ssh(cmd, timeout=3600)
         if rc != 0 or "___OK___" not in out:
             self.done.emit(False, "修復失敗（權限問題？需以 git_devs 帳號執行）。")
             return
@@ -5834,6 +5938,12 @@ class MainWindow(QMainWindow):
         # ================= 分頁 =================
         tabs = QTabWidget()
         root.addWidget(tabs, stretch=1)
+        # 全域中止鈕：放在分頁列右上角，任何分頁都看得到；只有操作進行中才可按。
+        self.cancel_btn = QPushButton("⛔ 中止")
+        self.cancel_btn.setToolTip("強制中止目前執行中的操作（砍掉子程序）。遠端動作可能做一半，之後請重新整理確認狀態。")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.on_cancel_worker)
+        tabs.setCornerWidget(self.cancel_btn, Qt.Corner.TopRightCorner)
 
         # ---------- 分頁 1：串接專案 ----------
         connect_page = QWidget()
@@ -6527,9 +6637,11 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(text)
 
     def set_busy(self, busy: bool):
+        self.cancel_btn.setEnabled(busy)
         self.run_btn.setEnabled(not busy)
         self.test_btn.setEnabled(not busy)
         self.refresh_btn.setEnabled(not busy)
+        self.kind_scan_btn.setEnabled(not busy)
         self.ci_status_btn.setEnabled(not busy)
         self.upgrade_btn.setEnabled(not busy)
         self.create_btn.setEnabled(not busy)
@@ -6560,11 +6672,45 @@ class MainWindow(QMainWindow):
         self.gc_btn.setEnabled(not busy and has_sel)
         self.fsck_btn.setEnabled(not busy and has_sel)
         self.tag_btn.setEnabled(not busy and has_sel)
+        # 這四顆過去只在 on_repo_selected 管，busy 時仍可按 → 併發 worker 互踩（稽核記錯 mode）。
+        self.desc_btn.setEnabled(not busy and has_sel)
+        self.branch_protect_btn.setEnabled(not busy and has_sel)
+        self.backup_btn.setEnabled(not busy and has_sel)
+        self.kind_btn.setEnabled(not busy and has_sel)
         if busy:
             self.run_btn.setText("執行中…")
         else:
             self.run_btn.setText("開始串接")
             self.update_run_enabled()
+
+    def on_cancel_worker(self):
+        w = self.worker
+        if not (w and w.isRunning()):
+            self.cancel_btn.setEnabled(False)
+            return
+        r = QMessageBox.question(
+            self, "中止操作",
+            "確定要強制中止目前操作？\n遠端動作可能做一半（例如同步、修復跑到一半），中止後建議重新整理確認狀態。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if r == QMessageBox.StandardButton.Yes:
+            w.cancel()
+
+    def closeEvent(self, event):
+        """跑到一半直接關窗會硬殺 QThread（遠端動作做一半、稽核沒記錄）——先確認、再收尾。"""
+        w = self.worker
+        if w and w.isRunning():
+            r = QMessageBox.question(
+                self, "操作進行中",
+                "還有操作在執行中，現在關閉會中止它（遠端動作可能做一半）。\n確定要中止並離開嗎？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            w.cancel()
+            w.wait(8000)
+        event.accept()
 
     # --- 測試連線 ---
     def on_test(self):
@@ -6907,9 +7053,13 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
-            if self.worker and self.worker.mode in DESTRUCTIVE_MODES:
+            # 用發訊號的那個 Worker 判斷 mode，而不是 self.worker——
+            # self.worker 是共用屬性，途中被重新指派會讓稽核記到錯的 mode。
+            sender = self.sender()
+            sender_mode = getattr(sender, "mode", None)
+            if sender_mode in DESTRUCTIVE_MODES:
                 c = self.collect_identity_cfg()
-                audit_log(c.get("user", ""), c.get("host", ""), self.worker.mode, msg.replace("\n", " "))
+                audit_log(c.get("user", ""), c.get("host", ""), sender_mode, msg.replace("\n", " "))
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
