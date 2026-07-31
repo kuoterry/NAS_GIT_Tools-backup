@@ -1418,6 +1418,81 @@ class ArchiveManageDialog(QDialog):
             self.refresh()
 
 
+class RegistryDialog(QDialog):
+    """金鑰名冊檢視：報表表格只看得到「這次掃描找到的」，名冊才記得「曾經存在過的」。
+    這裡把 status=missing 的條目、first_seen、最近歷史事件攤開來看，並提供清除
+    過時條目的入口（唯一會縮小 registry.json 的地方，走確認＋稽核）。"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("金鑰名冊歷史（含已消失的金鑰）")
+        self.resize(920, 480)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            f"檔案：{REGISTRY_PATH}\n"
+            "「missing」＝以前掃到過、最近一次掃描沒找到（被刪/搬走/資料夾沒加入掃描）。"
+            "從別台電腦同步來的條目不會被本機掃描標成 missing。"))
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["狀態", "指紋", "備註(comment)", "類型", "首次記錄", "最後看到", "最近事件"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self.table, stretch=1)
+        row = QHBoxLayout()
+        self.prune_b = QPushButton("刪除選取條目（僅名冊紀錄，不動檔案）…")
+        self.prune_b.clicked.connect(self.on_prune)
+        close_b = QPushButton("關閉")
+        close_b.clicked.connect(self.accept)
+        row.addWidget(self.prune_b)
+        row.addStretch(1)
+        row.addWidget(close_b)
+        lay.addLayout(row)
+        self.refresh()
+
+    def refresh(self):
+        self.reg = load_registry()
+        rows = sorted(self.reg.items(), key=lambda kv: kv[1].get("last_seen", ""), reverse=True)
+        self._row_keys = [k for k, _ in rows]
+        self.table.setRowCount(len(rows))
+        for i, (_key, e) in enumerate(rows):
+            hist = e.get("history", [])
+            recent = "；".join(f"{h.get('ts', '')} {h.get('action', '')}" for h in hist[-3:])
+            status = e.get("status", "")
+            vals = [status, e.get("fingerprint", "") or _key, e.get("comment", ""),
+                    e.get("type", ""), e.get("first_seen", ""), e.get("last_seen", ""), recent]
+            for col, val in enumerate(vals):
+                it = QTableWidgetItem(str(val))
+                if status == "missing" and col == 0:
+                    it.setForeground(Qt.GlobalColor.red)
+                self.table.setItem(i, col, it)
+
+    def on_prune(self):
+        picked = sorted({ix.row() for ix in self.table.selectedIndexes()})
+        if not picked:
+            return
+        keys = [self._row_keys[r] for r in picked]
+        r = QMessageBox.question(
+            self, "刪除名冊條目",
+            f"確定從名冊刪除 {len(keys)} 筆紀錄？\n只刪除歷史紀錄本身，不會動到任何金鑰檔案。\n"
+            "注意：若之後執行跨機器同步，已同步到雲端的同一筆條目會再被合併回來。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        for k in keys:
+            self.reg.pop(k, None)
+        try:
+            save_registry(self.reg)
+        except OSError as e:
+            QMessageBox.warning(self, "寫入失敗", f"名冊寫入失敗：{e}")
+            return
+        aud_ok = audit_log("registry_prune", "; ".join(keys))
+        self.refresh()
+        if not aud_ok:
+            QMessageBox.warning(self, "稽核失敗", "條目已刪除，但稽核紀錄寫入失敗（audit.log 不可寫）。")
+
+
 class AuditLogDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
@@ -1731,7 +1806,10 @@ class MainWindow(QMainWindow):
         folder_box = QGroupBox("掃描資料夾")
         fb = QVBoxLayout(folder_box)
         self.folder_list = QListWidget()
-        self.folder_list.addItem(os.path.join(os.path.expanduser("~"), ".ssh"))
+        self.settings = QSettings("TerryTools", "KeyManagement")
+        saved_folders = self.settings.value("scan_folders", [], type=list)
+        for f in (saved_folders or [os.path.join(os.path.expanduser("~"), ".ssh")]):
+            self.folder_list.addItem(f)
         fb.addWidget(self.folder_list)
         frow = QHBoxLayout()
         add_b = QPushButton("新增資料夾…")
@@ -1789,6 +1867,9 @@ class MainWindow(QMainWindow):
         self.archive_mgmt_b.clicked.connect(self.on_archive_mgmt)
         self.audit_b = QPushButton("稽核紀錄…")
         self.audit_b.clicked.connect(self.on_audit_log)
+        self.registry_b = QPushButton("名冊歷史…")
+        self.registry_b.setToolTip("看曾經存在過（含已消失 missing）的金鑰紀錄，可清除過時條目。")
+        self.registry_b.clicked.connect(self.on_registry)
         self.known_hosts_b = QPushButton("known_hosts 管理…")
         self.known_hosts_b.clicked.connect(self.on_known_hosts)
         self.sync_config_b = QPushButton("⚙ 雲端同步設定…")
@@ -1799,6 +1880,7 @@ class MainWindow(QMainWindow):
         self.export_b.clicked.connect(self.on_export_csv)
         brow.addWidget(self.archive_mgmt_b)
         brow.addWidget(self.audit_b)
+        brow.addWidget(self.registry_b)
         brow.addWidget(self.known_hosts_b)
         brow.addWidget(self.sync_config_b)
         brow.addWidget(self.sync_overview_b)
@@ -1810,13 +1892,30 @@ class MainWindow(QMainWindow):
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
+        # 背景動作進度 log：Worker.log 過去是死訊號（emit 了沒人接），大資料夾掃描
+        # 只看得到靜止的「掃描中…」，分不出慢跟卡死。
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFont(QFont("Consolas", 9))
+        self.log_view.setFixedHeight(90)
+        self.log_view.setPlaceholderText("背景動作進度會顯示在這裡（掃描/產生/同步…）")
+        lay.addWidget(self.log_view)
+
+    def append_log(self, line: str):
+        self.log_view.appendPlainText(line)
+
+    def _save_folders(self):
+        self.settings.setValue(
+            "scan_folders",
+            [self.folder_list.item(i).text() for i in range(self.folder_list.count())])
+
     def closeEvent(self, event):
         confirm_close_with_worker(self, event)
 
     def _busy(self, b):
         for x in (self.scan_b, self.gen_b, self.archive_mgmt_b, self.audit_b, self.export_b,
                   self.archive_del_b, self.hard_del_b, self.backup_b, self.view_raw_b,
-                  self.known_hosts_b, self.sync_config_b, self.sync_overview_b):
+                  self.known_hosts_b, self.sync_config_b, self.sync_overview_b, self.registry_b):
             x.setEnabled(not b)
         if not b:
             self.on_selection_changed()
@@ -1826,10 +1925,12 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "選擇要掃描的資料夾")
         if d:
             self.folder_list.addItem(d)
+            self._save_folders()
 
     def on_remove_folder(self):
         for it in self.folder_list.selectedItems():
             self.folder_list.takeItem(self.folder_list.row(it))
+        self._save_folders()
 
     # ---------- 掃描 ----------
     def on_scan(self):
@@ -1842,6 +1943,7 @@ class MainWindow(QMainWindow):
         self.status.setStyleSheet("")
         keep_worker_alive(self)
         self.worker = Worker("scan", {"folders": folders})
+        self.worker.log.connect(self.append_log)
         self.worker.result.connect(self.on_scan_result)
         self.worker.done.connect(self.on_scan_done)
         self.worker.start()
@@ -1921,6 +2023,7 @@ class MainWindow(QMainWindow):
         self.status.setStyleSheet("")
         keep_worker_alive(self)
         self.worker = Worker("generate", vals)
+        self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_generate_done)
         self.worker.start()
 
@@ -1948,6 +2051,7 @@ class MainWindow(QMainWindow):
         keep_worker_alive(self)
         self.worker = Worker("delete", {
             "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "hard": False})
+        self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_delete_done)
         self.worker.start()
 
@@ -1966,6 +2070,7 @@ class MainWindow(QMainWindow):
         keep_worker_alive(self)
         self.worker = Worker("delete", {
             "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "hard": True})
+        self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_delete_done)
         self.worker.start()
 
@@ -2000,6 +2105,7 @@ class MainWindow(QMainWindow):
         keep_worker_alive(self)
         self.worker = Worker("backup", {
             "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "dest_dir": d})
+        self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_backup_done)
         self.worker.start()
 
@@ -2022,6 +2128,7 @@ class MainWindow(QMainWindow):
         self._busy(True)
         keep_worker_alive(self)
         self.worker = Worker("read_private_raw", {"path": rec["priv_path"]})
+        self.worker.log.connect(self.append_log)
         self.worker.result.connect(self._show_raw)
         self.worker.done.connect(self._on_view_raw_done)
         self.worker.start()
@@ -2083,6 +2190,10 @@ class MainWindow(QMainWindow):
 
     def on_audit_log(self):
         dlg = AuditLogDialog(self)
+        dlg.exec()
+
+    def on_registry(self):
+        dlg = RegistryDialog(self)
         dlg.exec()
 
     def on_known_hosts(self):
