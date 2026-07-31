@@ -70,6 +70,35 @@ LFS_SUGGEST_BYTES = 5 * 1024 * 1024
 # 新建空倉庫可選套用的 .gitignore 模板：直接沿用下方 GITIGNORE_TEXT（單一真相來源，
 # 過去這裡另有一份精簡 Python 版，兩份同用途模板遲早 drift）。定義在 GITIGNORE_TEXT 之後。
 
+# 需部署到 NAS $BASE/tools/ 並由 DSM 任務排程表排程的 server-side 腳本。
+# repo 裡的副本是唯一受版控的真相來源；NAS 上那份只有在「部署排程腳本」按下去時才更新
+# （跟 CI 引擎的 PATCHED_ENGINE_B64「改了兩地要各自部署」是同一類問題，健檢會比對雜湊抓 drift）。
+TOOL_SCRIPT_NAMES = [
+    "sync_github_mirrors.sh",
+    "ci_daily_violation_report.sh",
+    "git_stats_report.sh",
+    "send_email.py",
+]
+
+
+def tool_script_path(name: str) -> str:
+    """找 server-side 腳本的本機副本路徑，找不到回空字串。
+
+    依序找：PyInstaller onefile 解包目錄（sys._MEIPASS，exe 有把腳本打包進去時）、
+    程式檔所在目錄（從 repo 目錄直接跑 .py 或 exe 放在 repo 裡的情況）。
+    """
+    cands = []
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        cands.append(os.path.join(meipass, name))
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), name))
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), name))
+    for p in cands:
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
 # 本機操作稽核 log：這套工具做的破壞性動作（刪 repo、砍 tag、砍 SSH 金鑰、批次清封存、GC 等）
 # NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
 AUDIT_LOG_PATH = os.path.join(os.path.expanduser("~"), ".nas_git_connector", "audit.log")
@@ -866,6 +895,8 @@ class Worker(QThread):
             self._run_profile_sync_push()
         elif self.mode == "repair":
             self._run_repair()
+        elif self.mode == "deploy_tools":
+            self._run_deploy_tools()
         elif self.mode == "log":
             self._run_log()
         elif self.mode == "create_repo":
@@ -2493,6 +2524,33 @@ class Worker(QThread):
     def _run_healthcheck(self):
         root = self.cfg["remote_root"]
         self.log.emit("--- Git Server 健康檢查 ---")
+        # 排程腳本 drift 檢查：本機先算 repo 副本的 SHA-256（統一 LF，與部署時的正規化一致），
+        # 遠端用 sha256sum 比對。任何一邊讀不到都回報「無法確認」，不得謊稱 [OK]（回報不變量）。
+        tools_lines = ["echo '== 排程腳本 drift 檢查（NAS tools/ vs repo 副本）=='"]
+        for tname in TOOL_SCRIPT_NAMES:
+            tpath = tool_script_path(tname)
+            if not tpath:
+                tools_lines.append(f"echo '[  ] {tname}：本機找不到 repo 副本，無法比對（請從 repo 目錄執行本工具或重建 exe）'")
+                continue
+            try:
+                with open(tpath, "rb") as tf:
+                    digest = hashlib.sha256(tf.read().replace(b"\r\n", b"\n")).hexdigest()
+            except OSError:
+                tools_lines.append(f"echo '[  ] {tname}：本機副本讀取失敗，無法比對'")
+                continue
+            tools_lines += [
+                f"f=\"$BASE/tools/{tname}\"",
+                "if [ ! -f \"$f\" ]; then",
+                f"  echo '[!!] {tname}：NAS 的 tools/ 沒有這支腳本（尚未部署，可用「部署排程腳本」放上去）'",
+                "elif ! command -v sha256sum >/dev/null 2>&1; then",
+                f"  echo '[  ] {tname}：NAS 上沒有 sha256sum，無法確認是否與 repo 副本一致'",
+                f"elif [ \"$(sha256sum \"$f\" | cut -d' ' -f1)\" = '{digest}' ]; then",
+                f"  echo '[OK] {tname}：與 repo 副本一致'",
+                "else",
+                f"  echo '[!!] {tname}：內容與 repo 副本不同（drift——NAS 上可能是舊版，用「部署排程腳本」更新）'",
+                "fi",
+            ]
+        tools_lines.append("echo")
         cmd = "\n".join([
             "echo ___BEGIN___",
             f"BASE='{root}'",
@@ -2584,6 +2642,64 @@ class Worker(QThread):
             "  echo '[OK] 所有 git_devs 帳號的 home 目錄 ACL 正常'",
             "elif [ \"$acl_bad\" = 0 ]; then",
             "  echo \"[  ] 有 $acl_skip 個帳號的 home ACL 因權限不足無法確認（非 root 讀不到別人 home 的 ACL，這台 NAS 對這個身份沒開免密碼 sudo，此處無法補 sudo 問到真相），其餘沒發現異常，不代表全部正常\"",
+            "fi",
+            "echo",
+        ] + tools_lines + [
+            "echo '== 鏡像庫同步新鮮度 =='",
+            "now=$(date +%s)",
+            "m_hits=0; m_total=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  [ \"$(git --git-dir=\"$repo\" config --get remote.origin.mirror 2>/dev/null)\" = true ] || continue",
+            "  m_total=$((m_total+1))",
+            "  n=$(basename \"$repo\")",
+            "  ts=$(stat -c %Y \"$repo/FETCH_HEAD\" 2>/dev/null)",
+            "  if [ -z \"$ts\" ]; then",
+            "    echo \"[  ] $n：找不到 FETCH_HEAD（從未同步過？）\"",
+            "    m_hits=$((m_hits+1))",
+            "  elif [ $(( (now - ts) / 86400 )) -ge 14 ]; then",
+            "    echo \"[  ] $n：已 $(( (now - ts) / 86400 )) 天沒同步（排程還活著嗎？）\"",
+            "    m_hits=$((m_hits+1))",
+            "  fi",
+            "done",
+            "if [ \"$m_total\" = 0 ]; then echo '[OK] 沒有鏡像庫'; elif [ \"$m_hits\" = 0 ]; then echo \"[OK] $m_total 個鏡像庫最近 14 天內都有同步\"; fi",
+            "echo",
+            "echo '== 離站備份狀態 =='",
+            "b_conf=0; b_warn=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  url=$(git --git-dir=\"$repo\" config --get remote.offsite-backup.url 2>/dev/null)",
+            "  [ -n \"$url\" ] || continue",
+            "  b_conf=$((b_conf+1))",
+            "  n=$(basename \"$repo\")",
+            "  last=$(git --git-dir=\"$repo\" config --get nasgit.lastbackup 2>/dev/null)",
+            "  if [ -z \"$last\" ]; then",
+            "    echo \"[  ] $n：設定了離站備份，但沒有成功推送的時戳紀錄（從未推過，或最後一次成功是在加入時戳功能之前）\"",
+            "    b_warn=$((b_warn+1))",
+            "  elif [ $(( (now - last) / 86400 )) -ge 14 ]; then",
+            "    echo \"[  ] $n：離站備份已 $(( (now - last) / 86400 )) 天沒成功推送\"",
+            "    b_warn=$((b_warn+1))",
+            "  fi",
+            "done",
+            "if [ \"$b_conf\" = 0 ]; then echo '[  ] 沒有任何倉庫設定離站備份（NAS 硬碟壞掉時 _archived 也會一起消失）'; elif [ \"$b_warn\" = 0 ]; then echo \"[OK] $b_conf 個設定離站備份的倉庫最近 14 天內都有成功推送\"; fi",
+            "echo",
+            "echo '== 封存區 =='",
+            "if [ -d \"$BASE/_archived\" ] && [ -n \"$(ls -A \"$BASE/_archived\" 2>/dev/null)\" ]; then",
+            "  a_cnt=$(ls -1 \"$BASE/_archived\" 2>/dev/null | wc -l)",
+            "  a_size=$(du -sh \"$BASE/_archived\" 2>/dev/null | cut -f1)",
+            f"  echo \"[  ] 封存區共 $a_cnt 項、佔 $a_size（超過 {ARCHIVE_STALE_DAYS} 天的項目會在封存區清單標示，請定期清理）\"",
+            "else",
+            "  echo '[OK] 封存區是空的'",
+            "fi",
+            "echo",
+            "echo '== 磁碟空間 =='",
+            "pct=$(df \"$BASE\" 2>/dev/null | awk 'NR==2 {gsub(\"%\",\"\",$5); print $5}')",
+            "if [ -z \"$pct\" ]; then",
+            "  echo '[  ] 讀不到磁碟使用率，無法確認'",
+            "elif [ \"$pct\" -ge 90 ] 2>/dev/null; then",
+            "  echo \"[!!] 磁碟使用率已達 $pct%，快滿了——先看「伺服器空間總覽」找大戶\"",
+            "else",
+            "  echo \"[OK] 磁碟使用率 $pct%\"",
             "fi",
             "echo",
             "echo '== 日誌 =='",
@@ -2738,6 +2854,57 @@ class Worker(QThread):
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, "一鍵修復完成。")
+
+    # --- 部署排程腳本到 NAS $BASE/tools/（同 upgrade_engine 的 base64 傳輸＋備份換檔慣例）---
+    def _run_deploy_tools(self):
+        root = self.cfg["remote_root"]
+        found, missing = [], []
+        for name in TOOL_SCRIPT_NAMES:
+            p = tool_script_path(name)
+            if p:
+                found.append((name, p))
+            else:
+                missing.append(name)
+        if not found:
+            self.done.emit(False, "本機找不到任何排程腳本副本（" + "、".join(TOOL_SCRIPT_NAMES) + "）。\n"
+                                  "請從 repo 目錄執行本工具，或用最新 build_exe.bat 重建 exe（會把腳本打包進去）。")
+            return
+        self.log.emit(f"--- 部署排程腳本到 tools/（{len(found)} 支）---")
+        lines = [f"BASE='{root}'", "mkdir -p \"$BASE/tools\""]
+        for name, p in found:
+            try:
+                data = open(p, "rb").read().replace(b"\r\n", b"\n")  # NAS 端是 sh/python，一律 LF
+            except OSError as e:
+                self.log.emit(f"[錯誤] 讀不到本機副本 {p}：{e}")
+                missing.append(name)
+                continue
+            b64 = base64.b64encode(data).decode("ascii")
+            lines += [
+                f"f=\"$BASE/tools/{name}\"",
+                f"printf '%s' '{b64}' | base64 -d > \"$f.new\"",
+                "if [ -s \"$f.new\" ]; then",
+                "  if [ -f \"$f\" ] && cmp -s \"$f\" \"$f.new\"; then",
+                f"    rm -f \"$f.new\"; echo '[SAME] {name}（內容相同，未變更）'",
+                "  else",
+                "    [ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
+                f"    mv \"$f.new\" \"$f\" && chmod 755 \"$f\" && echo '[OK] {name} 已部署'",
+                "  fi",
+                "else",
+                f"  rm -f \"$f.new\"; echo '[FAIL] {name} 解碼失敗'",
+                "fi",
+            ]
+        ok, body, hint = self._ssh_block(lines)
+        if not ok:
+            self.done.emit(False, f"部署失敗：{hint}")
+            return
+        self.hooks.emit(body)
+        nfail = body.count("[FAIL]")
+        note = ""
+        if missing:
+            note = "\n⚠ 本機缺少副本、未部署：" + "、".join(missing)
+        self.done.emit(nfail == 0,
+                       f"排程腳本部署完成（{body.count('[OK]')} 支更新、{body.count('[SAME]')} 支已是最新、{nfail} 支失敗）。{note}\n"
+                       "提醒：DSM「任務排程表」的排程項目要自己掛，這裡只負責把腳本檔放上去/更新。")
 
     # --- 日誌檢視（tail）---
     def _run_log(self):
@@ -6293,6 +6460,11 @@ class MainWindow(QMainWindow):
         self.git_devs_cred_btn = QPushButton("git_devs 密碼留底紀錄…")
         self.git_devs_cred_btn.setToolTip("查看/清除本機留底的 git_devs 新帳號密碼紀錄（明碼檔案）。")
         self.git_devs_cred_btn.clicked.connect(self.on_view_git_devs_creds)
+        self.deploy_tools_btn = QPushButton("部署排程腳本…")
+        self.deploy_tools_btn.setToolTip(
+            "把 repo 內的 server-side 排程腳本（鏡像同步/CI 日報/推送統計/寄信）部署到 NAS 的 tools/，"
+            "舊檔自動備份。DSM 任務排程表的排程項目仍需自行設定一次。")
+        self.deploy_tools_btn.clicked.connect(self.on_deploy_tools)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
         og.addWidget(self.new_user_btn, 0, 2)
@@ -6300,6 +6472,7 @@ class MainWindow(QMainWindow):
         og.addWidget(self.notify_btn, 1, 1)
         og.addWidget(self.git_devs_list_btn, 1, 2)
         og.addWidget(self.git_devs_cred_btn, 2, 0)
+        og.addWidget(self.deploy_tools_btn, 2, 1)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視（最後 200 筆）")
@@ -6718,7 +6891,7 @@ class MainWindow(QMainWindow):
         self.activity_btn.setEnabled(not busy)
         self.ssh_keys_btn.setEnabled(not busy)
         for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.notify_btn,
-                  self.git_devs_list_btn, self.git_devs_cred_btn,
+                  self.git_devs_list_btn, self.git_devs_cred_btn, self.deploy_tools_btn,
                   self.push_log_btn, self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
@@ -7261,6 +7434,18 @@ class MainWindow(QMainWindow):
 
     def on_disk_usage(self):
         self._start_maint("disk_usage", "伺服器空間總覽")
+
+    def on_deploy_tools(self):
+        r = QMessageBox.question(
+            self, "部署排程腳本",
+            "將把 repo 內的 server-side 腳本部署/更新到 NAS 的 tools/：\n"
+            "・" + "\n・".join(TOOL_SCRIPT_NAMES) + "\n\n"
+            "既有檔案會先備份（.bak-時間戳）再覆蓋；內容相同則不動。\n"
+            "DSM 任務排程表的排程項目不會被更動，第一次部署後請自行到 DSM 掛排程。\n確定執行嗎？",
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._start_maint("deploy_tools", "部署排程腳本")
 
     def on_notify_config(self):
         cfg = dict(self.collect_identity_cfg())
