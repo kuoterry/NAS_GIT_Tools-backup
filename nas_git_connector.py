@@ -2314,7 +2314,15 @@ class Worker(QThread):
     def _run_upgrade_engine(self):
         c = self.cfg
         root = c["remote_root"]
-        b64 = PATCHED_ENGINE_B64
+        # 引擎腳本內寫死 BASE="/volume1/Git_Server"；若目前 remote_root 不同，
+        # 部署前先改寫，否則引擎會讀不到 ci_policies/<repo>.policy → POLICY 空
+        # → 靜默放行所有 push（跟沒裝一樣，且完全看不出來）。
+        eng_src = base64.b64decode(PATCHED_ENGINE_B64).decode("utf-8")
+        eng_src, n_sub = re.subn(r"(?m)^BASE=.*$", f'BASE="{root}"', eng_src, count=1)
+        if n_sub != 1:
+            self.done.emit(False, "內建 CI 引擎內容異常（找不到 BASE= 行），已中止升級。")
+            return
+        b64 = base64.b64encode(eng_src.encode("utf-8")).decode("ascii")
         self.log.emit("--- 升級 CI 引擎 pre-receive.ci（自動備份 + 換檔）---")
         # 用 base64 傳輸避免引號/換行問題；先解碼到 .new，做健全性檢查，備份舊檔後再換上。
         cmd = "\n".join([
