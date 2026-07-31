@@ -293,8 +293,8 @@ def _login_precondition_selfcheck(username: str) -> list:
 
     只檢查、印警告，不重覆做已經在腳本前面做過的修正動作（shell 強制設定、
     chown/chmod/synoacltool 都已經在前面步驟做過），這裡純粹是跑完後的總結。
-    CreateGitDevsUserDialog（新帳號）、AddKeyForUserDialog（補金鑰）都呼叫這個共用片段，
-    確保兩邊的檢查清單不會慢慢長歪、各自遺漏。"""
+    CreateGitDevsUserDialog（新帳號）、AddKeyForUserDialog（補金鑰）、RotateKeyDialog（輪替）
+    都呼叫這個共用片段，確保三邊的檢查清單不會慢慢長歪、各自遺漏。"""
     return [
         "# ---- 登入前置條件自我檢查（已知會擋 SSH 金鑰登入的項目，一次列出）----",
         f'SHELL_NOW=$(grep "^{username}:" /etc/passwd | cut -d: -f7)',
@@ -5187,12 +5187,20 @@ class RotateKeyDialog(QDialog):
             'echo "偵測到的 home 目錄：$HOME_DIR"',
             'AK="$HOME_DIR/.ssh/authorized_keys"',
             "",
-            "# 2) 動手前先備份原檔",
+            "# 2) 登入前置條件修正（與建帳號/補金鑰腳本同一套；輪替完才發現新鑰匙登不進去最冤枉）",
+            "#    /sbin/nologin 會擋掉所有透過 SSH 執行的指令（含 git push）；home 目錄的 Synology ACL",
+            "#    不乾淨、或擁有者不是本人，sshd 會整個無聲忽略 authorized_keys、退回密碼登入（不報錯）。",
+            f"sudo sed -i 's#^\\({self.username}:.*:\\)/sbin/nologin$#\\1/bin/sh#' /etc/passwd",
+            'sudo synoacltool -del "$HOME_DIR"',
+            'sudo chmod 700 "$HOME_DIR"',
+            f'sudo chown {self.username}:users "$HOME_DIR"',
+            "",
+            "# 3) 動手前先備份原檔",
             'sudo mkdir -p "$HOME_DIR/.ssh"',
             'sudo touch "$AK"',
             'sudo cp "$AK" "$AK.bak-$(date +%Y%m%d-%H%M%S)"',
             "",
-            "# 3) 加入新公鑰（若已存在則跳過，不重複加入）",
+            "# 4) 加入新公鑰（若已存在則跳過，不重複加入）",
             "NEWKEY=$(cat <<'EOF'",
             new_pubkey,
             "EOF",
@@ -5207,7 +5215,7 @@ class RotateKeyDialog(QDialog):
         if old_pubkey:
             lines += [
                 "",
-                "# 4) 撤銷舊公鑰（找不到也不會報錯，就當作本來就不在）",
+                "# 5) 撤銷舊公鑰（找不到也不會報錯，就當作本來就不在）",
                 "OLDKEY=$(cat <<'EOF'",
                 old_pubkey,
                 "EOF",
@@ -5219,13 +5227,15 @@ class RotateKeyDialog(QDialog):
         else:
             lines += [
                 "",
-                "# 4) 沒有填舊公鑰，跳過撤銷這步（只新增，不撤銷任何既有金鑰）",
+                "# 5) 沒有填舊公鑰，跳過撤銷這步（只新增，不撤銷任何既有金鑰）",
             ]
         lines += [
             "",
             'sudo chmod 700 "$HOME_DIR/.ssh"',
             'sudo chmod 600 "$AK"',
             f'sudo chown -R {self.username}:users "$HOME_DIR/.ssh"',
+            "",
+        ] + _login_precondition_selfcheck(self.username) + [
             "",
             "# 完成後記得：確認新鑰匙能登入、舊鑰匙不能登入，再回 Key_Management 把舊金鑰標記封存/刪除。",
         ]
