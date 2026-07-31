@@ -262,15 +262,20 @@ def parse_ppk_pubkey(path: str):
     key_type = None
     comment = ""
     pub_b64_lines = []
-    for i, ln in enumerate(lines):
-        if ln.startswith("PuTTY-User-Key-File-"):
-            key_type = ln.split(":", 1)[1].strip()
-        elif ln.startswith("Comment:"):
-            comment = ln.split(":", 1)[1].strip()
-        elif ln.startswith("Public-Lines:"):
-            count = int(ln.split(":", 1)[1].strip())
-            pub_b64_lines = lines[i + 1:i + 1 + count]
-            break
+    try:
+        # 整段解析都在 try 裡：一個被截斷/手改壞的 .ppk 只該讓「這個檔」解析失敗，
+        # 不能讓 int()/IndexError 炸穿 build_records 導致整次掃描零筆結果。
+        for i, ln in enumerate(lines):
+            if ln.startswith("PuTTY-User-Key-File-"):
+                key_type = ln.split(":", 1)[1].strip()
+            elif ln.startswith("Comment:"):
+                comment = ln.split(":", 1)[1].strip()
+            elif ln.startswith("Public-Lines:"):
+                count = int(ln.split(":", 1)[1].strip())
+                pub_b64_lines = lines[i + 1:i + 1 + count]
+                break
+    except (ValueError, IndexError):
+        return None
     if not key_type or not pub_b64_lines:
         return None
     try:
@@ -281,7 +286,12 @@ def parse_ppk_pubkey(path: str):
 
 
 def derive_pubkey_via_sshkeygen(path: str):
-    """只對「已確認未加密」的私鑰呼叫，純本機執行，不會把檔案內容傳到任何地方。"""
+    """只對「已確認未加密」的私鑰呼叫，純本機執行，不會把檔案內容傳到任何地方。
+
+    回傳 (公鑰行或 None, 失敗原因字串)——「沒裝 ssh-keygen」「逾時」「金鑰壞了」是
+    三種不同的問題，全部折成同一句「無法自動推導」會讓使用者無從下手。"""
+    if not shutil.which("ssh-keygen"):
+        return None, "找不到 ssh-keygen（未安裝 OpenSSH 用戶端）"
     try:
         cp = subprocess.run(
             ["ssh-keygen", "-y", "-f", path],
@@ -289,16 +299,33 @@ def derive_pubkey_via_sshkeygen(path: str):
             creationflags=_NO_WINDOW,
         )
         if cp.returncode == 0 and cp.stdout.strip():
-            return cp.stdout.strip()
-    except Exception:
-        pass
-    return None
+            return cp.stdout.strip(), ""
+        return None, (cp.stderr or "").strip().splitlines()[-1] if (cp.stderr or "").strip() else f"rc={cp.returncode}"
+    except subprocess.TimeoutExpired:
+        return None, "ssh-keygen 逾時（可能在等 passphrase？）"
+    except OSError as e:
+        return None, str(e)
 
 
-def scan_folder(folder: str):
-    """遞迴掃描資料夾，依副檔名/內容判斷分成公鑰／私鑰／ppk 三類路徑清單。"""
+# 掃描時直接跳過的大型雜訊目錄（加大資料夾如 Documents 時不用每檔讀 16KB）
+SKIP_DIRNAMES = {".git", "node_modules", "__pycache__", ".venv", "venv", "$RECYCLE.BIN"}
+
+
+def scan_folder(folder: str, errors: list = None):
+    """遞迴掃描資料夾，依副檔名/內容判斷分成公鑰／私鑰／ppk 三類。
+
+    回傳 (pub_files, priv_files, ppk_files, priv_info)：priv_info 是
+    {path: classify_private_key_file() 結果}，讓 build_records 不用對同一個
+    私鑰檔再讀第二次。讀不進去的子目錄記到 errors（不再無聲跳過）。"""
     pub_files, priv_files, ppk_files = [], [], []
-    for root, _dirs, files in os.walk(folder):
+    priv_info = {}
+
+    def _on_walk_error(err):
+        if errors is not None:
+            errors.append(f"{getattr(err, 'filename', '?')}：{getattr(err, 'strerror', err)}")
+
+    for root, dirs, files in os.walk(folder, onerror=_on_walk_error):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRNAMES]
         for name in files:
             if name in SKIP_FILENAMES:
                 continue
@@ -308,9 +335,11 @@ def scan_folder(folder: str):
             elif name.endswith(".ppk"):
                 ppk_files.append(path)
             else:
-                if classify_private_key_file(path):
+                info = classify_private_key_file(path)
+                if info:
                     priv_files.append(path)
-    return pub_files, priv_files, ppk_files
+                    priv_info[path] = info
+    return pub_files, priv_files, ppk_files, priv_info
 
 
 def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict = None, this_host: str = "") -> str:
@@ -333,7 +362,8 @@ def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict 
         if rec.get("priv_encrypted"):
             notes.append("ℹ 私鑰已加密且找不到公鑰，需密碼才能取得指紋")
         else:
-            notes.append("⚠ 找不到公鑰且無法自動推導")
+            reason = rec.get("derive_error", "")
+            notes.append("⚠ 找不到公鑰且無法自動推導" + (f"（{reason}）" if reason else ""))
     if rec.get("derived"):
         notes.append("✔ 已自動從私鑰推導出公鑰")
     mtime = rec.get("mtime")
@@ -502,16 +532,35 @@ def delete_known_hosts_entry(line_no: int, path: str = KNOWN_HOSTS_PATH):
     return True, f"已刪除第 {line_no + 1} 行（原檔已備份到 {backup_path}）"
 
 
-def build_records(folders):
-    """掃描所有資料夾，配對公私鑰、補齊指紋/強度/時間/建議，回傳紀錄清單。"""
-    all_pub, all_priv, all_ppk = [], [], []
+def build_records(folders, errors: list = None):
+    """掃描所有資料夾，配對公私鑰、補齊指紋/強度/時間/建議，回傳紀錄清單。
+
+    folders 先正規化去重、並丟掉已被其他選取資料夾涵蓋的巢狀資料夾——同一資料夾
+    加兩次（或同時加 ~ 和 ~/.ssh）會讓 .ppk 出現幽靈重複紀錄，還觸發假的
+    「指紋相同」警告。errors 收 os.walk 讀不進去的子目錄清單。"""
+    normed = []
     for folder in folders:
         if not os.path.isdir(folder):
             continue
-        p, pr, pk = scan_folder(folder)
+        nf = _norm_path(folder)
+        if nf not in normed:
+            normed.append(nf)
+    roots = [f for f in normed
+             if not any(f != g and (f + os.sep).startswith(g + os.sep) for g in normed)]
+
+    all_pub, all_priv, all_ppk = [], [], []
+    priv_info_map = {}
+    seen_ppk = set()
+    for folder in roots:
+        p, pr, pk, pinfo = scan_folder(folder, errors=errors)
         all_pub += p
         all_priv += pr
-        all_ppk += pk
+        priv_info_map.update(pinfo)
+        for x in pk:
+            nx = _norm_path(x)
+            if nx not in seen_ppk:
+                seen_ppk.add(nx)
+                all_ppk.append(x)
 
     def base_key(path):
         d = os.path.dirname(path)
@@ -534,16 +583,18 @@ def build_records(folders):
             if parsed:
                 rec.update(type=parsed["type"], blob=parsed["blob"], comment=parsed["comment"])
         if priv_path:
-            priv_info = classify_private_key_file(priv_path)
+            priv_info = priv_info_map.get(priv_path) or classify_private_key_file(priv_path)
             rec["priv_format"] = priv_info["format"] if priv_info else "?"
             rec["priv_encrypted"] = priv_info["encrypted"] if priv_info else None
             if not pub_path and priv_info and priv_info["encrypted"] is False:
-                derived = derive_pubkey_via_sshkeygen(priv_path)
+                derived, derive_err = derive_pubkey_via_sshkeygen(priv_path)
                 if derived:
                     parsed = parse_pubkey_line(derived)
                     if parsed:
                         rec.update(type=parsed["type"], blob=parsed["blob"],
                                    comment=parsed["comment"], derived=True)
+                else:
+                    rec["derive_error"] = derive_err
         records.append(rec)
 
     for ppk_path in all_ppk:
@@ -884,7 +935,12 @@ class Worker(QThread):
     def _run_scan(self):
         folders = self.params.get("folders", [])
         self.log.emit(f"掃描 {len(folders)} 個資料夾中…")
-        records = build_records(folders)
+        walk_errors = []
+        records = build_records(folders, errors=walk_errors)
+        for we in walk_errors[:20]:
+            self.log.emit(f"⚠ 讀不到：{we}")
+        if len(walk_errors) > 20:
+            self.log.emit(f"⚠ 共 {len(walk_errors)} 個位置讀不到（僅列前 20）")
         # 名冊更新失敗（磁碟滿/權限）不該吃掉整份掃描結果——表格照樣顯示，訊息帶警語
         reg_note = ""
         try:
@@ -905,6 +961,10 @@ class Worker(QThread):
             return
         if os.path.exists(path) or os.path.exists(path + ".pub"):
             self.done.emit(False, f"檔案已存在，未覆蓋：{path}")
+            return
+        if not shutil.which("ssh-keygen"):
+            self.done.emit(False, "找不到 ssh-keygen——請先安裝 Windows 內建 OpenSSH 用戶端"
+                                  "（設定 → 應用程式 → 選用功能），再重試。")
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         args = ["ssh-keygen", "-t", key_type, "-N", passphrase, "-C", comment, "-f", path]
