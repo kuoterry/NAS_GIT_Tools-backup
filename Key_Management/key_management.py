@@ -598,18 +598,41 @@ def build_records(folders):
 # 本機金鑰名冊（持久化歷史紀錄，即使金鑰被刪除也保留曾經存在過的記錄）
 # ============================================================
 
+HISTORY_CAP = 200  # 每個條目的 history 事件上限，超過丟最舊的（防止名冊與同步 payload 無限成長）
+
+
+def _cap_history(history: list) -> list:
+    return history[-HISTORY_CAP:] if len(history) > HISTORY_CAP else history
+
+
 def load_registry():
+    """讀名冊。檔案損壞時把原檔改名保留（.corrupt-時戳）再回空 dict——
+    不然下一次 save_registry 會直接用「只剩本次掃描」的內容蓋掉整份歷史，
+    使用者完全不會知道曾經有一份更完整的紀錄存在過。"""
     try:
         with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        try:
+            os.replace(REGISTRY_PATH, REGISTRY_PATH + f".corrupt-{ts}")
+            audit_log("registry_corrupt", f"registry.json 無法解析，已改名保留為 registry.json.corrupt-{ts}")
+        except OSError:
+            pass
+        return {}
+    except OSError:
         return {}
 
 
 def save_registry(reg: dict):
+    """原子寫入：先寫暫存檔再 os.replace，中途斷電/當機不會留下半份 JSON。"""
     os.makedirs(APP_DIR, exist_ok=True)
-    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+    tmp = REGISTRY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, REGISTRY_PATH)
 
 
 def update_registry_from_scan(records):
@@ -634,12 +657,27 @@ def update_registry_from_scan(records):
             "priv_encrypted": rec.get("priv_encrypted"),
             "status": "active",
         })
-        entry.setdefault("history", []).append({"ts": now, "action": "scanned"})
+        hist = entry.setdefault("history", [])
+        # 「每次掃描都記一筆 scanned」會讓 history 無限成長、同步 payload 跟著爆炸；
+        # 只在狀態有意義變化時記（第一次看到、或從 missing 回到 active）。
+        if not hist or hist[-1].get("action") != "scanned":
+            hist.append({"ts": now, "action": "scanned"})
+        entry["history"] = _cap_history(hist)
         reg[key] = entry
+    hostname = socket.gethostname() or "UNKNOWN"
     for key, entry in reg.items():
-        if key not in seen_keys and entry.get("status") == "active":
-            entry["status"] = "missing"
-            entry.setdefault("history", []).append({"ts": now, "action": "missing_from_scan"})
+        if key in seen_keys or entry.get("status") != "active":
+            continue
+        # 從別台機器同步進來的條目本機本來就掃不到，不能翻成 missing——
+        # 否則每次掃描都把外機金鑰標失蹤再推回 NAS，跨機器狀態整個爛掉。
+        hosts = entry.get("seen_hosts") or {}
+        if hosts and hostname not in hosts:
+            continue
+        entry["status"] = "missing"
+        hist = entry.setdefault("history", [])
+        if not hist or hist[-1].get("action") != "missing_from_scan":
+            hist.append({"ts": now, "action": "missing_from_scan"})
+        entry["history"] = _cap_history(hist)
     save_registry(reg)
     return reg
 
@@ -682,7 +720,7 @@ def read_nas_git_connector_profiles():
     return result
 
 
-def _sync_ssh(sync_cfg: dict, remote_cmd: str):
+def _sync_ssh(sync_cfg: dict, remote_cmd: str, input_text: str = ""):
     """對 NAS 執行遠端指令，只走 SSH 金鑰登入，不支援密碼——這支工具本來就只有
     ssh-keygen 這一個 subprocess 依賴，刻意不加 plink/密碼分支，比照
     nas_git_connector.py 的 _ssh() 但精簡到只剩同步需要的這一條路徑。"""
@@ -698,7 +736,7 @@ def _sync_ssh(sync_cfg: dict, remote_cmd: str):
     ]
     try:
         cp = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=30,
+                             errors="replace", timeout=60, input=input_text,
                              creationflags=_NO_WINDOW if os.name == "nt" else 0)
         return cp.returncode, cp.stdout, cp.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -715,10 +753,17 @@ def _between(text: str) -> str:
     return text[start + len("___BEGIN___"):end].strip("\n")
 
 
+# 描述「這台機器的磁碟現況」的欄位——合併時永遠以本機值為準，不能被另一台
+# 機器「較新的 last_seen」整筆蓋掉：路徑/格式/狀態在別台機器上是另一回事，
+# 蓋過來會讓報表指向不存在的檔案，連帶弄壞 nas_git_connector 讀 pub_path 的匯入橋。
+MACHINE_LOCAL_FIELDS = ("pub_path", "priv_path", "priv_format", "priv_encrypted", "status")
+
+
 def merge_registries(local: dict, remote: dict, hostname: str):
     """合併本機與雲端的金鑰名冊。key 選法跟 update_registry_from_scan 一致（指紋或路徑
-    後備）。每筆依 last_seen 較新的欄位為準；history 串接去重；seen_hosts（這把鑰匙在
-    哪些電腦出現過）一律聯集、只加不減，本機這次同步時把自己也蓋進去。"""
+    後備）。中繼欄位依 last_seen 較新者為準，但 MACHINE_LOCAL_FIELDS 一律保留本機值；
+    history 串接去重（上限 HISTORY_CAP）；seen_hosts（這把鑰匙在哪些電腦出現過）一律
+    聯集、只加不減，本機這次同步時把自己也蓋進去。"""
     merged = {}
     for key in set(local) | set(remote):
         l, r = local.get(key), remote.get(key)
@@ -728,6 +773,9 @@ def merge_registries(local: dict, remote: dict, hostname: str):
             entry = dict(r)
         else:
             entry = dict(r if (r.get("last_seen") or "") > (l.get("last_seen") or "") else l)
+            for fld in MACHINE_LOCAL_FIELDS:
+                if fld in l:
+                    entry[fld] = l[fld]
             firsts = [x for x in (l.get("first_seen"), r.get("first_seen")) if x]
             if firsts:
                 entry["first_seen"] = min(firsts)
@@ -738,7 +786,7 @@ def merge_registries(local: dict, remote: dict, hostname: str):
                 if pair not in seen_pairs:
                     history.append(h)
                     seen_pairs.add(pair)
-            entry["history"] = history
+            entry["history"] = _cap_history(history)
         seen_hosts = dict((l or {}).get("seen_hosts") or {})
         seen_hosts.update((r or {}).get("seen_hosts") or {})
         if l:
@@ -794,9 +842,14 @@ class Worker(QThread):
         folders = self.params.get("folders", [])
         self.log.emit(f"掃描 {len(folders)} 個資料夾中…")
         records = build_records(folders)
-        update_registry_from_scan(records)
+        # 名冊更新失敗（磁碟滿/權限）不該吃掉整份掃描結果——表格照樣顯示，訊息帶警語
+        reg_note = ""
+        try:
+            update_registry_from_scan(records)
+        except OSError as e:
+            reg_note = f"\n⚠ 名冊 registry.json 更新失敗（{e}），本次掃描結果只顯示、未記錄。"
         self.result.emit(records)
-        self.done.emit(True, f"掃描完成，共找到 {len(records)} 組金鑰。")
+        self.done.emit(True, f"掃描完成，共找到 {len(records)} 組金鑰。" + reg_note)
 
     def _run_generate(self):
         path = self.params.get("path", "")
@@ -958,6 +1011,9 @@ class Worker(QThread):
         if not remote_root:
             self.done.emit(False, "同步設定未填 remote_root，請先到「⚙ 雲端同步設定…」設定。")
             return
+        if "'" in remote_root or "\n" in remote_root:
+            self.done.emit(False, "remote_root 含引號/換行等不安全字元，請修正同步設定。")
+            return
         hostname = socket.gethostname() or "UNKNOWN"
         self.log.emit("--- 跨機器同步金鑰名冊 ---")
 
@@ -979,19 +1035,29 @@ class Worker(QThread):
 
         local_reg = load_registry()
         merged = merge_registries(local_reg, remote_reg, hostname)
+        # 合併結果要蓋掉本機名冊前先留一份備份——遠端那份若是壞的/舊的/別台機器
+        # 誤推的，這是唯一能把本機歷史找回來的路（NAS 端推送本來就有 .bak，本機比照）。
+        if os.path.isfile(REGISTRY_PATH):
+            try:
+                shutil.copy2(REGISTRY_PATH, REGISTRY_PATH + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+            except OSError as e:
+                self.done.emit(False, f"本機名冊備份失敗（{e}），為安全起見中止同步。")
+                return
         save_registry(merged)
 
         payload = json.dumps(merged, ensure_ascii=False)
         b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        # b64 從 stdin 餵進去，不放 argv——名冊會隨 history 成長，Windows 命令列
+        # 有 32767 字元上限，塞 argv 遲早在某次掃描後永久炸掉同步。
         push_cmd = "\n".join([
             f"d='{remote_root}/config'; f=\"$d/km_registry_sync.json\"",
             "mkdir -p \"$d\"",
             "[ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
-            f"printf '%s' '{b64}' | base64 -d > \"$f\"",
+            "base64 -d > \"$f.new\" && [ -s \"$f.new\" ] && mv \"$f.new\" \"$f\"",
             "chmod 600 \"$f\"",
             "echo ___OK___",
         ])
-        rc2, out2, err2 = _sync_ssh(sync_cfg, push_cmd)
+        rc2, out2, err2 = _sync_ssh(sync_cfg, push_cmd, input_text=b64)
         if rc2 != 0 or "___OK___" not in out2:
             self.done.emit(False, f"推送雲端金鑰名冊失敗：{(err2 or out2).strip()}")
             return
