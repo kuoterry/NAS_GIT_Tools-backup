@@ -42,7 +42,14 @@ if errorlevel 1 (
 echo.
 
 echo [2/3] Packaging...
-%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name NasGitConnector nas_git_connector.py
+rem --add-data: bundle the server-side scheduled scripts so the frozen exe can
+rem deploy them to NAS tools/ and hash-compare them in the health check.
+%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name NasGitConnector ^
+  --add-data "sync_github_mirrors.sh;." ^
+  --add-data "ci_daily_violation_report.sh;." ^
+  --add-data "git_stats_report.sh;." ^
+  --add-data "send_email.py;." ^
+  nas_git_connector.py
 if errorlevel 1 (
   echo [ERROR] Packaging failed. See messages above.
   pause

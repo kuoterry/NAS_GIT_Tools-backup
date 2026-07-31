@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.6.1"
+__version__ = "2.7.0"
 
 import os
 import sys
@@ -35,6 +35,10 @@ import string
 import json
 import urllib.request
 import urllib.error
+import traceback
+import threading
+import time
+import tempfile
 from datetime import datetime, timezone
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
@@ -63,16 +67,37 @@ ARCHIVE_STALE_DAYS = 90
 # 健康檢查用：單一檔案超過這個大小（bytes）就建議改用 Git LFS，僅提醒不自動處理。
 LFS_SUGGEST_BYTES = 5 * 1024 * 1024
 
-# 新建空倉庫可選套用的 .gitignore 模板（Python 專案常見規則）。
-GITIGNORE_TEMPLATE = """__pycache__/
-*.pyc
-.venv/
-venv/
-build/
-dist/
-*.egg-info/
-.DS_Store
-"""
+# 新建空倉庫可選套用的 .gitignore 模板：直接沿用下方 GITIGNORE_TEXT（單一真相來源，
+# 過去這裡另有一份精簡 Python 版，兩份同用途模板遲早 drift）。定義在 GITIGNORE_TEXT 之後。
+
+# 需部署到 NAS $BASE/tools/ 並由 DSM 任務排程表排程的 server-side 腳本。
+# repo 裡的副本是唯一受版控的真相來源；NAS 上那份只有在「部署排程腳本」按下去時才更新
+# （跟 CI 引擎的 PATCHED_ENGINE_B64「改了兩地要各自部署」是同一類問題，健檢會比對雜湊抓 drift）。
+TOOL_SCRIPT_NAMES = [
+    "sync_github_mirrors.sh",
+    "ci_daily_violation_report.sh",
+    "git_stats_report.sh",
+    "send_email.py",
+]
+
+
+def tool_script_path(name: str) -> str:
+    """找 server-side 腳本的本機副本路徑，找不到回空字串。
+
+    依序找：PyInstaller onefile 解包目錄（sys._MEIPASS，exe 有把腳本打包進去時）、
+    程式檔所在目錄（從 repo 目錄直接跑 .py 或 exe 放在 repo 裡的情況）。
+    """
+    cands = []
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        cands.append(os.path.join(meipass, name))
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), name))
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), name))
+    for p in cands:
+        if os.path.isfile(p):
+            return p
+    return ""
+
 
 # 本機操作稽核 log：這套工具做的破壞性動作（刪 repo、砍 tag、砍 SSH 金鑰、批次清封存、GC 等）
 # NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
@@ -94,14 +119,39 @@ def save_git_devs_credential(admin_user: str, host: str, new_username: str, pass
         pass
 
 
-def audit_log(user: str, host: str, action: str, detail: str):
+def audit_log(user: str, host: str, action: str, detail: str) -> bool:
+    """把一筆破壞性操作寫進本機稽核 log；寫入失敗回傳 False 並跳一次性警告。
+
+    這個檔案是刪 repo / 砍 tag 等動作唯一的本機紀錄，寫不進去不能靜默吞掉——
+    每個 session 至少要讓使用者知道一次稽核已中斷（之後同 session 不重複跳窗）。
+    """
+    global _AUDIT_LOG_WARNED
     try:
         os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"{ts}\t{user}@{host}\t{action}\t{detail}\n")
-    except OSError:
-        pass
+        return True
+    except OSError as e:
+        if not _AUDIT_LOG_WARNED:
+            _AUDIT_LOG_WARNED = True
+            try:
+                app = QApplication.instance()
+                # audit_log 也會從 Worker 執行緒被呼叫（如 _run_repo_gc），
+                # QMessageBox 只能在 UI 執行緒跳，其餘情況退回 stderr。
+                if app is not None and QThread.currentThread() is app.thread():
+                    QMessageBox.warning(
+                        None, "稽核紀錄寫入失敗",
+                        f"無法寫入本機稽核紀錄：\n{AUDIT_LOG_PATH}\n\n{e}\n\n"
+                        "破壞性操作將不會留下本機紀錄（本次啟動期間只提醒這一次）。")
+                else:
+                    print(f"[WARN] 稽核紀錄寫入失敗：{AUDIT_LOG_PATH}：{e}", file=sys.stderr)
+            except Exception:
+                pass
+        return False
+
+
+_AUDIT_LOG_WARNED = False
 
 # ============================================================
 # 預設身份(Profile)：第一次執行會自動建立。
@@ -264,8 +314,8 @@ def _login_precondition_selfcheck(username: str) -> list:
 
     只檢查、印警告，不重覆做已經在腳本前面做過的修正動作（shell 強制設定、
     chown/chmod/synoacltool 都已經在前面步驟做過），這裡純粹是跑完後的總結。
-    CreateGitDevsUserDialog（新帳號）、AddKeyForUserDialog（補金鑰）都呼叫這個共用片段，
-    確保兩邊的檢查清單不會慢慢長歪、各自遺漏。"""
+    CreateGitDevsUserDialog（新帳號）、AddKeyForUserDialog（補金鑰）、RotateKeyDialog（輪替）
+    都呼叫這個共用片段，確保三邊的檢查清單不會慢慢長歪、各自遺漏。"""
     return [
         "# ---- 登入前置條件自我檢查（已知會擋 SSH 金鑰登入的項目，一次列出）----",
         f'SHELL_NOW=$(grep "^{username}:" /etc/passwd | cut -d: -f7)',
@@ -510,6 +560,9 @@ Desktop.ini
 *.tmp
 """
 
+# 新建空倉庫的模板與串接流程共用同一份內容（單一真相來源）
+GITIGNORE_TEMPLATE = GITIGNORE_TEXT
+
 
 # ============================================================
 # 小工具：路徑判斷
@@ -560,10 +613,19 @@ class Worker(QThread):
     repos = pyqtSignal(list)      # 列出倉庫用：回傳 repo 名稱清單
     hooks = pyqtSignal(str)       # 讀 CI hook 用：回傳 hook 內容文字
 
+    # plink 是否支援 -pwfile（PuTTY 0.77+）。None=未知（先試 -pwfile），False=確定不支援。
+    _plink_pwfile_ok = None
+
     def __init__(self, cfg: dict, mode: str = "connect"):
         super().__init__()
         self.cfg = cfg
         self.mode = mode  # "connect" 串接 / "test" 測連線 / "list" 列出倉庫
+        self._cancel_requested = False
+        self._pw_file = None  # plink -pwfile 用的暫存密碼檔，run() 結束時刪除
+
+    def cancel(self):
+        """要求中止目前操作：正在跑的子程序會被砍掉，_run 回傳 rc=125。"""
+        self._cancel_requested = True
 
     # --- 執行外部指令的統一入口 ---
     def _mask(self, a):
@@ -573,26 +635,100 @@ class Worker(QThread):
             return "****"
         return a
 
-    def _run(self, args, cwd=None, input_bytes=None, env=None):
+    def _run(self, args, cwd=None, input_bytes=None, env=None, timeout=None):
+        """執行子程序：輸出逐行即時 emit（長操作不再整段黑箱等待）、支援逾時與取消。
+
+        回傳 (rc, out, err)。特殊 rc：124=逾時強制結束、125=使用者取消。
+        timeout=None 表示不設限（僅留給本機互動性極低的操作；遠端一律給逾時）。
+        """
         self.log.emit("$ " + " ".join(self._mask(a) for a in args))
         try:
-            cp = subprocess.run(
-                args, cwd=cwd, capture_output=True, input=input_bytes,
-                env=env, creationflags=_NO_WINDOW
+            proc = subprocess.Popen(
+                args, cwd=cwd, env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=_NO_WINDOW,
             )
         except FileNotFoundError as e:
             self.log.emit(f"[錯誤] 找不到執行檔：{e}")
             return 127, "", str(e)
-        out = cp.stdout.decode("utf-8", "replace").strip()
-        err = cp.stderr.decode("utf-8", "replace").strip()
-        if out:
-            self.log.emit(out)
-        if err:
-            self.log.emit(err)
-        return cp.returncode, out, err
+        try:
+            if input_bytes:
+                proc.stdin.write(input_bytes)
+                proc.stdin.flush()
+            proc.stdin.close()
+        except OSError:
+            pass
 
-    def _ssh(self, remote_cmd):
-        """對 NAS 執行遠端指令。有密碼→用 plink -pw；無密碼→用內建 ssh（金鑰，若這個身份
+        out_lines, err_lines = [], []
+
+        def _reader(stream, sink):
+            """把子程序的一條輸出流逐行收進 sink 並即時丟到 log 視窗。"""
+            for raw in iter(stream.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                sink.append(line)
+                if line:
+                    self.log.emit(line)
+            stream.close()
+
+        t_out = threading.Thread(target=_reader, args=(proc.stdout, out_lines), daemon=True)
+        t_err = threading.Thread(target=_reader, args=(proc.stderr, err_lines), daemon=True)
+        t_out.start()
+        t_err.start()
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        killed_reason = None
+        while proc.poll() is None:
+            if self._cancel_requested:
+                killed_reason = "cancel"
+                break
+            if deadline is not None and time.monotonic() > deadline:
+                killed_reason = "timeout"
+                break
+            time.sleep(0.1)
+        if killed_reason:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait()
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+        out = "\n".join(out_lines).strip()
+        err = "\n".join(err_lines).strip()
+        if killed_reason == "cancel":
+            self.log.emit("[中止] 使用者取消，已強制結束子程序")
+            return 125, out, "cancelled"
+        if killed_reason == "timeout":
+            self.log.emit(f"[錯誤] 執行逾時（超過 {timeout} 秒），已強制結束")
+            return 124, out, err or "timeout"
+        return proc.returncode, out, err
+
+    # 遠端指令預設逾時：一般操作 10 分鐘該夠；gc/fsck/同步鏡像等長操作各自傳更大的值。
+    SSH_DEFAULT_TIMEOUT = 600
+
+    def _plink_pw_args(self, pw):
+        """回傳 plink 的密碼參數。優先用 -pwfile（密碼不進命令列，避免同機任何
+        程序用 Win32_Process.CommandLine 直接讀到明碼）；偵測到舊版 plink 不支援
+        時退回 -pw。密碼檔放使用者暫存目錄，run() 結束時刪除。"""
+        if Worker._plink_pwfile_ok is False:
+            return ["-pw", pw]
+        if self._pw_file is None:
+            fd, path = tempfile.mkstemp(prefix="nasgit_pw_")
+            with os.fdopen(fd, "w", encoding="ascii", errors="replace") as f:
+                f.write(pw)
+            self._pw_file = path
+        return ["-pwfile", self._pw_file]
+
+    def _cleanup_pw_file(self):
+        if self._pw_file:
+            try:
+                os.remove(self._pw_file)
+            except OSError:
+                pass
+            self._pw_file = None
+
+    def _ssh(self, remote_cmd, timeout=SSH_DEFAULT_TIMEOUT):
+        """對 NAS 執行遠端指令。有密碼→用 plink；無密碼→用內建 ssh（金鑰，若這個身份
         指定了私鑰檔就明確帶 -i，避免 SSH 只憑預設檔名/agent 猜不到非預設命名的金鑰）。"""
         c = self.cfg
         ssh_host = f"{c['user']}@{c['host']}"
@@ -607,19 +743,31 @@ class Worker(QThread):
                 )
                 return 255, "", "plink-missing"
             # 餵 y\n 以在首次連線時自動接受主機金鑰（之後會被 PuTTY 快取）
-            args = [plink, "-pw", pw, ssh_host, remote_cmd]
-            return self._run(args, input_bytes=b"y\n")
+            args = [plink] + self._plink_pw_args(pw) + [ssh_host, remote_cmd]
+            rc, out, err = self._run(args, input_bytes=b"y\n", timeout=timeout)
+            if rc != 0 and Worker._plink_pwfile_ok is None and "-pwfile" in (err or ""):
+                # 舊版 plink 不認得 -pwfile：記住這件事，這次直接用 -pw 重跑一遍。
+                Worker._plink_pwfile_ok = False
+                self.log.emit("[提示] 此版 plink 不支援 -pwfile，退回 -pw（建議升級 PuTTY ≥ 0.77）")
+                args = [plink, "-pw", pw, ssh_host, remote_cmd]
+                rc, out, err = self._run(args, input_bytes=b"y\n", timeout=timeout)
+            elif rc == 0 and Worker._plink_pwfile_ok is None:
+                Worker._plink_pwfile_ok = True
+            return rc, out, err
         else:
             args = [
                 "ssh",
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ConnectTimeout=10",
+                # 連線後對端死掉（NAS 睡死/斷網）約 60 秒內偵測到，而不是永遠掛住。
+                "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=4",
             ]
             if identity_file:
                 args += ["-i", identity_file, "-o", "IdentitiesOnly=yes"]
             args += [ssh_host, remote_cmd]
-            return self._run(args)
+            return self._run(args, timeout=timeout)
 
     def _git_env(self):
         """本地 git 若要用密碼推送，透過 plink 當 GIT_SSH_COMMAND；若無密碼但這個身份指定了
@@ -631,7 +779,11 @@ class Worker(QThread):
             if not plink:
                 return None
             env = os.environ.copy()
-            env["GIT_SSH_COMMAND"] = f'"{plink}" -pw {pw}'
+            pw_args = self._plink_pw_args(pw)
+            if pw_args[0] == "-pwfile":
+                env["GIT_SSH_COMMAND"] = f'"{plink}" -pwfile "{pw_args[1]}"'
+            else:
+                env["GIT_SSH_COMMAND"] = f'"{plink}" -pw {pw}'
             return env
         if identity_file:
             env = os.environ.copy()
@@ -640,6 +792,17 @@ class Worker(QThread):
         return None
 
     def run(self):
+        # 任何 _run_* 冒出的例外都必須轉成 done(False)：QThread 若無聲死掉，
+        # done 永遠不發射、set_busy(False) 永遠不執行，整個 UI 會鎖死到砍程式為止。
+        try:
+            self._dispatch()
+        except Exception as e:
+            self.log.emit("[錯誤] 內部例外：\n" + traceback.format_exc().strip())
+            self.done.emit(False, f"內部錯誤：{e}")
+        finally:
+            self._cleanup_pw_file()
+
+    def _dispatch(self):
         if self.mode == "test":
             self._run_test()
         elif self.mode == "list":
@@ -732,6 +895,8 @@ class Worker(QThread):
             self._run_profile_sync_push()
         elif self.mode == "repair":
             self._run_repair()
+        elif self.mode == "deploy_tools":
+            self._run_deploy_tools()
         elif self.mode == "log":
             self._run_log()
         elif self.mode == "create_repo":
@@ -763,6 +928,38 @@ class Worker(QThread):
             return "\n".join(lines[b + 1:e]).strip()
         except ValueError:
             return out.strip()
+
+    @staticmethod
+    def _err_hint(err, rc):
+        """把一次失敗的 (stderr, rc) 擠成一句能直接放進使用者訊息的原因。"""
+        if rc == 124:
+            return "逾時無回應"
+        if rc == 125:
+            return "已被使用者中止"
+        tail = (err or "").strip().splitlines()
+        return tail[-1] if tail else f"連線或權限問題（rc={rc}）"
+
+    def _ssh_block(self, lines, timeout=SSH_DEFAULT_TIMEOUT):
+        """執行一段 ___BEGIN___/___END___ 包裝的遠端腳本，回 (ok, body, err_hint)。
+
+        集中三件每個站點都在手工重複的事：包裝標記、_between 濾 banner、
+        失敗時擠出一句可以直接附進使用者訊息的原因（stderr 末行／逾時／中止），
+        讓「連線或權限問題」這種猜謎式錯誤訊息有東西可以附。
+        新寫的 Worker mode 一律用這個，不要再手刻 echo ___BEGIN___。
+        """
+        cmd = "\n".join(["echo ___BEGIN___"] + list(lines) + ["echo ___END___", "true"])
+        rc, out, err = self._ssh(cmd, timeout=timeout)
+        body = self._between(out)
+        if rc == 0:
+            return True, body, ""
+        if rc == 124:
+            hint = f"逾時（超過 {timeout} 秒無回應）"
+        elif rc == 125:
+            hint = "已被使用者中止"
+        else:
+            tail = (err or "").strip().splitlines()
+            hint = tail[-1] if tail else f"rc={rc}"
+        return False, body, hint
 
     # --- 只測 NAS 連線 ---
     def _run_test(self):
@@ -990,9 +1187,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 CI 規則失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 CI 規則失敗：" + self._err_hint(err, rc))
             return
         lines = out.splitlines()
         try:
@@ -1038,9 +1235,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 CI 狀態總表失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 CI 狀態總表失敗：" + self._err_hint(err, rc))
             return
         lines = out.splitlines()
         try:
@@ -1213,9 +1410,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取明細失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取明細失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {name} 明細。")
@@ -1235,9 +1432,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取描述失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取描述失敗：" + self._err_hint(err, rc))
             return
         text = self._between(out)
         if text.startswith("Unnamed repository"):
@@ -1282,9 +1479,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取分支保護設定失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取分支保護設定失敗：" + self._err_hint(err, rc))
             return
         lines = self._between(out).splitlines()
         deny_del = lines[0].strip() if len(lines) > 0 else "false"
@@ -1344,9 +1541,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取檔案列表失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取檔案列表失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out)
         branch = ""
@@ -1383,9 +1580,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取檔案內容失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取檔案內容失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {path}。")
@@ -1408,19 +1605,21 @@ class Worker(QThread):
             "  name=$(basename \"$repo\")",
             "  case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac",
             "  before=$(du -sh \"$repo\" 2>/dev/null | cut -f1)",
-            "  if git --git-dir=\"$repo\" gc --quiet >/dev/null 2>&1; then",
+            "  if err=$(git --git-dir=\"$repo\" gc --quiet 2>&1 >/dev/null); then",
             "    after=$(du -sh \"$repo\" 2>/dev/null | cut -f1)",
             "    echo \"[OK]   $name  $before -> $after\"",
             "  else",
             "    echo \"[FAIL] $name\"",
+            "    echo \"$err\" | tail -n 3 | sed 's/^/       /'",
             "  fi",
             "done",
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd, timeout=3600)
         if rc != 0:
-            self.done.emit(False, "GC 失敗（連線或權限問題）。")
+            tail = (err or "").strip().splitlines()
+            self.done.emit(False, "GC 失敗：" + (tail[-1] if tail else f"rc={rc}"))
             return
         body = self._between(out)
         self.hooks.emit(body)
@@ -1465,9 +1664,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd, timeout=3600)
         if rc != 0:
-            self.done.emit(False, "完整性檢查失敗（連線或權限問題）。")
+            self.done.emit(False, "完整性檢查失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out)
         self.hooks.emit(body)
@@ -1498,9 +1697,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 log 失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 log 失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {name}（{branch}）最近 {count} 筆 commit。")
@@ -1558,9 +1757,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取已合併分支失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取已合併分支失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {name} 的已合併分支清單。")
@@ -1635,9 +1834,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "比較失敗（連線或權限問題）。")
+            self.done.emit(False, "比較失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out)
         self.hooks.emit(body or "（沒有差異）")
@@ -1753,9 +1952,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 blame 失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 blame 失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {path} 的 blame。")
@@ -1861,9 +2060,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "查詢失敗（連線或權限問題）。")
+            self.done.emit(False, "查詢失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out)
         exists = "EXISTS:YES" in body
@@ -1953,7 +2152,7 @@ class Worker(QThread):
             self.done.emit(False, f"目標資料夾已存在，未動作：\n{target}")
             return
         self.log.emit(f"--- git clone → {target} ---")
-        rc, out, err = self._run(["git", "clone", url, target], env=self._git_env())
+        rc, out, err = self._run(["git", "clone", url, target], env=self._git_env(), timeout=3600)
         if rc == 0:
             self.done.emit(True, f"已 clone 到本地：\n{target}")
         else:
@@ -1977,28 +2176,27 @@ class Worker(QThread):
             self.done.emit(False, "GitHub URL 格式不合規（僅允許 https:// / git@ / ssh:// / file:// 開頭的正常網址）。")
             return
         self.log.emit(f"--- 建立 GitHub 鏡像：{name} ← {url} ---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
+        ok, body, hint = self._ssh_block([
             f"BASE='{root}'; name='{name}'; url='{url}'",
             "repo=\"$BASE/$name\"",
             "if [ -e \"$repo\" ]; then echo EXISTS; echo ___END___; exit 0; fi",
-            "if git clone --mirror \"$url\" \"$repo\" >/dev/null 2>&1; then",
+            # 保留 clone 的 stderr：失敗時使用者才知道是 DNS、認證還是私有庫問題，不用猜。
+            "if err=$(git clone --mirror \"$url\" \"$repo\" 2>&1 >/dev/null); then",
             "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null",
             "  echo ___OK___",
             "else",
             "  rm -rf \"$repo\"; echo CLONE_FAIL",
+            "  echo \"$err\" | tail -n 5",
             "fi",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd)
-        if "EXISTS" in out:
+        ], timeout=3600)
+        if "EXISTS" in body:
             self.done.emit(False, f"倉庫已存在，未建立：{name}")
-        elif rc == 0 and "___OK___" in out:
+        elif ok and "___OK___" in body:
             clone_url = f"{c['user']}@{c['host']}:{root}/{name}"
             self.done.emit(True, f"已建立鏡像：{name}\n上游：{url}\n本地 Clone URL：{clone_url}\n（日後用『同步鏡像』或排程更新）")
         else:
-            self.done.emit(False, "建立鏡像失敗（NAS 連不到 GitHub？私有庫需在 NAS 設金鑰/token？）。")
+            detail = "\n".join(body.splitlines()[1:]) if "CLONE_FAIL" in body else hint
+            self.done.emit(False, "建立鏡像失敗。" + (f"\n原因：\n{detail}" if detail else ""))
 
     # --- 同步鏡像（remote update --prune）；names 空則同步全部鏡像 ---
     def _run_sync_mirrors(self):
@@ -2006,8 +2204,7 @@ class Worker(QThread):
         names = [n for n in self.cfg.get("mirror_names", []) if is_safe_name(n)]
         flt = ("".join(" " + n + " " for n in names)) if names else ""
         self.log.emit(f"--- 同步鏡像（{'選取 ' + str(len(names)) + ' 個' if names else '全部'}）---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
+        ok, body, hint = self._ssh_block([
             f"BASE='{root}'; FILTER='{flt}'",
             "n=0",
             "for repo in \"$BASE\"/*.git; do",
@@ -2016,21 +2213,19 @@ class Worker(QThread):
             "  [ \"$(git --git-dir=\"$repo\" config --get remote.origin.mirror 2>/dev/null)\" = true ] || continue",
             "  if [ -n \"$FILTER\" ]; then case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac; fi",
             "  n=$((n+1))",
-            "  if git --git-dir=\"$repo\" remote update --prune >/dev/null 2>&1; then",
+            # 保留每庫的 stderr 末幾行：失敗清單才有可診斷的原因，不再只有 [FAIL] 三個字。
+            "  if err=$(git --git-dir=\"$repo\" remote update --prune 2>&1 >/dev/null); then",
             "    echo \"[OK]   $name\"",
             "  else",
             "    echo \"[FAIL] $name\"",
+            "    echo \"$err\" | tail -n 3 | sed 's/^/       /'",
             "  fi",
             "done",
             "[ \"$n\" = 0 ] && echo '（沒有符合的鏡像庫）'",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd)
-        if rc != 0:
-            self.done.emit(False, "同步失敗（連線或權限問題）。")
+        ], timeout=3600)
+        if not ok:
+            self.done.emit(False, f"同步失敗：{hint}")
             return
-        body = self._between(out)
         self.hooks.emit(body)
         nfail = body.count("[FAIL]")
         nok = body.count("[OK]")
@@ -2051,9 +2246,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取失敗：" + self._err_hint(err, rc))
             return
         body = self._between(out).strip()
         self.hooks.emit(body)
@@ -2097,8 +2292,7 @@ class Worker(QThread):
         names = [n for n in self.cfg.get("backup_repo_names", []) if is_safe_name(n)]
         flt = ("".join(" " + n + " " for n in names)) if names else ""
         self.log.emit(f"--- 同步離站備份（{'選取 ' + str(len(names)) + ' 個' if names else '全部已設定'}）---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
+        script = [
             f"BASE='{root}'; FILTER='{flt}'",
             "n=0",
             "for repo in \"$BASE\"/*.git; do",
@@ -2108,21 +2302,21 @@ class Worker(QThread):
             "  [ -n \"$url\" ] || continue",
             "  if [ -n \"$FILTER\" ]; then case \"$FILTER\" in *\" $name \"*) ;; *) continue;; esac; fi",
             "  n=$((n+1))",
-            "  if git --git-dir=\"$repo\" push --mirror offsite-backup >/dev/null 2>&1; then",
+            "  if err=$(git --git-dir=\"$repo\" push --mirror offsite-backup 2>&1 >/dev/null); then",
             "    echo \"[OK]   $name\"",
+            # 成功才蓋時戳：健檢用它找「設了備份卻從沒推成功過」的倉庫。
+            "    git --git-dir=\"$repo\" config nasgit.lastbackup \"$(date +%s)\" 2>/dev/null",
             "  else",
             "    echo \"[FAIL] $name\"",
+            "    echo \"$err\" | tail -n 3 | sed 's/^/       /'",
             "  fi",
             "done",
             "[ \"$n\" = 0 ] && echo '（沒有設定離站備份的倉庫）'",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd)
-        if rc != 0:
-            self.done.emit(False, "同步失敗（連線或權限問題）。")
+        ]
+        ok, body, hint = self._ssh_block(script, timeout=3600)
+        if not ok:
+            self.done.emit(False, f"同步失敗：{hint}")
             return
-        body = self._between(out)
         self.hooks.emit(body)
         nfail = body.count("[FAIL]")
         nok = body.count("[OK]")
@@ -2204,11 +2398,18 @@ class Worker(QThread):
         page = 1
         try:
             while True:
-                batch = _get(f"https://api.github.com/users/{login}/repos?per_page=100&page={page}&type=owner")
-                if not batch:
-                    break
+                if token:
+                    # 有 token 走 /user/repos 才看得到私有庫（/users/<login>/repos 只回公開庫）；
+                    # 回傳是 token 本人的倉庫，再用 owner.login 過濾成輸入的帳號。
+                    raw = _get(f"https://api.github.com/user/repos?per_page=100&page={page}&affiliation=owner")
+                    batch = [r for r in (raw or [])
+                             if (r.get("owner") or {}).get("login", "").lower() == login.lower()]
+                else:
+                    raw = _get(f"https://api.github.com/users/{login}/repos?per_page=100&page={page}&type=owner")
+                    batch = raw or []
                 repos.extend(batch)
-                if len(batch) < 100:
+                # 分頁判斷要看 API 原始回傳筆數，不能看過濾後的（過濾可能把整頁濾光）
+                if not raw or len(raw) < 100:
                     break
                 page += 1
         except urllib.error.HTTPError as e:
@@ -2279,7 +2480,15 @@ class Worker(QThread):
     def _run_upgrade_engine(self):
         c = self.cfg
         root = c["remote_root"]
-        b64 = PATCHED_ENGINE_B64
+        # 引擎腳本內寫死 BASE="/volume1/Git_Server"；若目前 remote_root 不同，
+        # 部署前先改寫，否則引擎會讀不到 ci_policies/<repo>.policy → POLICY 空
+        # → 靜默放行所有 push（跟沒裝一樣，且完全看不出來）。
+        eng_src = base64.b64decode(PATCHED_ENGINE_B64).decode("utf-8")
+        eng_src, n_sub = re.subn(r"(?m)^BASE=.*$", f'BASE="{root}"', eng_src, count=1)
+        if n_sub != 1:
+            self.done.emit(False, "內建 CI 引擎內容異常（找不到 BASE= 行），已中止升級。")
+            return
+        b64 = base64.b64encode(eng_src.encode("utf-8")).decode("ascii")
         self.log.emit("--- 升級 CI 引擎 pre-receive.ci（自動備份 + 換檔）---")
         # 用 base64 傳輸避免引號/換行問題；先解碼到 .new，做健全性檢查，備份舊檔後再換上。
         cmd = "\n".join([
@@ -2315,6 +2524,33 @@ class Worker(QThread):
     def _run_healthcheck(self):
         root = self.cfg["remote_root"]
         self.log.emit("--- Git Server 健康檢查 ---")
+        # 排程腳本 drift 檢查：本機先算 repo 副本的 SHA-256（統一 LF，與部署時的正規化一致），
+        # 遠端用 sha256sum 比對。任何一邊讀不到都回報「無法確認」，不得謊稱 [OK]（回報不變量）。
+        tools_lines = ["echo '== 排程腳本 drift 檢查（NAS tools/ vs repo 副本）=='"]
+        for tname in TOOL_SCRIPT_NAMES:
+            tpath = tool_script_path(tname)
+            if not tpath:
+                tools_lines.append(f"echo '[  ] {tname}：本機找不到 repo 副本，無法比對（請從 repo 目錄執行本工具或重建 exe）'")
+                continue
+            try:
+                with open(tpath, "rb") as tf:
+                    digest = hashlib.sha256(tf.read().replace(b"\r\n", b"\n")).hexdigest()
+            except OSError:
+                tools_lines.append(f"echo '[  ] {tname}：本機副本讀取失敗，無法比對'")
+                continue
+            tools_lines += [
+                f"f=\"$BASE/tools/{tname}\"",
+                "if [ ! -f \"$f\" ]; then",
+                f"  echo '[!!] {tname}：NAS 的 tools/ 沒有這支腳本（尚未部署，可用「部署排程腳本」放上去）'",
+                "elif ! command -v sha256sum >/dev/null 2>&1; then",
+                f"  echo '[  ] {tname}：NAS 上沒有 sha256sum，無法確認是否與 repo 副本一致'",
+                f"elif [ \"$(sha256sum \"$f\" | cut -d' ' -f1)\" = '{digest}' ]; then",
+                f"  echo '[OK] {tname}：與 repo 副本一致'",
+                "else",
+                f"  echo '[!!] {tname}：內容與 repo 副本不同（drift——NAS 上可能是舊版，用「部署排程腳本」更新）'",
+                "fi",
+            ]
+        tools_lines.append("echo")
         cmd = "\n".join([
             "echo ___BEGIN___",
             f"BASE='{root}'",
@@ -2408,14 +2644,72 @@ class Worker(QThread):
             "  echo \"[  ] 有 $acl_skip 個帳號的 home ACL 因權限不足無法確認（非 root 讀不到別人 home 的 ACL，這台 NAS 對這個身份沒開免密碼 sudo，此處無法補 sudo 問到真相），其餘沒發現異常，不代表全部正常\"",
             "fi",
             "echo",
+        ] + tools_lines + [
+            "echo '== 鏡像庫同步新鮮度 =='",
+            "now=$(date +%s)",
+            "m_hits=0; m_total=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  [ \"$(git --git-dir=\"$repo\" config --get remote.origin.mirror 2>/dev/null)\" = true ] || continue",
+            "  m_total=$((m_total+1))",
+            "  n=$(basename \"$repo\")",
+            "  ts=$(stat -c %Y \"$repo/FETCH_HEAD\" 2>/dev/null)",
+            "  if [ -z \"$ts\" ]; then",
+            "    echo \"[  ] $n：找不到 FETCH_HEAD（從未同步過？）\"",
+            "    m_hits=$((m_hits+1))",
+            "  elif [ $(( (now - ts) / 86400 )) -ge 14 ]; then",
+            "    echo \"[  ] $n：已 $(( (now - ts) / 86400 )) 天沒同步（排程還活著嗎？）\"",
+            "    m_hits=$((m_hits+1))",
+            "  fi",
+            "done",
+            "if [ \"$m_total\" = 0 ]; then echo '[OK] 沒有鏡像庫'; elif [ \"$m_hits\" = 0 ]; then echo \"[OK] $m_total 個鏡像庫最近 14 天內都有同步\"; fi",
+            "echo",
+            "echo '== 離站備份狀態 =='",
+            "b_conf=0; b_warn=0",
+            "for repo in \"$BASE\"/*.git; do",
+            "  [ -d \"$repo\" ] || continue",
+            "  url=$(git --git-dir=\"$repo\" config --get remote.offsite-backup.url 2>/dev/null)",
+            "  [ -n \"$url\" ] || continue",
+            "  b_conf=$((b_conf+1))",
+            "  n=$(basename \"$repo\")",
+            "  last=$(git --git-dir=\"$repo\" config --get nasgit.lastbackup 2>/dev/null)",
+            "  if [ -z \"$last\" ]; then",
+            "    echo \"[  ] $n：設定了離站備份，但沒有成功推送的時戳紀錄（從未推過，或最後一次成功是在加入時戳功能之前）\"",
+            "    b_warn=$((b_warn+1))",
+            "  elif [ $(( (now - last) / 86400 )) -ge 14 ]; then",
+            "    echo \"[  ] $n：離站備份已 $(( (now - last) / 86400 )) 天沒成功推送\"",
+            "    b_warn=$((b_warn+1))",
+            "  fi",
+            "done",
+            "if [ \"$b_conf\" = 0 ]; then echo '[  ] 沒有任何倉庫設定離站備份（NAS 硬碟壞掉時 _archived 也會一起消失）'; elif [ \"$b_warn\" = 0 ]; then echo \"[OK] $b_conf 個設定離站備份的倉庫最近 14 天內都有成功推送\"; fi",
+            "echo",
+            "echo '== 封存區 =='",
+            "if [ -d \"$BASE/_archived\" ] && [ -n \"$(ls -A \"$BASE/_archived\" 2>/dev/null)\" ]; then",
+            "  a_cnt=$(ls -1 \"$BASE/_archived\" 2>/dev/null | wc -l)",
+            "  a_size=$(du -sh \"$BASE/_archived\" 2>/dev/null | cut -f1)",
+            f"  echo \"[  ] 封存區共 $a_cnt 項、佔 $a_size（超過 {ARCHIVE_STALE_DAYS} 天的項目會在封存區清單標示，請定期清理）\"",
+            "else",
+            "  echo '[OK] 封存區是空的'",
+            "fi",
+            "echo",
+            "echo '== 磁碟空間 =='",
+            "pct=$(df \"$BASE\" 2>/dev/null | awk 'NR==2 {gsub(\"%\",\"\",$5); print $5}')",
+            "if [ -z \"$pct\" ]; then",
+            "  echo '[  ] 讀不到磁碟使用率，無法確認'",
+            "elif [ \"$pct\" -ge 90 ] 2>/dev/null; then",
+            "  echo \"[!!] 磁碟使用率已達 $pct%，快滿了——先看「伺服器空間總覽」找大戶\"",
+            "else",
+            "  echo \"[OK] 磁碟使用率 $pct%\"",
+            "fi",
+            "echo",
             "echo '== 日誌 =='",
             "[ -d \"$BASE/logs\" ] && echo '[OK] logs 目錄存在' || echo '[  ] 無 logs 目錄'",
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd, timeout=3600)
         if rc != 0:
-            self.done.emit(False, "健康檢查失敗（連線或權限問題）。")
+            self.done.emit(False, "健康檢查失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, "健康檢查完成。")
@@ -2438,9 +2732,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取伺服器空間資訊失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取伺服器空間資訊失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, "已讀取伺服器空間總覽。")
@@ -2462,9 +2756,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取 Telegram 通知設定失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取 Telegram 通知設定失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, "已讀取 Telegram 通知設定。")
@@ -2501,9 +2795,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取跨機器身份設定失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取跨機器身份設定失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out).strip() or "{}")
         self.done.emit(True, "已讀取跨機器身份設定。")
@@ -2530,10 +2824,15 @@ class Worker(QThread):
 
     # --- 一鍵修復（套用 template hook + 修群組權限）---
     def _run_repair(self):
+        """一鍵修復；cfg["dry_run"] 為真時只檢查回報 [WOULD-FIX]/[OK]，不改動任何東西。
+
+        全量覆蓋版的舊回報每個 repo 都印 [FIX]，分不出「本來就好」跟「真的修了什麼」；
+        試跑模式讓人敢常態跑，確認有東西要修再按真的執行。
+        """
         root = self.cfg["remote_root"]
-        self.log.emit("--- 一鍵修復：套用 template hook + 修群組 ---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
+        dry = bool(self.cfg.get("dry_run"))
+        self.log.emit("--- 一鍵修復" + ("（試跑，不改動）" if dry else "：套用 template hook + 修群組 ---"))
+        common_head = [
             f"BASE='{root}'",
             "PRE=\"$BASE/hooks_template/pre-receive.stub\"",
             "POST=\"$BASE/hooks_template/post-receive\"",
@@ -2541,25 +2840,95 @@ class Worker(QThread):
             "for repo in \"$BASE\"/*.git; do",
             "  [ -d \"$repo\" ] || continue",
             "  n=$(basename \"$repo\")",
-            "  mkdir -p \"$repo/hooks\"",
-            "  [ -f \"$PRE\" ] && { cp \"$PRE\" \"$repo/hooks/pre-receive\"; chmod 750 \"$repo/hooks/pre-receive\"; }",
-            "  [ -f \"$POST\" ] && { cp \"$POST\" \"$repo/hooks/post-receive\"; chmod 750 \"$repo/hooks/post-receive\"; }",
-            "  git --git-dir=\"$repo\" config core.sharedRepository group 2>/dev/null",
-            "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
-            "  echo \"[FIX] $n\"",
-            "  fixed=$((fixed+1))",
-            "done",
-            "echo \"共處理 $fixed 個 repo\"",
-            "echo ___OK___",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd)
-        if rc != 0 or "___OK___" not in out:
-            self.done.emit(False, "修復失敗（權限問題？需以 git_devs 帳號執行）。")
+        ]
+        if dry:
+            body_lines = common_head + [
+                "  why=''",
+                "  [ -f \"$PRE\" ] && ! cmp -s \"$PRE\" \"$repo/hooks/pre-receive\" 2>/dev/null && why=\"$why pre-receive不同步\"",
+                "  [ -f \"$POST\" ] && ! cmp -s \"$POST\" \"$repo/hooks/post-receive\" 2>/dev/null && why=\"$why post-receive不同步\"",
+                "  [ \"$(git --git-dir=\"$repo\" config --get core.sharedRepository 2>/dev/null)\" = group ] || why=\"$why 缺sharedRepository=group\"",
+                "  ng=$(find \"$repo\" -not -group git_devs 2>/dev/null | head -1)",
+                "  [ -n \"$ng\" ] && why=\"$why 有非git_devs群組的檔案\"",
+                "  if [ -n \"$why\" ]; then",
+                "    echo \"[WOULD-FIX] $n：$why\"",
+                "    fixed=$((fixed+1))",
+                "  else",
+                "    echo \"[OK] $n\"",
+                "  fi",
+                "done",
+                "echo \"共 $fixed 個 repo 需要修復（試跑，未改動任何東西）\"",
+                "echo ___OK___",
+            ]
+        else:
+            body_lines = common_head + [
+                "  mkdir -p \"$repo/hooks\"",
+                "  [ -f \"$PRE\" ] && { cp \"$PRE\" \"$repo/hooks/pre-receive\"; chmod 750 \"$repo/hooks/pre-receive\"; }",
+                "  [ -f \"$POST\" ] && { cp \"$POST\" \"$repo/hooks/post-receive\"; chmod 750 \"$repo/hooks/post-receive\"; }",
+                "  git --git-dir=\"$repo\" config core.sharedRepository group 2>/dev/null",
+                "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
+                "  echo \"[FIX] $n\"",
+                "  fixed=$((fixed+1))",
+                "done",
+                "echo \"共處理 $fixed 個 repo\"",
+                "echo ___OK___",
+            ]
+        ok, body, hint = self._ssh_block(body_lines, timeout=3600)
+        if not ok or "___OK___" not in body:
+            self.done.emit(False, f"修復{'試跑' if dry else ''}失敗：{hint or '權限問題？需以 git_devs 帳號執行'}")
             return
-        self.hooks.emit(self._between(out))
-        self.done.emit(True, "一鍵修復完成。")
+        self.hooks.emit(body.replace("___OK___", "").strip())
+        self.done.emit(True, "試跑完成（未改動任何東西）。" if dry else "一鍵修復完成。")
+
+    # --- 部署排程腳本到 NAS $BASE/tools/（同 upgrade_engine 的 base64 傳輸＋備份換檔慣例）---
+    def _run_deploy_tools(self):
+        root = self.cfg["remote_root"]
+        found, missing = [], []
+        for name in TOOL_SCRIPT_NAMES:
+            p = tool_script_path(name)
+            if p:
+                found.append((name, p))
+            else:
+                missing.append(name)
+        if not found:
+            self.done.emit(False, "本機找不到任何排程腳本副本（" + "、".join(TOOL_SCRIPT_NAMES) + "）。\n"
+                                  "請從 repo 目錄執行本工具，或用最新 build_exe.bat 重建 exe（會把腳本打包進去）。")
+            return
+        self.log.emit(f"--- 部署排程腳本到 tools/（{len(found)} 支）---")
+        lines = [f"BASE='{root}'", "mkdir -p \"$BASE/tools\""]
+        for name, p in found:
+            try:
+                data = open(p, "rb").read().replace(b"\r\n", b"\n")  # NAS 端是 sh/python，一律 LF
+            except OSError as e:
+                self.log.emit(f"[錯誤] 讀不到本機副本 {p}：{e}")
+                missing.append(name)
+                continue
+            b64 = base64.b64encode(data).decode("ascii")
+            lines += [
+                f"f=\"$BASE/tools/{name}\"",
+                f"printf '%s' '{b64}' | base64 -d > \"$f.new\"",
+                "if [ -s \"$f.new\" ]; then",
+                "  if [ -f \"$f\" ] && cmp -s \"$f\" \"$f.new\"; then",
+                f"    rm -f \"$f.new\"; echo '[SAME] {name}（內容相同，未變更）'",
+                "  else",
+                "    [ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
+                f"    mv \"$f.new\" \"$f\" && chmod 755 \"$f\" && echo '[OK] {name} 已部署'",
+                "  fi",
+                "else",
+                f"  rm -f \"$f.new\"; echo '[FAIL] {name} 解碼失敗'",
+                "fi",
+            ]
+        ok, body, hint = self._ssh_block(lines)
+        if not ok:
+            self.done.emit(False, f"部署失敗：{hint}")
+            return
+        self.hooks.emit(body)
+        nfail = body.count("[FAIL]")
+        note = ""
+        if missing:
+            note = "\n⚠ 本機缺少副本、未部署：" + "、".join(missing)
+        self.done.emit(nfail == 0,
+                       f"排程腳本部署完成（{body.count('[OK]')} 支更新、{body.count('[SAME]')} 支已是最新、{nfail} 支失敗）。{note}\n"
+                       "提醒：DSM「任務排程表」的排程項目要自己掛，這裡只負責把腳本檔放上去/更新。")
 
     # --- 日誌檢視（tail）---
     def _run_log(self):
@@ -2577,9 +2946,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取日誌失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取日誌失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已讀取 {logfile}。")
@@ -2693,9 +3062,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "自我測試失敗（連線或權限問題）。")
+            self.done.emit(False, "自我測試失敗：" + self._err_hint(err, rc))
             return
         self.hooks.emit(self._between(out))
         self.done.emit(True, f"已對 {name} 完成 CI 自我測試。")
@@ -2717,9 +3086,9 @@ class Worker(QThread):
             "echo ___END___",
             "true",
         ])
-        rc, out, _ = self._ssh(cmd)
+        rc, out, err = self._ssh(cmd)
         if rc != 0:
-            self.done.emit(False, "讀取封存區失敗（連線或權限問題）。")
+            self.done.emit(False, "讀取封存區失敗：" + self._err_hint(err, rc))
             return
         entries = []
         for ln in self._between(out).splitlines():
@@ -2772,27 +3141,39 @@ class Worker(QThread):
 
     # --- 封存區：永久刪除 ---
     def _run_archive_purge(self):
+        """永久刪除封存項目。支援單筆（arch_name）與批次（arch_names）——批次在
+        同一條 SSH 連線內迴圈刪除，不再每個項目各開一條連線（20 項省下 ~30 秒握手）。"""
         root = self.cfg["remote_root"]
-        arch = self.cfg.get("arch_name", "")
-        if not self._safe_arch(arch):
-            self.done.emit(False, f"名稱不安全：{arch!r}")
+        names = self.cfg.get("arch_names") or (
+            [self.cfg["arch_name"]] if self.cfg.get("arch_name") else [])
+        bad = [a for a in names if not self._safe_arch(a)]
+        if bad:
+            self.done.emit(False, f"名稱不安全：{bad[0]!r}")
             return
-        self.log.emit(f"--- 永久刪除封存：{arch} ---")
-        cmd = "\n".join([
-            "echo ___BEGIN___",
-            f"BASE='{root}'; A=\"$BASE/_archived\"; arch='{arch}'",
-            "e=\"$A/$arch\"",
-            "if [ ! -e \"$e\" ]; then echo NOTFOUND; echo ___END___; exit 0; fi",
-            "rm -rf \"$e\" && echo PURGED",
-            "echo ___END___",
-            "true",
-        ])
-        rc, out, _ = self._ssh(cmd)
-        body = self._between(out)
-        if rc == 0 and "PURGED" in body:
-            self.done.emit(True, f"已永久刪除：{arch}")
+        if not names:
+            self.done.emit(False, "沒有要刪除的封存項目。")
+            return
+        self.log.emit(f"--- 永久刪除封存（{len(names)} 個）---")
+        lines = [f"BASE='{root}'; A=\"$BASE/_archived\""]
+        for a in names:
+            lines += [
+                f"e=\"$A/{a}\"",
+                f"if [ ! -e \"$e\" ]; then echo '[NOTFOUND] {a}'",
+                f"elif rm -rf \"$e\"; then echo '[OK] {a}'",
+                f"else echo '[FAIL] {a}'; fi",
+            ]
+        ok, body, hint = self._ssh_block(lines)
+        if not ok:
+            self.done.emit(False, f"刪除失敗：{hint}")
+            return
+        self.hooks.emit(body)
+        nok = body.count("[OK] ")
+        nbad = body.count("[FAIL] ") + body.count("[NOTFOUND] ")
+        if len(names) == 1:
+            self.done.emit(nok == 1, f"已永久刪除：{names[0]}" if nok == 1
+                           else f"刪除失敗（{body.strip() or '權限問題？'}）。")
         else:
-            self.done.emit(False, "刪除失敗（權限問題？）。")
+            self.done.emit(nbad == 0, f"批次清理完成：成功 {nok}、失敗 {nbad}。")
 
     # --- 完整串接 ---
     def _run_connect(self):
@@ -2834,49 +3215,62 @@ class Worker(QThread):
             return
         self.log.emit(f"ℹ git 身分：{name_out} <{email_out}>")
 
-        # Step 1 NAS 建庫
+        # Step 1 NAS 建庫（存在檢查＋建庫＋權限＋hook＋讀既有分類，合併成一條 SSH——
+        # 過去這段拆成 5 條連線，每條 1-2 秒握手，串接一次要白等近十秒）
         self.log.emit("--- 步驟 1：在 NAS 建立裸倉庫 ---")
-        rc, out, _ = self._ssh(f"[ -d '{remote_repo_path}' ] && echo YES || echo NO")
-        if rc != 0:
+        ok, body, hint = self._ssh_block([
+            f"REPO='{remote_repo_path}'; ROOT='{root}'; NAME='{repo_name}'",
+            "if [ -d \"$REPO\" ]; then",
+            "  echo EXISTS",
+            "else",
+            "  if git init --bare \"$REPO\" >/dev/null 2>&1; then",
+            "    echo CREATED",
+            # 讓 git 之後自己建立的物件檔就是群組可寫，避免不同身份交錯 push 時互卡權限
+            "    git --git-dir=\"$REPO\" config core.sharedRepository group",
+            # 權限：sudo -n（免密碼）盡力而為，失敗不中斷
+            f"    if sudo -n chown -R {user}:git_devs \"$REPO\" 2>/dev/null && "
+            f"sudo -n chmod g+s \"$REPO\" 2>/dev/null && sudo -n chmod -R g+rwX \"$REPO\" 2>/dev/null; then",
+            "      echo PERM_OK",
+            "    else",
+            "      echo PERM_MANUAL",
+            "    fi",
+            "  else",
+            "    echo INIT_FAIL",
+            "  fi",
+            "fi",
+            "if [ -d \"$REPO\" ]; then",
+            "  if [ -f \"$ROOT/install_and_monitor_git_hooks.sh\" ]; then",
+            "    \"$ROOT/install_and_monitor_git_hooks.sh\" \"$NAME\"",
+            "  else",
+            "    echo '[WARN] 找不到 install_and_monitor_git_hooks.sh，略過'",
+            "  fi",
+            "  echo \"KIND=$(git --git-dir=\"$REPO\" config --get nasgit.kind 2>/dev/null)\"",
+            "fi",
+        ])
+        if not ok:
             self.done.emit(False, "無法連線 NAS（SSH 驗證或連線問題）。\n"
+                                  f"原因：{hint}\n"
                                   "請確認已設 SSH 金鑰，或填密碼並安裝 PuTTY(plink)。在家可改用內網 IP。")
             return
-
-        if "YES" in out:
+        if "INIT_FAIL" in body:
+            self.done.emit(False, "NAS repo 建立失敗（git init --bare）。")
+            return
+        if "EXISTS" in body:
             self.log.emit(f"[INFO] NAS repo 已存在，跳過建立：{remote_repo_path}")
-        else:
-            rc, _, _ = self._ssh(f"git init --bare '{remote_repo_path}'")
-            if rc != 0:
-                self.done.emit(False, "NAS repo 建立失敗（git init --bare）。")
-                return
-            # 讓 git 之後自己建立的物件檔就是群組可寫，避免不同身份交錯 push 時互卡權限
-            self._ssh(f"git --git-dir='{remote_repo_path}' config core.sharedRepository group")
-            # 權限：sudo -n（免密碼）盡力而為，失敗不中斷
-            perm_cmd = (
-                f"sudo -n chown -R {user}:git_devs '{remote_repo_path}' 2>/dev/null && "
-                f"sudo -n chmod g+s '{remote_repo_path}' 2>/dev/null && "
-                f"sudo -n chmod -R g+rwX '{remote_repo_path}' 2>/dev/null"
+        elif "PERM_OK" in body:
+            self.log.emit(f"[OK] 已建立並設定權限：{remote_repo_path}")
+        elif "PERM_MANUAL" in body:
+            self.log.emit("⚠️ NAS repo 已建立，但權限需手動補完（sudo 未設 NOPASSWD）。")
+            self.log.emit("   請另開視窗執行（會問 NAS 密碼）：")
+            self.log.emit(
+                f'   ssh {ssh_host} "sudo chown -R {user}:git_devs '
+                f"'{remote_repo_path}'; sudo chmod g+s '{remote_repo_path}'; "
+                f"sudo chmod -R g+rwX '{remote_repo_path}'\""
             )
-            rc, _, _ = self._ssh(perm_cmd)
-            if rc == 0:
-                self.log.emit(f"[OK] 已建立並設定權限：{remote_repo_path}")
-            else:
-                self.log.emit("⚠️ NAS repo 已建立，但權限需手動補完（sudo 未設 NOPASSWD）。")
-                self.log.emit("   請另開視窗執行（會問 NAS 密碼）：")
-                self.log.emit(
-                    f'   ssh {ssh_host} "sudo chown -R {user}:git_devs '
-                    f"'{remote_repo_path}'; sudo chmod g+s '{remote_repo_path}'; "
-                    f"sudo chmod -R g+rwX '{remote_repo_path}'\""
-                )
-
-        # 安裝 hook（盡力而為）
-        self.log.emit("👉 安裝 Git hook...")
-        hook_cmd = (
-            f"if [ -f '{root}/install_and_monitor_git_hooks.sh' ]; then "
-            f"'{root}/install_and_monitor_git_hooks.sh' '{repo_name}'; "
-            f"else echo '[WARN] 找不到 install_and_monitor_git_hooks.sh，略過'; fi"
-        )
-        self._ssh(hook_cmd)
+        existing_kind = ""
+        for bl in body.splitlines():
+            if bl.startswith("KIND="):
+                existing_kind = bl[len("KIND="):].strip()
 
         # Step 2 本地就地配置
         self.log.emit("--- 步驟 2：本地就地配置 ---")
@@ -2959,27 +3353,28 @@ class Worker(QThread):
             )
             return
 
-        # 2-7 NAS HEAD 指向本分支
-        rc, _, _ = self._ssh(
-            f"git --git-dir='{remote_repo_path}' symbolic-ref HEAD refs/heads/{shq(branch)}"
-        )
-        if rc == 0:
+        # 2-7 NAS HEAD 指向本分支＋記錄來源分類（合併成一條 SSH；
+        # NAS 上已有 nasgit.kind 就不覆蓋，見 CLAUDE.md）
+        post_lines = [
+            f"repo='{remote_repo_path}'",
+            f"git --git-dir=\"$repo\" symbolic-ref HEAD refs/heads/{shq(branch)} && echo HEAD_OK",
+        ]
+        kind_label = ""
+        if not existing_kind:
+            kind_lines, kind_label = self._repo_kind_config_lines(prev_origin)
+            post_lines += kind_lines
+        ok, body, _hint = self._ssh_block(post_lines)
+        if ok and "HEAD_OK" in body:
             self.log.emit(f"✔ 已將 NAS 預設分支(HEAD)指向 {branch}")
-
-        # 2-8 記錄倉庫來源分類（NAS 上已有 nasgit.kind 就不覆蓋，見 CLAUDE.md）
-        self._record_repo_kind(remote_repo_path, prev_origin)
+        if kind_label:
+            self.log.emit(f"ℹ 來源分類：{kind_label}")
 
         self.done.emit(True, f"完成！專案已就地接上 NAS。\nNAS 倉庫：{remote_repo_path}")
 
-    # --- 串接當下依 prev_origin 判斷來源分類，寫入 nasgit.kind（NAS 已有值就不覆蓋，
-    # 避免蓋掉先前手動分類或批次比對的結果）---
-    def _record_repo_kind(self, remote_repo_path, prev_origin):
-        rc, existing, _ = self._ssh(
-            f"git --git-dir='{remote_repo_path}' config --get nasgit.kind 2>/dev/null; true"
-        )
-        if existing.strip():
-            return
-
+    # --- 串接當下依 prev_origin 判斷來源分類，回傳要併進遠端腳本的 config 行與顯示文字。
+    # 不自己開 SSH 連線：呼叫端（_run_connect）把這些行併進既有的 post-push 腳本一次送出；
+    # 「NAS 已有 nasgit.kind 就不覆蓋」的檢查也由呼叫端用第一條腳本讀回的值把關（見 CLAUDE.md）---
+    def _repo_kind_config_lines(self, prev_origin):
         prev_origin = (prev_origin or "").strip()
         if not prev_origin:
             kind, upstream, src = "own", "", "auto-connect"
@@ -3014,15 +3409,13 @@ class Worker(QThread):
                         )
 
         steps = [
-            f"repo='{remote_repo_path}'",
             f"git --git-dir=\"$repo\" config nasgit.kind {shq(kind)}",
             f"git --git-dir=\"$repo\" config nasgit.kindsrc {shq(src)}",
         ]
         if upstream:
             steps.append(f"git --git-dir=\"$repo\" config nasgit.upstream {shq(upstream)}")
-        self._ssh("\n".join(steps))
         label = {"own": "自己的", "fork": "我 fork 的", "clone": "clone 別人的"}[kind]
-        self.log.emit(f"ℹ 來源分類：{label}" + (f"（來源 {upstream}）" if upstream else ""))
+        return steps, label + (f"（來源 {upstream}）" if upstream else "")
 
 
 # ============================================================
@@ -4056,38 +4449,29 @@ class ArchiveDialog(QDialog):
             f"確定永久刪除以下 {len(names)} 個封存項目？此動作無法復原：\n" + "\n".join(names))
         if r != QMessageBox.StandardButton.Yes:
             return
-        self._purge_queue = list(names)
-        self._purge_ok = 0
-        self._purge_fail = 0
+        # 一條 SSH 連線內批次刪除（過去每項各開一條連線、由 _run_next_purge 佇列驅動）
         self._busy(True)
-        self._run_next_purge()
-
-    def _run_next_purge(self):
-        if not self._purge_queue:
-            self._busy(False)
-            msg = f"批次清理完成：成功 {self._purge_ok}、失敗 {self._purge_fail}。"
-            self.status.setText(("✔ " if self._purge_fail == 0 else "⚠ ") + msg)
-            self.status.setStyleSheet("color:#1a7f37;" if self._purge_fail == 0 else "color:#b06000;")
-            self.refresh()
-            return
-        name = self._purge_queue.pop(0)
-        self._purging_name = name
-        self.status.setText(f"刪除中… {name}（剩 {len(self._purge_queue) + 1} 個）")
+        self.status.setText(f"批次刪除中…（{len(names)} 個）")
         self.status.setStyleSheet("")
         cfg = dict(self.cfg)
-        cfg["arch_name"] = name
+        cfg["arch_names"] = list(names)
         self.worker = Worker(cfg, mode="archive_purge")
-        self.worker.done.connect(self._on_bulk_purge_one_done)
+        self.worker.hooks.connect(self._on_bulk_purge_body)
+        self.worker.done.connect(self._on_bulk_purge_done)
         self.worker.start()
 
-    def _on_bulk_purge_one_done(self, ok, msg):
-        if ok:
-            self._purge_ok += 1
-            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "archive_purge",
-                      getattr(self, "_purging_name", "").replace("\n", " ") + " (批次清理)")
-        else:
-            self._purge_fail += 1
-        self._run_next_purge()
+    def _on_bulk_purge_body(self, body: str):
+        # 逐項補稽核：只記真的刪掉的那些
+        for line in body.splitlines():
+            if line.startswith("[OK] "):
+                audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""), "archive_purge",
+                          line[len("[OK] "):].strip() + " (批次清理)")
+
+    def _on_bulk_purge_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "⚠ ") + msg)
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b06000;")
+        self.refresh()
 
 
 # ============================================================
@@ -5040,12 +5424,20 @@ class RotateKeyDialog(QDialog):
             'echo "偵測到的 home 目錄：$HOME_DIR"',
             'AK="$HOME_DIR/.ssh/authorized_keys"',
             "",
-            "# 2) 動手前先備份原檔",
+            "# 2) 登入前置條件修正（與建帳號/補金鑰腳本同一套；輪替完才發現新鑰匙登不進去最冤枉）",
+            "#    /sbin/nologin 會擋掉所有透過 SSH 執行的指令（含 git push）；home 目錄的 Synology ACL",
+            "#    不乾淨、或擁有者不是本人，sshd 會整個無聲忽略 authorized_keys、退回密碼登入（不報錯）。",
+            f"sudo sed -i 's#^\\({self.username}:.*:\\)/sbin/nologin$#\\1/bin/sh#' /etc/passwd",
+            'sudo synoacltool -del "$HOME_DIR"',
+            'sudo chmod 700 "$HOME_DIR"',
+            f'sudo chown {self.username}:users "$HOME_DIR"',
+            "",
+            "# 3) 動手前先備份原檔",
             'sudo mkdir -p "$HOME_DIR/.ssh"',
             'sudo touch "$AK"',
             'sudo cp "$AK" "$AK.bak-$(date +%Y%m%d-%H%M%S)"',
             "",
-            "# 3) 加入新公鑰（若已存在則跳過，不重複加入）",
+            "# 4) 加入新公鑰（若已存在則跳過，不重複加入）",
             "NEWKEY=$(cat <<'EOF'",
             new_pubkey,
             "EOF",
@@ -5060,7 +5452,7 @@ class RotateKeyDialog(QDialog):
         if old_pubkey:
             lines += [
                 "",
-                "# 4) 撤銷舊公鑰（找不到也不會報錯，就當作本來就不在）",
+                "# 5) 撤銷舊公鑰（找不到也不會報錯，就當作本來就不在）",
                 "OLDKEY=$(cat <<'EOF'",
                 old_pubkey,
                 "EOF",
@@ -5072,13 +5464,15 @@ class RotateKeyDialog(QDialog):
         else:
             lines += [
                 "",
-                "# 4) 沒有填舊公鑰，跳過撤銷這步（只新增，不撤銷任何既有金鑰）",
+                "# 5) 沒有填舊公鑰，跳過撤銷這步（只新增，不撤銷任何既有金鑰）",
             ]
         lines += [
             "",
             'sudo chmod 700 "$HOME_DIR/.ssh"',
             'sudo chmod 600 "$AK"',
             f'sudo chown -R {self.username}:users "$HOME_DIR/.ssh"',
+            "",
+        ] + _login_precondition_selfcheck(self.username) + [
             "",
             "# 完成後記得：確認新鑰匙能登入、舊鑰匙不能登入，再回 Key_Management 把舊金鑰標記封存/刪除。",
         ]
@@ -5492,7 +5886,7 @@ class RepoKindScanDialog(QDialog):
         self.token_edit = QLineEdit(self.settings.value("github_token", "", type=str))
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         g.addWidget(self.token_edit, 1, 1)
-        self.remember_check = QCheckBox("記住帳號/token（存在本機設定）")
+        self.remember_check = QCheckBox("記住帳號/token（明碼存於本機登錄檔，token 可讀你所有私有庫，請自行評估）")
         self.remember_check.setChecked(bool(self.settings.value("github_login", "", type=str)))
         g.addWidget(self.remember_check, 2, 1)
         g.addWidget(QLabel("本機掃描資料夾（分號分隔）："), 3, 0)
@@ -5547,17 +5941,27 @@ class RepoKindScanDialog(QDialog):
             self.settings.remove("github_token")
 
         self.scan_btn.setEnabled(False)
-        self.status.setText("掃描 GitHub 中…")
+        self.status.setText("掃描 GitHub 與本機資料夾中…（兩者並行）")
         self.status.setStyleSheet("")
         match_names = [r[0][:-4] if r[0].endswith(".git") else r[0] for r in self.all_repos]
         cfg = dict(self.cfg)
         cfg["github_login"] = login
         cfg["github_token"] = self.token_edit.text().strip()
         cfg["match_names"] = match_names
+        # GitHub API 掃描與本機磁碟掃描互不相依，並行跑省掉一半等待
+        self._scan_pending = 2
+        self._scan_errors = []
         self.gh_worker = Worker(cfg, mode="github_scan")
         self.gh_worker.hooks.connect(self._on_gh_result)
         self.gh_worker.done.connect(self._on_gh_done)
+        roots = [p.strip() for p in self.roots_edit.text().split(";") if p.strip()]
+        cfg2 = dict(self.cfg)
+        cfg2["scan_roots"] = roots
+        self.local_worker = Worker(cfg2, mode="local_scan")
+        self.local_worker.hooks.connect(self._on_local_result)
+        self.local_worker.done.connect(self._on_local_done)
         self.gh_worker.start()
+        self.local_worker.start()
 
     def _on_gh_result(self, text):
         try:
@@ -5567,18 +5971,8 @@ class RepoKindScanDialog(QDialog):
 
     def _on_gh_done(self, ok, msg):
         if not ok:
-            self.scan_btn.setEnabled(True)
-            self.status.setText("❌ " + msg)
-            self.status.setStyleSheet("color:#b00020;")
-            return
-        self.status.setText("掃描本機資料夾中…")
-        roots = [p.strip() for p in self.roots_edit.text().split(";") if p.strip()]
-        cfg = dict(self.cfg)
-        cfg["scan_roots"] = roots
-        self.local_worker = Worker(cfg, mode="local_scan")
-        self.local_worker.hooks.connect(self._on_local_result)
-        self.local_worker.done.connect(self._on_local_done)
-        self.local_worker.start()
+            self._scan_errors.append("GitHub：" + msg)
+        self._scan_finish_one()
 
     def _on_local_result(self, text):
         try:
@@ -5587,13 +5981,22 @@ class RepoKindScanDialog(QDialog):
             self.local_result = {}
 
     def _on_local_done(self, ok, msg):
-        self.scan_btn.setEnabled(True)
         if not ok:
-            self.status.setText("❌ " + msg)
-            self.status.setStyleSheet("color:#b00020;")
+            self._scan_errors.append("本機：" + msg)
+        self._scan_finish_one()
+
+    def _scan_finish_one(self):
+        self._scan_pending -= 1
+        if self._scan_pending > 0:
             return
-        self.status.setText("比對完成，逐列確認後按「套用勾選」寫回。")
-        self.status.setStyleSheet("color:#1a7f37;")
+        self.scan_btn.setEnabled(True)
+        if self._scan_errors:
+            # 一邊失敗另一邊的證據還是有用，照樣列表，但把失敗原因標出來
+            self.status.setText("⚠ 部分掃描失敗（僅以成功那邊的證據建議）：" + "；".join(self._scan_errors))
+            self.status.setStyleSheet("color:#b06000;")
+        else:
+            self.status.setText("比對完成，逐列確認後按「套用勾選」寫回。")
+            self.status.setStyleSheet("color:#1a7f37;")
         self._build_table()
 
     def _build_table(self):
@@ -5791,6 +6194,12 @@ class MainWindow(QMainWindow):
         # ================= 分頁 =================
         tabs = QTabWidget()
         root.addWidget(tabs, stretch=1)
+        # 全域中止鈕：放在分頁列右上角，任何分頁都看得到；只有操作進行中才可按。
+        self.cancel_btn = QPushButton("⛔ 中止")
+        self.cancel_btn.setToolTip("強制中止目前執行中的操作（砍掉子程序）。遠端動作可能做一半，之後請重新整理確認狀態。")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.on_cancel_worker)
+        tabs.setCornerWidget(self.cancel_btn, Qt.Corner.TopRightCorner)
 
         # ---------- 分頁 1：串接專案 ----------
         connect_page = QWidget()
@@ -6075,6 +6484,11 @@ class MainWindow(QMainWindow):
         self.git_devs_cred_btn = QPushButton("git_devs 密碼留底紀錄…")
         self.git_devs_cred_btn.setToolTip("查看/清除本機留底的 git_devs 新帳號密碼紀錄（明碼檔案）。")
         self.git_devs_cred_btn.clicked.connect(self.on_view_git_devs_creds)
+        self.deploy_tools_btn = QPushButton("部署排程腳本…")
+        self.deploy_tools_btn.setToolTip(
+            "把 repo 內的 server-side 排程腳本（鏡像同步/CI 日報/推送統計/寄信）部署到 NAS 的 tools/，"
+            "舊檔自動備份。DSM 任務排程表的排程項目仍需自行設定一次。")
+        self.deploy_tools_btn.clicked.connect(self.on_deploy_tools)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
         og.addWidget(self.new_user_btn, 0, 2)
@@ -6082,6 +6496,7 @@ class MainWindow(QMainWindow):
         og.addWidget(self.notify_btn, 1, 1)
         og.addWidget(self.git_devs_list_btn, 1, 2)
         og.addWidget(self.git_devs_cred_btn, 2, 0)
+        og.addWidget(self.deploy_tools_btn, 2, 1)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視（最後 200 筆）")
@@ -6484,9 +6899,11 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(text)
 
     def set_busy(self, busy: bool):
+        self.cancel_btn.setEnabled(busy)
         self.run_btn.setEnabled(not busy)
         self.test_btn.setEnabled(not busy)
         self.refresh_btn.setEnabled(not busy)
+        self.kind_scan_btn.setEnabled(not busy)
         self.ci_status_btn.setEnabled(not busy)
         self.upgrade_btn.setEnabled(not busy)
         self.create_btn.setEnabled(not busy)
@@ -6498,7 +6915,7 @@ class MainWindow(QMainWindow):
         self.activity_btn.setEnabled(not busy)
         self.ssh_keys_btn.setEnabled(not busy)
         for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.notify_btn,
-                  self.git_devs_list_btn, self.git_devs_cred_btn,
+                  self.git_devs_list_btn, self.git_devs_cred_btn, self.deploy_tools_btn,
                   self.push_log_btn, self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
@@ -6517,11 +6934,45 @@ class MainWindow(QMainWindow):
         self.gc_btn.setEnabled(not busy and has_sel)
         self.fsck_btn.setEnabled(not busy and has_sel)
         self.tag_btn.setEnabled(not busy and has_sel)
+        # 這四顆過去只在 on_repo_selected 管，busy 時仍可按 → 併發 worker 互踩（稽核記錯 mode）。
+        self.desc_btn.setEnabled(not busy and has_sel)
+        self.branch_protect_btn.setEnabled(not busy and has_sel)
+        self.backup_btn.setEnabled(not busy and has_sel)
+        self.kind_btn.setEnabled(not busy and has_sel)
         if busy:
             self.run_btn.setText("執行中…")
         else:
             self.run_btn.setText("開始串接")
             self.update_run_enabled()
+
+    def on_cancel_worker(self):
+        w = self.worker
+        if not (w and w.isRunning()):
+            self.cancel_btn.setEnabled(False)
+            return
+        r = QMessageBox.question(
+            self, "中止操作",
+            "確定要強制中止目前操作？\n遠端動作可能做一半（例如同步、修復跑到一半），中止後建議重新整理確認狀態。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if r == QMessageBox.StandardButton.Yes:
+            w.cancel()
+
+    def closeEvent(self, event):
+        """跑到一半直接關窗會硬殺 QThread（遠端動作做一半、稽核沒記錄）——先確認、再收尾。"""
+        w = self.worker
+        if w and w.isRunning():
+            r = QMessageBox.question(
+                self, "操作進行中",
+                "還有操作在執行中，現在關閉會中止它（遠端動作可能做一半）。\n確定要中止並離開嗎？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            w.cancel()
+            w.wait(8000)
+        event.accept()
 
     # --- 測試連線 ---
     def on_test(self):
@@ -6628,6 +7079,8 @@ class MainWindow(QMainWindow):
             rows.sort(key=activity_key, reverse=True)
         else:  # 名稱
             rows.sort(key=lambda r: r[0].lower())
+        # 重建前記住目前選取；否則打字篩選/重新整理都會把選取（含批次 CI 的多選）清掉
+        selected_names = {i.data(Qt.ItemDataRole.UserRole) for i in self.repo_list.selectedItems()}
         self.repo_list.clear()
         for row in rows:
             name, status, pol, mirror, size_kb = row[0], row[1], row[2], row[3], row[4]
@@ -6655,6 +7108,8 @@ class MainWindow(QMainWindow):
             if status.startswith("空庫"):
                 it.setForeground(Qt.GlobalColor.gray)
             self.repo_list.addItem(it)
+            if name in selected_names:
+                it.setSelected(True)
 
     def _current_kind_tab(self) -> str:
         if not hasattr(self, "kind_tabbar"):
@@ -6809,6 +7264,21 @@ class MainWindow(QMainWindow):
         self.worker.done.connect(self.on_rename_done)
         self.worker.start()
 
+    def _patch_repo_row(self, name, new_name=None, policy=None):
+        """rename/set_ci 完成後直接改本地清單資料並重畫，不再整包 re-list——
+        _run_list 會對每個 repo 跑 du -sk，全量重整是這個畫面最貴的操作。"""
+        for i, r in enumerate(self._all_repos):
+            if r[0] == name:
+                r = list(r)
+                if new_name:
+                    r[0] = new_name
+                if policy is not None:
+                    r[2] = policy
+                self._all_repos[i] = tuple(r)
+                break
+        self._update_kind_tab_counts()
+        self.apply_repo_filter(self.filter_edit.text())
+
     def on_rename_done(self, ok: bool, msg: str):
         self.set_busy(False)
         if ok:
@@ -6816,7 +7286,13 @@ class MainWindow(QMainWindow):
             self.browse_status.setStyleSheet("color:#1a7f37;")
             c = self.collect_identity_cfg()
             audit_log(c.get("user", ""), c.get("host", ""), "rename_repo", msg.replace("\n", " "))
-            self.on_refresh()
+            w = self.sender()
+            old = w.cfg.get("repo_name", "") if w else ""
+            new = w.cfg.get("new_name", "") if w else ""
+            if new and not new.endswith(".git"):
+                new += ".git"
+            if old and new:
+                self._patch_repo_row(old, new_name=new)
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
@@ -6864,13 +7340,16 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
-            if self.worker and self.worker.mode in DESTRUCTIVE_MODES:
+            # 用發訊號的那個 Worker 判斷 mode，而不是 self.worker——
+            # self.worker 是共用屬性，途中被重新指派會讓稽核記到錯的 mode。
+            sender = self.sender()
+            sender_mode = getattr(sender, "mode", None)
+            if sender_mode in DESTRUCTIVE_MODES:
                 c = self.collect_identity_cfg()
-                audit_log(c.get("user", ""), c.get("host", ""), self.worker.mode, msg.replace("\n", " "))
+                audit_log(c.get("user", ""), c.get("host", ""), sender_mode, msg.replace("\n", " "))
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
-            QMessageBox.warning(self, "讀取失敗", msg)
             QMessageBox.warning(self, "讀取失敗", msg)
 
     # ---------- 設定 CI（每 repo 獨立）----------
@@ -6900,10 +7379,12 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
             QMessageBox.information(self, "完成", msg)
-            if self.worker:
+            w = self.sender()
+            if w:
                 c = self.collect_identity_cfg()
-                detail = f"repo={self.worker.cfg.get('repo_name', '')} policy={self.worker.cfg.get('ci_policy', '')}"
+                detail = f"repo={w.cfg.get('repo_name', '')} policy={w.cfg.get('ci_policy', '')}"
                 audit_log(c.get("user", ""), c.get("host", ""), "set_ci", detail)
+                self._patch_repo_row(w.cfg.get("repo_name", ""), policy=w.cfg.get("ci_policy", "none"))
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
@@ -6964,19 +7445,39 @@ class MainWindow(QMainWindow):
         self._start_maint("healthcheck", "健康檢查")
 
     def on_repair(self):
-        r = QMessageBox.question(
-            self, "一鍵修復",
+        box = QMessageBox(self)
+        box.setWindowTitle("一鍵修復")
+        box.setText(
             "將對所有 repo：\n"
             "・以 hooks_template 的 pre-receive.stub / post-receive 覆蓋各 repo 的 hook\n"
             "・chmod 750 hook、chgrp -R git_devs、chmod -R g+rwX\n\n"
-            "這會統一全庫 hook 與權限。確定執行嗎？",
-        )
-        if r != QMessageBox.StandardButton.Yes:
-            return
-        self._start_maint("repair", "一鍵修復")
+            "「試跑」只檢查並列出哪些 repo 需要修（不改動任何東西），\n"
+            "「直接執行」才會真的覆蓋 hook 與權限。")
+        dry_btn = box.addButton("試跑（只檢查）", QMessageBox.ButtonRole.ActionRole)
+        run_btn = box.addButton("直接執行", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(dry_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is dry_btn:
+            self._start_maint("repair", "一鍵修復（試跑）", extra={"dry_run": True})
+        elif clicked is run_btn:
+            self._start_maint("repair", "一鍵修復")
 
     def on_disk_usage(self):
         self._start_maint("disk_usage", "伺服器空間總覽")
+
+    def on_deploy_tools(self):
+        r = QMessageBox.question(
+            self, "部署排程腳本",
+            "將把 repo 內的 server-side 腳本部署/更新到 NAS 的 tools/：\n"
+            "・" + "\n・".join(TOOL_SCRIPT_NAMES) + "\n\n"
+            "既有檔案會先備份（.bak-時間戳）再覆蓋；內容相同則不動。\n"
+            "DSM 任務排程表的排程項目不會被更動，第一次部署後請自行到 DSM 掛排程。\n確定執行嗎？",
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._start_maint("deploy_tools", "部署排程腳本")
 
     def on_notify_config(self):
         cfg = dict(self.collect_identity_cfg())
@@ -7107,12 +7608,15 @@ class MainWindow(QMainWindow):
         if ok:
             self.browse_status.setText("✔ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#1a7f37;")
-            self.on_refresh()  # 重整讓清單 CI 欄更新
-            if self.worker:
+            w = self.sender()
+            if w:
                 c = self.collect_identity_cfg()
-                names = ",".join(self.worker.cfg.get("repo_names", []))
-                detail = f"repos={names} policy={self.worker.cfg.get('ci_policy', '')}"
+                repo_names = w.cfg.get("repo_names", [])
+                pol = w.cfg.get("ci_policy", "none")
+                detail = f"repos={','.join(repo_names)} policy={pol}"
                 audit_log(c.get("user", ""), c.get("host", ""), "set_ci_batch", detail)
+                for rn in repo_names:  # 原地更新 CI 欄，不整包 re-list
+                    self._patch_repo_row(rn, policy=pol)
         else:
             self.browse_status.setText("❌ " + msg.replace("\n", "　"))
             self.browse_status.setStyleSheet("color:#b00020;")
