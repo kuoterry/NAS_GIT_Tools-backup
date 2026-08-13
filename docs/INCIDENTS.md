@@ -121,3 +121,16 @@ Note the fix only reaches production when someone clicks "升級 CI 引擎" in t
 為什麼活了兩個版本沒被抓到：`python -c "import key_management"` 的驗證抓不到執行期 `NameError`；1.5.0 新加的 unittest 只測純函數，而這隻蟲正好長在 Worker 的成功路徑上。由第三方細讀代理發現（grep「呼叫了但沒定義」），不是使用者回報。
 
 修法（1.5.1）：`audit_log()` 回傳 `bool`、補上 `audit_failed_note()` 定義；`tests/test_key_management.py` 新增 `TestAuditPlumbing`，直接呼叫 `Worker._run_delete` 的封存成功路徑斷言 `done(True, …)`——教訓入庫：**純函數測試蓋不到「動作做完、回報路徑才炸」這種洞，關鍵 Worker 路徑要有煙霧測試**。
+
+---
+
+## 2026-08-13 — CI 引擎兩個「檢查早已停止檢查」：違規 log 從未有寫入者、profile 旋鈕從未被讀
+
+第三方細讀代理發現、解碼 `PATCHED_ENGINE_B64` 證實的兩個同型缺陷：
+
+1. **`logs/ci_violation.log` 全系統沒有任何寫入者。** 引擎的 `violate()` 只做 echo＋Telegram＋（strict 時）exit 1；90 行內沒有任何一行寫檔。下游 `ci_daily_violation_report.sh` 每天讀這個不存在的檔，讀不到就**主動發「🎉 今日沒有任何 CI 違規」**——不是沉默，是每天一封的假安心。Telegram 即時訊息又會被聊天室滾掉，違規歷史等於從未存在。修法：`violate()`/`hard_block()` 寫入 `date | repo | branch | reason | mode | user`（第 2 欄必須是 repo，日報的 `awk -F'|' '{print $2}'` 依賴它）。
+2. **`ci_profiles/<policy>.conf` 是死旋鈕。** 引擎只讀 `ci_policies/<repo>.policy` 與 `tg_bot.conf`，`ci_profiles/` 出現 0 次——但 `_run_hooks` 的報表把 conf 的 `PROTECT_MASTER` 等欄位印成生效中設定，`CiProfileDialog`（2.9.0 新做的編輯器）的警語也說改了會生效。修法：引擎先設內建預設值再 source conf；`PROTECT_MASTER` 實作為 hard block（不分 soft/strict——soft 下只警告等於沒保護）；新增 `MAX_FILE_MB`、`CHECK_SECRETS` 兩個新旋鈕。
+
+**部署當天的第三個坑（差點重演同一型）**：NAS 上其實一直存在舊的 conf 檔，用的是**另一套變數名與 yes/no 值**（`PROTECT_MASTER=yes`、`CHECK_COMMIT_FORMAT=`、`CHECK_BRANCH=`）——以前引擎不讀所以無所謂，新引擎一上線 source 進來，`"yes"` 過不了 `[ "$PROTECT_MASTER" = "1" ]`，master 保護在 soft repo 上**再次靜默失效**。當場抓到（部署後立刻 `cat` 全部 conf 檢查行尾與內容），修法雙管齊下：引擎加 `__flag()` 正規化（1/yes/true/on 都算開）、NAS 端 conf 改寫成正典旋鈕名（舊檔備份）。教訓：**啟用一個「一直存在但從未被讀」的設定檔之前，先看檔案裡實際寫了什麼**——它的內容從未被任何執行路徑驗證過。
+
+驗證：拋棄式 bare repo 真 push 11 案例全過（合規放行、壞訊息 strict 擋/soft 放、master 兩種 policy 都擋、2MB 超限擋、BOT_TOKEN 樣式擋、新分支 `--not --all` 路徑、yes 值正規化、CHECK_COMMIT_MSG=no 停用生效、log 欄位對齊日報 awk）。新引擎已部署 NAS（舊引擎與舊 conf 均有 .bak）。
