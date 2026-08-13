@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.11.0"
+__version__ = "2.12.0"
 
 import os
 import sys
@@ -7552,6 +7552,10 @@ class MainWindow(QMainWindow):
         self.restore_backup_btn.setToolTip("災難還原：把離站備份端點整份 clone --mirror 回 NAS，"
                                            "還原後請接著跑「一鍵修復」補 hooks。")
         self.restore_backup_btn.clicked.connect(self.on_restore_from_backup)
+        self.terminal_btn = QPushButton("🖥 開啟管理終端機")
+        self.terminal_btn.setToolTip("用目前身份開一個 ssh 視窗（sudo 診斷、貼腳本用）——"
+                                     "open_admin_terminal() 原本只在產生腳本視窗出現，這裡給它常駐入口。")
+        self.terminal_btn.clicked.connect(self.on_open_terminal)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
         og.addWidget(self.new_user_btn, 0, 2)
@@ -7562,6 +7566,7 @@ class MainWindow(QMainWindow):
         og.addWidget(self.deploy_tools_btn, 2, 1)
         og.addWidget(self.ci_profile_btn, 2, 2)
         og.addWidget(self.restore_backup_btn, 3, 0)
+        og.addWidget(self.terminal_btn, 3, 1)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視")
@@ -8645,6 +8650,13 @@ class MainWindow(QMainWindow):
 
     def on_audit_sync(self):
         self._start_maint("audit_sync", "同步稽核紀錄")
+
+    def on_open_terminal(self):
+        # 刻意不掛 set_busy：開終端機不佔 Worker，背景有操作在跑時照樣能開視窗查東西
+        cfg = dict(self.collect_identity_cfg())
+        ok, msg = open_admin_terminal(cfg)
+        if not ok:
+            QMessageBox.warning(self, "開啟終端機失敗", msg)
 
     def on_create_git_devs_user(self):
         cfg = dict(self.collect_identity_cfg())
