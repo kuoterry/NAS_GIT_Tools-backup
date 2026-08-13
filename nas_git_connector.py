@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.9.0"
+__version__ = "2.9.1"
 
 import os
 import sys
@@ -2290,6 +2290,11 @@ class Worker(QThread):
         if url:
             steps.append(f"url='{url}'")
             steps.append("git --git-dir=\"$repo\" remote add offsite-backup \"$url\" 2>&1")
+            # 拔掉 remote add 預設的 fetch refspec：留著的話 push 成功後 git 會順手更新
+            # refs/remotes/offsite-backup/*（opportunistic update），這些追蹤 refs 長在
+            # bare repo 裡，下一次 push --mirror 就會被當一般 refs 推進備份庫、永遠洗不掉。
+            # 首個 repo（NAS_GIT_Tools 自己）實測踩到才發現（2026-08-13）。
+            steps.append("git --git-dir=\"$repo\" config --unset-all remote.offsite-backup.fetch 2>/dev/null")
         steps.append("echo ___OK___")
         steps.append("true")
         rc, out, _ = self._ssh("\n".join(steps))
@@ -2386,6 +2391,9 @@ class Worker(QThread):
             "if err=$(git clone --mirror \"$url\" \"$repo\" 2>&1 >/dev/null); then",
             "  git --git-dir=\"$repo\" remote remove origin 2>/dev/null",
             "  git --git-dir=\"$repo\" remote add offsite-backup \"$url\" 2>/dev/null",
+            # 拔掉 fetch refspec：留著的話 push 成功後 git 會順手生出
+            # refs/remotes/offsite-backup/*，下一次 push --mirror 就把垃圾 refs 推進備份庫
+            "  git --git-dir=\"$repo\" config --unset-all remote.offsite-backup.fetch 2>/dev/null",
             "  git --git-dir=\"$repo\" config core.sharedRepository group 2>/dev/null",
             "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
             "  echo ___OK___",
