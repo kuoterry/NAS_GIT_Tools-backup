@@ -220,6 +220,70 @@ class TestAuditPlumbing(unittest.TestCase):
             km.APP_DIR, km.AUDIT_LOG_PATH, km.ARCHIVE_DIR = orig
 
 
+class TestIcaclsParsing(unittest.TestCase):
+    SAMPLE = (
+        "C:\\Users\\me\\.ssh\\id_test NT AUTHORITY\\SYSTEM:(F)\n"
+        "               BUILTIN\\Administrators:(F)\n"
+        "               BUILTIN\\Users:(RX)\n"
+        "               Everyone:(R)\n"
+        "               PC\\Git_User1:(F)\n"
+    )
+
+    def test_flags_broad_groups_only(self):
+        hits = km.parse_icacls_broad_principals(self.SAMPLE)
+        joined = " ".join(hits)
+        self.assertIn("Users", joined)
+        self.assertIn("Everyone", joined)
+        # 帳號名剛好含 user 子字串（Git_User1）不能誤中——token 帶反斜線+冒號界定
+        self.assertNotIn("Git_User1", joined)
+        self.assertNotIn("SYSTEM", joined)
+
+    def test_clean_acl_no_hits(self):
+        clean = ("C:\\k NT AUTHORITY\\SYSTEM:(F)\n"
+                 "     BUILTIN\\Administrators:(F)\n"
+                 "     PC\\terry:(F)\n")
+        self.assertEqual(km.parse_icacls_broad_principals(clean), [])
+
+    def test_first_line_filename_prefix(self):
+        # icacls 首行是「檔名 主體:(旗標)」黏在一起、沒有反斜線分隔——不能漏抓
+        sample = "C:\\keys\\id_x Everyone:(R)\n     PC\\terry:(F)\n"
+        hits = km.parse_icacls_broad_principals(sample)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Everyone", hits[0])
+
+
+class TestPairMismatch(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "需要 ssh-keygen")
+    def test_stale_pub_flagged(self):
+        # 兩把真鑰，把 B 的 .pub 蓋到 A 的 basename 上 → 配對驗證要抓到
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "id_a")
+            b = os.path.join(d, "id_b")
+            for p in (a, b):
+                subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", p],
+                               capture_output=True, input="", text=True, timeout=30, check=True)
+            shutil.copy2(b + ".pub", a + ".pub")   # A 的 .pub 現在是 B 的（stale/換過）
+            os.remove(b)
+            os.remove(b + ".pub")
+            records = km.build_records([d])
+            # build_records 會把掃描根目錄 normcase（Windows 全小寫），路徑比對要跟進
+            rec = next(r for r in records
+                       if os.path.normcase(r.get("priv_path") or "") == os.path.normcase(a))
+            self.assertTrue(rec.get("pair_mismatch"), "stale .pub 沒被抓到")
+            self.assertIn(".pub 與私鑰不是同一把", rec.get("advisories", ""))
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "需要 ssh-keygen")
+    def test_matching_pair_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "id_ok")
+            subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", a],
+                           capture_output=True, input="", text=True, timeout=30, check=True)
+            records = km.build_records([d])
+            rec = next(r for r in records
+                       if os.path.normcase(r.get("priv_path") or "") == os.path.normcase(a))
+            self.assertFalse(rec.get("pair_mismatch"))
+
+
 class TestMergeRegistries(unittest.TestCase):
     def _entry(self, last_seen, comment, **kw):
         e = {"fingerprint": "SHA256:x", "last_seen": last_seen, "comment": comment,
