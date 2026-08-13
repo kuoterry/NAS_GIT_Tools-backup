@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 
 import os
 import sys
@@ -79,6 +79,7 @@ TOOL_SCRIPT_NAMES = [
     "git_stats_report.sh",
     "send_email.py",
     "offsite_backup_sync.sh",
+    "nas_git_healthcheck.sh",
 ]
 
 
@@ -104,6 +105,10 @@ def tool_script_path(name: str) -> str:
 # NAS 端只留得住 push 記錄，這裡額外留一份本機紀錄方便事後追查「我到底做過什麼」。
 AUDIT_LOG_PATH = os.path.join(os.path.expanduser("~"), ".nas_git_connector", "audit.log")
 DESTRUCTIVE_MODES = {"delete", "rename_repo", "repo_gc", "tag_delete", "ssh_keys_delete", "archive_purge"}
+
+# 每次「伺服器空間總覽」都留一筆快照（JSONL：ts/pct/used_kb），趨勢才看得出誰在膨脹；
+# 只在本機累積，不上 NAS——這是觀測紀錄，不是設定。
+DISK_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".nas_git_connector", "disk_history.jsonl")
 
 # 新增 git_devs 帳號時自動產生的 DSM 登入密碼留底檔——明碼存放，僅供應急查回密碼用；
 # 這個檔案本身就是機密，請自行限制存取（例如搬到有加密的資料夾）並定期清理不再需要的紀錄。
@@ -131,7 +136,8 @@ def audit_log(user: str, host: str, action: str, detail: str) -> bool:
         os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{ts}\t{user}@{host}\t{action}\t{detail}\n")
+            # 機器欄位：多機合併（audit_sync）後才分得出同一身份是從哪台機器動的手
+            f.write(f"{ts}\t{user}@{host}\t{action}\t{detail}\t機器={socket.gethostname()}\n")
         return True
     except OSError as e:
         if not _AUDIT_LOG_WARNED:
@@ -890,6 +896,14 @@ class Worker(QThread):
             self._run_tg_conf_get()
         elif self.mode == "tg_conf_set":
             self._run_tg_conf_set()
+        elif self.mode == "ci_profile_get":
+            self._run_ci_profile_get()
+        elif self.mode == "ci_profile_set":
+            self._run_ci_profile_set()
+        elif self.mode == "audit_sync":
+            self._run_audit_sync()
+        elif self.mode == "restore_from_backup":
+            self._run_restore_from_backup()
         elif self.mode == "profile_sync_pull":
             self._run_profile_sync_pull()
         elif self.mode == "profile_sync_push":
@@ -2346,6 +2360,50 @@ class Worker(QThread):
         nok = body.count("[OK]")
         self.done.emit(nfail == 0, f"離站備份同步完成：成功 {nok}、失敗 {nfail}。")
 
+    # --- 災難還原：從離站備份端點把整個 repo clone --mirror 回 NAS ---
+    # clone --mirror 會把來源設成 remote.origin 且 mirror=true——那是「GitHub 鏡像」的
+    # 判定旗標（effective_repo_kind 視為權威），不拆掉的話還原回來的庫會被鏡像同步
+    # 排程一起掃、來源分類也會永遠顯示成鏡像。所以 clone 完立刻移除 origin，
+    # 改掛 remote.offsite-backup 指回備份端點（還原後的庫天然就該繼續備份到原處）。
+    def _run_restore_from_backup(self):
+        c = self.cfg
+        root = c["remote_root"]
+        url = (c.get("backup_url", "") or "").strip()
+        name = c.get("repo_name", "")
+        if not name.endswith(".git"):
+            name += ".git"
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規（僅允許中英數字與 . _ -）：{name!r}")
+            return
+        if not re.match(r"^(https://|http://|git@|ssh://|file://)[A-Za-z0-9@._:/~?=&%+\-]+$", url):
+            self.done.emit(False, "備份來源 URL 格式不合規（僅允許 https:// / git@ / ssh:// / file:// 開頭的正常網址）。")
+            return
+        self.log.emit(f"--- 災難還原：{name} ← {url} ---")
+        ok, body, hint = self._ssh_block([
+            f"BASE='{root}'; name='{name}'; url='{url}'",
+            "repo=\"$BASE/$name\"",
+            "if [ -e \"$repo\" ]; then echo EXISTS; echo ___END___; exit 0; fi",
+            "if err=$(git clone --mirror \"$url\" \"$repo\" 2>&1 >/dev/null); then",
+            "  git --git-dir=\"$repo\" remote remove origin 2>/dev/null",
+            "  git --git-dir=\"$repo\" remote add offsite-backup \"$url\" 2>/dev/null",
+            "  git --git-dir=\"$repo\" config core.sharedRepository group 2>/dev/null",
+            "  chgrp -R git_devs \"$repo\" 2>/dev/null; chmod -R g+rwX \"$repo\" 2>/dev/null; chmod g+s \"$repo\" 2>/dev/null",
+            "  echo ___OK___",
+            "else",
+            "  rm -rf \"$repo\"; echo CLONE_FAIL",
+            "  echo \"$err\" | tail -n 5",
+            "fi",
+        ], timeout=3600)
+        if "EXISTS" in body:
+            self.done.emit(False, f"倉庫已存在，未還原：{name}\n（若要覆蓋請先把現有的刪除/封存）")
+        elif ok and "___OK___" in body:
+            self.done.emit(True, f"已從備份還原：{name}\n來源：{url}\n"
+                                 "・已把來源掛回 remote.offsite-backup（之後照常參加離站備份同步）\n"
+                                 "・hooks / CI 引擎還沒補——請接著跑「一鍵修復」把 hook 模板套上")
+        else:
+            detail = "\n".join(body.splitlines()[1:]) if "CLONE_FAIL" in body else hint
+            self.done.emit(False, "還原失敗。" + (f"\n原因：\n{detail}" if detail else ""))
+
     # --- 設定/批次設定倉庫來源分類（nasgit.kind / nasgit.upstream / nasgit.kindsrc）---
     # 鏡像庫（remote.origin.mirror=true）一律拒寫：mirror 這個分類只認 git 原生的
     # mirror flag，不能被 nasgit.kind 蓋過去，避免兩個真相來源打架。
@@ -2770,6 +2828,8 @@ class Worker(QThread):
             "echo",
             "echo '== 各倉庫大小排行（前 10 大）=='",
             "for d in \"$BASE\"/*.git; do [ -d \"$d\" ] || continue; du -sh \"$d\" 2>/dev/null; done | sort -rh | head -10",
+            # 機器可讀快照行（-P/-k 固定格式，人看的 -h 版本上面照舊）：pct used_kb
+            "echo \"___USAGE___ $(df -P \"$BASE\" 2>/dev/null | awk 'NR==2 {gsub(\"%\",\"\",$5); print $5}') $(du -sk \"$BASE\" 2>/dev/null | cut -f1)\"",
             "echo ___END___",
             "true",
         ])
@@ -2777,8 +2837,58 @@ class Worker(QThread):
         if rc != 0:
             self.done.emit(False, "讀取伺服器空間資訊失敗：" + self._err_hint(err, rc))
             return
-        self.hooks.emit(self._between(out))
+        body = self._between(out)
+        trend = ""
+        usage_line = next((ln for ln in body.splitlines() if ln.startswith("___USAGE___")), "")
+        body = "\n".join(ln for ln in body.splitlines() if not ln.startswith("___USAGE___"))
+        parts = usage_line.split()
+        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            trend = self._disk_history_update(int(parts[1]), int(parts[2]))
+        self.hooks.emit((trend + "\n\n" if trend else "") + body)
         self.done.emit(True, "已讀取伺服器空間總覽。")
+
+    def _disk_history_update(self, pct: int, used_kb: int) -> str:
+        """把本次快照 append 進本機 disk_history.jsonl，回傳近 12 筆的趨勢文字。
+
+        同一天重複查詢只保留當天最後一筆（免得手癢連按十次灌爆歷史）。
+        讀寫失敗一律靜默降級成「沒有趨勢段」，不能因為觀測檔壞了擋掉主要輸出。
+        """
+        entries = []
+        try:
+            with open(DISK_HISTORY_PATH, encoding="utf-8") as f:
+                for ln in f:
+                    try:
+                        e = json.loads(ln)
+                        if isinstance(e, dict) and "ts" in e:
+                            entries.append(e)
+                    except ValueError:
+                        continue
+        except OSError:
+            pass
+        today = datetime.now().strftime("%Y-%m-%d")
+        entries = [e for e in entries if not str(e.get("ts", "")).startswith(today)]
+        entries.append({"ts": datetime.now().strftime("%Y-%m-%d %H:%M"), "pct": pct, "used_kb": used_kb})
+        try:
+            os.makedirs(os.path.dirname(DISK_HISTORY_PATH), exist_ok=True)
+            with open(DISK_HISTORY_PATH, "w", encoding="utf-8") as f:
+                for e in entries:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        if len(entries) < 2:
+            return "== 用量趨勢 ==\n（第一筆快照已記錄，之後每次查詢會累積出趨勢）"
+        lines = ["== 用量趨勢（近 12 筆快照，每日最多留一筆）=="]
+        recent = entries[-12:]
+        prev_kb = None
+        for e in recent:
+            gb = e.get("used_kb", 0) / 1048576
+            delta = ""
+            if prev_kb is not None:
+                d = (e.get("used_kb", 0) - prev_kb) / 1048576
+                delta = f"（{'+' if d >= 0 else ''}{d:.2f} GB）"
+            lines.append(f"{e.get('ts', '?')}  {e.get('pct', '?')}%  {gb:.2f} GB {delta}")
+            prev_kb = e.get("used_kb", 0)
+        return "\n".join(lines)
 
     # --- 讀取 Telegram 通知設定（CI 引擎與鏡像同步腳本共用的 config/tg_bot.conf）---
     def _run_tg_conf_get(self):
@@ -2823,6 +2933,108 @@ class Worker(QThread):
             self.done.emit(True, "已更新 Telegram 通知設定（舊檔已備份）。")
         else:
             self.done.emit(False, "更新 Telegram 通知設定失敗（連線或權限問題）。")
+
+    # --- 讀取全部 CI profile（ci_profiles/*.conf）內容 ---
+    # 這些是「共用」設定檔：一個 .conf 影響掛在該 policy 上的所有 repo，
+    # 跟 BranchProtectDialog 的單庫 git config 是兩層不同的機制（見 CLAUDE.md）。
+    def _run_ci_profile_get(self):
+        root = self.cfg["remote_root"]
+        self.log.emit("--- 讀取 CI profile 設定檔 ---")
+        ok, body, hint = self._ssh_block([
+            f"d='{root}/ci_profiles'",
+            "if [ -d \"$d\" ]; then",
+            "  for p in \"$d\"/*.conf; do",
+            "    [ -f \"$p\" ] || continue",
+            "    echo \"===FILE=== $(basename \"$p\")\"",
+            "    cat \"$p\"",
+            "  done",
+            "fi",
+        ])
+        if not ok:
+            self.done.emit(False, f"讀取 CI profile 失敗：{hint}")
+            return
+        self.hooks.emit(body)
+        self.done.emit(True, "已讀取 CI profile 設定檔。" if "===FILE===" in body
+                       else "NAS 上沒有 ci_profiles/*.conf（引擎會用內建預設值）。")
+
+    # --- 寫回單一 CI profile（base64 傳輸、寫前備份，同 tg_conf_set 慣例）---
+    def _run_ci_profile_set(self):
+        root = self.cfg["remote_root"]
+        fname = self.cfg.get("profile_file", "")
+        content = self.cfg.get("profile_content", "")
+        # 檔名白名單：純檔名（不得含路徑），且必須是 .conf
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.conf$", fname):
+            self.done.emit(False, f"profile 檔名不合規：{fname!r}")
+            return
+        self.log.emit(f"--- 更新 CI profile：{fname} ---")
+        b64 = base64.b64encode(content.replace("\r\n", "\n").encode("utf-8")).decode("ascii")
+        ok, body, hint = self._ssh_block([
+            f"d='{root}/ci_profiles'; f=\"$d/{fname}\"",
+            "mkdir -p \"$d\"",
+            "[ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
+            f"printf '%s' '{b64}' | base64 -d > \"$f\"",
+            "echo ___OK___",
+        ])
+        if ok and "___OK___" in body:
+            self.done.emit(True, f"已更新 {fname}（舊檔已備份）。\n"
+                                 "注意：這是共用 profile，掛在這個 policy 上的所有 repo 下一次 push 就會吃到新設定。")
+        else:
+            self.done.emit(False, f"更新 {fname} 失敗：{hint}")
+
+    # --- 同步本機稽核紀錄（多機合併）：本機 audit.log 與 NAS config/audit_sync.log
+    #     取聯集（行首是 ISO 時戳，sort -u 的字典序就是時間序），兩邊都換成合併結果。
+    #     上傳走「分段 append 到遠端暫存檔再一次解碼」：整份 base64 塞進單一 ssh 命令
+    #     會踩 Windows 32767 字元 argv 上限（Key_Management 的名冊同步踩過同一個雷）。---
+    def _run_audit_sync(self):
+        root = self.cfg["remote_root"]
+        self.log.emit("--- 同步稽核紀錄（多機合併）---")
+        try:
+            with open(AUDIT_LOG_PATH, encoding="utf-8") as f:
+                local_text = f.read()
+        except OSError:
+            local_text = ""
+        n_local = len([ln for ln in local_text.splitlines() if ln.strip()])
+        b64 = base64.b64encode(local_text.encode("utf-8")).decode("ascii")
+        chunks = [b64[i:i + 16000] for i in range(0, len(b64), 16000)] or [""]
+        ok, _, hint = self._ssh_block([
+            f"d='{root}/config'", "mkdir -p \"$d\"", "rm -f \"$d/audit_sync.upb64\"", "echo ___OK___",
+        ])
+        if not ok:
+            self.done.emit(False, f"同步稽核紀錄失敗（初始化上傳暫存檔）：{hint}")
+            return
+        for i, ch in enumerate(chunks, 1):
+            if len(chunks) > 1:
+                self.log.emit(f"上傳分段 {i}/{len(chunks)}…")
+            ok, _, hint = self._ssh_block([
+                f"printf '%s' '{ch}' >> '{root}/config/audit_sync.upb64'", "echo ___OK___",
+            ])
+            if not ok:
+                self.done.emit(False, f"同步稽核紀錄失敗（上傳分段 {i}/{len(chunks)}）：{hint}")
+                return
+        ok, body, hint = self._ssh_block([
+            f"d='{root}/config'; f=\"$d/audit_sync.log\"; up=\"$d/audit_sync.upb64\"",
+            "[ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
+            "{ [ -f \"$up\" ] && base64 -d < \"$up\"; [ -f \"$f\" ] && cat \"$f\"; } | grep -v '^[[:space:]]*$' | sort -u > \"$f.new\"",
+            "mv \"$f.new\" \"$f\"; chmod 600 \"$f\"; rm -f \"$up\"",
+            "cat \"$f\"",
+        ])
+        if not ok:
+            self.done.emit(False, f"同步稽核紀錄失敗（合併）：{hint}")
+            return
+        merged = body.strip("\n")
+        try:
+            if os.path.exists(AUDIT_LOG_PATH):
+                shutil.copy2(AUDIT_LOG_PATH,
+                             AUDIT_LOG_PATH + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+            os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
+            with open(AUDIT_LOG_PATH, "w", encoding="utf-8") as f:
+                f.write(merged + ("\n" if merged else ""))
+        except OSError as e:
+            # NAS 端已經合併成功，本機寫不回去要講清楚，不能讓使用者以為兩邊都同步好了
+            self.done.emit(False, f"NAS 端已合併，但本機稽核檔寫回失敗：{e}")
+            return
+        n_merged = len([ln for ln in merged.splitlines() if ln.strip()])
+        self.done.emit(True, f"稽核紀錄已同步：本機原有 {n_local} 筆 → 合併後 {n_merged} 筆（兩邊一致，舊檔各自留有備份）。")
 
     # --- 讀取跨機器共享的身份設定（config/profiles_sync.json；只含 user/host/remote_root/
     #     updated_at/machines，絕不含密碼或 identity_file——那兩者是機器本地的東西）---
@@ -4331,6 +4543,166 @@ class NotifyConfigDialog(QDialog):
         else:
             self.status.setText("❌ " + msg)
             self.status.setStyleSheet("color:#b00020;")
+
+
+# ============================================================
+# CI Profile（ci_profiles/*.conf）編輯 對話框
+# 共用 profile：一個 .conf 影響掛在該 policy 上的所有 repo——跟單庫的
+# BranchProtectDialog（git 原生 denyDeletes/denyNonFastForwards）是兩層機制。
+# ============================================================
+class CiProfileDialog(QDialog):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.worker = None
+        self._profiles = {}
+        self._current = ""
+        self.setWindowTitle("CI Profile 設定（共用檔）")
+        self.resize(560, 420)
+        lay = QVBoxLayout(self)
+        warn = QLabel("⚠ 這些是 CI 引擎的共用 profile（NAS 上 ci_profiles/*.conf）："
+                      "改一個檔會影響掛在該 policy 上的「所有」repo 的下一次 push。"
+                      "純文字直接編輯（如 PROTECT_MASTER=1），存檔前舊檔自動備份。")
+        warn.setWordWrap(True)
+        lay.addWidget(warn)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Profile 檔："))
+        self.combo = QComboBox()
+        self.combo.currentTextChanged.connect(self._on_switch)
+        row.addWidget(self.combo, stretch=1)
+        lay.addLayout(row)
+        self.editor = QPlainTextEdit()
+        self.editor.setFont(QFont("Consolas", 10))
+        lay.addWidget(self.editor, stretch=1)
+        self.status = QLabel("讀取中…")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Close)
+        self.bb.accepted.connect(self.on_save)
+        self.bb.rejected.connect(self.reject)
+        self.bb.setEnabled(False)
+        lay.addWidget(self.bb)
+        self._load()
+
+    def _load(self):
+        self.worker = Worker(dict(self.cfg), mode="ci_profile_get")
+        self.worker.hooks.connect(self._on_loaded)
+        self.worker.done.connect(self._on_load_done)
+        self.worker.start()
+
+    def _on_loaded(self, text):
+        name = None
+        buf = []
+        for ln in text.splitlines():
+            if ln.startswith("===FILE=== "):
+                if name is not None:
+                    self._profiles[name] = "\n".join(buf)
+                name = ln[len("===FILE=== "):].strip()
+                buf = []
+            elif name is not None:
+                buf.append(ln)
+        if name is not None:
+            self._profiles[name] = "\n".join(buf)
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        self.combo.addItems(sorted(self._profiles))
+        self.combo.blockSignals(False)
+        if self._profiles:
+            first = sorted(self._profiles)[0]
+            self._current = first
+            self.combo.setCurrentText(first)
+            self.editor.setPlainText(self._profiles[first])
+
+    def _on_load_done(self, ok, msg):
+        self.bb.setEnabled(ok and bool(self._profiles))
+        if ok and not self._profiles:
+            self.status.setText("NAS 上沒有 ci_profiles/*.conf——引擎會用內建預設值，這裡沒東西可編輯。")
+        else:
+            self.status.setText("" if ok else ("❌ " + msg))
+            self.status.setStyleSheet("" if ok else "color:#b00020;")
+
+    def _on_switch(self, name):
+        # 換檔前把目前編輯內容收回字典，切回來不會丟
+        if self._current in self._profiles:
+            self._profiles[self._current] = self.editor.toPlainText()
+        self._current = name
+        self.editor.setPlainText(self._profiles.get(name, ""))
+
+    def on_save(self):
+        fname = self.combo.currentText()
+        if not fname:
+            return
+        r = QMessageBox.question(
+            self, "確認寫回共用 profile",
+            f"確定要覆寫 NAS 上的 ci_profiles/{fname} 嗎？\n"
+            "掛在這個 policy 上的所有 repo 下一次 push 就會吃到新設定（舊檔會自動備份）。")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self.bb.setEnabled(False)
+        self.status.setText("儲存中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["profile_file"] = fname
+        cfg["profile_content"] = self.editor.toPlainText()
+        self.worker = Worker(cfg, mode="ci_profile_set")
+        self.worker.done.connect(self._on_saved)
+        self.worker.start()
+
+    def _on_saved(self, ok, msg):
+        self.bb.setEnabled(True)
+        if ok:
+            self._profiles[self.combo.currentText()] = self.editor.toPlainText()
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""),
+                      "ci_profile_set", self.combo.currentText())
+            QMessageBox.information(self, "完成", msg)
+        else:
+            self.status.setText("❌ " + msg)
+            self.status.setStyleSheet("color:#b00020;")
+
+
+# ============================================================
+# 災難還原 對話框（從離站備份端點 clone --mirror 回 NAS）
+# ============================================================
+class RestoreFromBackupDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("從離站備份還原")
+        self.setMinimumWidth(480)
+        lay = QVBoxLayout(self)
+        note = QLabel("把離站備份端點（例如 GitHub 私有備份庫）整份 clone --mirror 回 NAS。\n"
+                      "・NAS 上同名倉庫已存在會拒絕還原（要覆蓋請先刪除/封存）\n"
+                      "・還原後來源會掛回 remote.offsite-backup，照常參加之後的備份同步\n"
+                      "・hooks / CI 引擎不會自動補——還原完請接著跑「一鍵修復」")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        g = QGridLayout()
+        g.addWidget(QLabel("倉庫名稱："), 0, 0)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("例如 MyProject（自動補 .git）")
+        g.addWidget(self.name_edit, 0, 1)
+        g.addWidget(QLabel("備份來源 URL："), 1, 0)
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://github.com/<me>/<backup>.git 或 git@…")
+        g.addWidget(self.url_edit, 1, 1)
+        lay.addLayout(g)
+        self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.bb.accepted.connect(self._check_accept)
+        self.bb.rejected.connect(self.reject)
+        lay.addWidget(self.bb)
+
+    def _check_accept(self):
+        name = self.name_edit.text().strip()
+        base = name[:-4] if name.endswith(".git") else name
+        if not is_safe_name(base or name):
+            QMessageBox.warning(self, "名稱不合規", "倉庫名稱僅允許中英數字與 . _ -（不可為空）。")
+            return
+        if not self.url_edit.text().strip():
+            QMessageBox.warning(self, "缺少 URL", "請填備份來源 URL。")
+            return
+        self.accept()
+
+    def values(self):
+        return self.name_edit.text().strip(), self.url_edit.text().strip()
 
 
 # ============================================================
@@ -6528,9 +6900,17 @@ class MainWindow(QMainWindow):
         self.git_devs_cred_btn.clicked.connect(self.on_view_git_devs_creds)
         self.deploy_tools_btn = QPushButton("部署排程腳本…")
         self.deploy_tools_btn.setToolTip(
-            "把 repo 內的 server-side 排程腳本（鏡像同步/CI 日報/推送統計/寄信）部署到 NAS 的 tools/，"
-            "舊檔自動備份。DSM 任務排程表的排程項目仍需自行設定一次。")
+            "把 repo 內的 server-side 排程腳本（鏡像同步/CI 日報/推送統計/寄信/離站備份/排程健檢）"
+            "部署到 NAS 的 tools/，舊檔自動備份。DSM 任務排程表的排程項目仍需自行設定一次。")
         self.deploy_tools_btn.clicked.connect(self.on_deploy_tools)
+        self.ci_profile_btn = QPushButton("CI Profile 設定…")
+        self.ci_profile_btn.setToolTip("編輯 ci_profiles/*.conf（共用 profile，如 PROTECT_MASTER）——"
+                                       "影響掛在該 policy 上的所有 repo，跟單庫的分支保護是兩層機制。")
+        self.ci_profile_btn.clicked.connect(self.on_ci_profile)
+        self.restore_backup_btn = QPushButton("從離站備份還原…")
+        self.restore_backup_btn.setToolTip("災難還原：把離站備份端點整份 clone --mirror 回 NAS，"
+                                           "還原後請接著跑「一鍵修復」補 hooks。")
+        self.restore_backup_btn.clicked.connect(self.on_restore_from_backup)
         og.addWidget(self.hc_btn, 0, 0)
         og.addWidget(self.repair_btn, 0, 1)
         og.addWidget(self.new_user_btn, 0, 2)
@@ -6539,6 +6919,8 @@ class MainWindow(QMainWindow):
         og.addWidget(self.git_devs_list_btn, 1, 2)
         og.addWidget(self.git_devs_cred_btn, 2, 0)
         og.addWidget(self.deploy_tools_btn, 2, 1)
+        og.addWidget(self.ci_profile_btn, 2, 2)
+        og.addWidget(self.restore_backup_btn, 3, 0)
         mp.addWidget(ops_box)
 
         log_box = QGroupBox("日誌檢視（最後 200 筆）")
@@ -6552,10 +6934,15 @@ class MainWindow(QMainWindow):
         self.audit_log_btn = QPushButton("本機操作稽核紀錄")
         self.audit_log_btn.setToolTip("這套工具在本機做過的刪除/砍 tag/砍金鑰/GC/批次清封存等破壞性動作紀錄。")
         self.audit_log_btn.clicked.connect(self.on_view_audit_log)
+        self.audit_sync_btn = QPushButton("☁ 同步稽核紀錄（多機合併）")
+        self.audit_sync_btn.setToolTip("本機 audit.log 與 NAS config/audit_sync.log 取聯集後兩邊同步——"
+                                       "家裡/公司各自的操作紀錄合成一份完整時間軸（兩邊舊檔都會備份）。")
+        self.audit_sync_btn.clicked.connect(self.on_audit_sync)
         lg.addWidget(self.push_log_btn, 0, 0)
         lg.addWidget(self.viol_log_btn, 0, 1)
         lg.addWidget(self.dbg_log_btn, 0, 2)
         lg.addWidget(self.audit_log_btn, 1, 0)
+        lg.addWidget(self.audit_sync_btn, 1, 1)
         mp.addWidget(log_box)
 
         self.maint_status = QLabel("維運動作都會走目前選定的身份（金鑰/plink）。")
@@ -6958,6 +7345,7 @@ class MainWindow(QMainWindow):
         self.ssh_keys_btn.setEnabled(not busy)
         for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.notify_btn,
                   self.git_devs_list_btn, self.git_devs_cred_btn, self.deploy_tools_btn,
+                  self.ci_profile_btn, self.restore_backup_btn, self.audit_sync_btn,
                   self.push_log_btn, self.viol_log_btn, self.dbg_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
@@ -7526,6 +7914,23 @@ class MainWindow(QMainWindow):
         self.save_current_profile(silent=True)
         dlg = NotifyConfigDialog(self, cfg)
         dlg.exec()
+
+    def on_ci_profile(self):
+        cfg = dict(self.collect_identity_cfg())
+        self.save_current_profile(silent=True)
+        dlg = CiProfileDialog(self, cfg)
+        dlg.exec()
+
+    def on_restore_from_backup(self):
+        dlg = RestoreFromBackupDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, url = dlg.values()
+        self._start_maint("restore_from_backup", "從離站備份還原",
+                          extra={"repo_name": name, "backup_url": url})
+
+    def on_audit_sync(self):
+        self._start_maint("audit_sync", "同步稽核紀錄")
 
     def on_create_git_devs_user(self):
         cfg = dict(self.collect_identity_cfg())
