@@ -50,6 +50,7 @@ rem deploy them to NAS tools/ and hash-compare them in the health check.
   --add-data "git_stats_report.sh;." ^
   --add-data "send_email.py;." ^
   --add-data "offsite_backup_sync.sh;." ^
+  --add-data "nas_git_healthcheck.sh;." ^
   nas_git_connector.py
 if errorlevel 1 (
   echo [ERROR] Packaging failed. See messages above.
