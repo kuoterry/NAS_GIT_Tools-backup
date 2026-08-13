@@ -57,7 +57,7 @@ try:
 except ImportError:
     pyzipper = None
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -333,6 +333,62 @@ def derive_pubkey_via_sshkeygen(path: str):
         return None, str(e)
 
 
+# --- 私鑰檔權限檢查：Windows OpenSSH 遇到 ACL 過寬會「靜默忽略金鑰、退回密碼登入」，
+# 不報任何錯（NasGitConnector 那邊 2026-07-15 的真實事故就是這一型）——本機端之前零可見度 ---
+
+# icacls 輸出裡代表「過寬」的授權主體短名（去掉網域前綴後比對；群組名在中文
+# Windows 通常仍是英文，中英兩種都認）。用「完整短名」比對而不是子字串——
+# 帳號名剛好含 user（如 Git_User1）不能被誤中。
+_BROAD_PRINCIPAL_NAMES = {
+    "everyone", "users", "authenticated users", "每個人", "使用者", "已驗證的使用者",
+}
+
+
+def parse_icacls_broad_principals(icacls_output: str):
+    """從 icacls 輸出行挑出「過寬」的授權主體，回傳主體字串清單（找不到＝權限乾淨）。
+
+    每行格式（首行前綴檔名）：[檔名 ]DOMAIN\\Principal:(旗標)。取 ":(" 前的主體、
+    去掉最後一個反斜線前的網域，再跟過寬名單比對完整短名。
+    拆成純函數是為了可測：真實輸出長相用樣本釘在測試裡，不用真的動檔案 ACL。"""
+    hits = []
+    for ln in icacls_output.splitlines():
+        s = ln.strip()
+        if ":(" not in s:
+            continue
+        principal = s.split(":(", 1)[0]
+        short = principal.rsplit("\\", 1)[-1].strip().lower()
+        # 首行主體前面黏著檔名（無反斜線分隔，如 "C:\k Everyone"）——
+        # 再用最後一/兩個空白詞比對一次（"authenticated users" 是兩個詞）
+        words = short.split()
+        candidates = {short}
+        if words:
+            candidates.add(words[-1])
+            candidates.add(" ".join(words[-2:]))
+        if candidates & _BROAD_PRINCIPAL_NAMES:
+            hits.append(s)
+    return hits
+
+
+def check_private_key_permissions(path: str):
+    """檢查私鑰檔權限是否過寬。回傳過寬描述字串；乾淨或無法判斷回 ""。
+
+    POSIX：st_mode 的 group/other 位元非零即過寬。
+    Windows：shell out 到 icacls 解析授權主體（僅讀取 ACL，不碰檔案內容）。
+    讀不到/工具缺失一律回 ""——這是 advisory，不確定時寧可安靜也不誤報。"""
+    try:
+        if os.name != "nt":
+            mode = os.stat(path).st_mode & 0o077
+            return f"group/other 可存取（mode …{oct(os.stat(path).st_mode)[-3:]}）" if mode else ""
+        cp = subprocess.run(["icacls", path], capture_output=True, text=True,
+                            timeout=10, input="", creationflags=_NO_WINDOW)
+        if cp.returncode != 0:
+            return ""
+        hits = parse_icacls_broad_principals(cp.stdout)
+        return ("、".join(h.split(":")[0].split("\\")[-1] or h for h in hits[:3]) + " 可存取") if hits else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
 # 掃描時直接跳過的大型雜訊目錄（加大資料夾如 Documents 時不用每檔讀 16KB）
 SKIP_DIRNAMES = {".git", "node_modules", "__pycache__", ".venv", "venv", "$RECYCLE.BIN"}
 
@@ -392,6 +448,12 @@ def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict 
             notes.append("⚠ 私鑰未加密（.ppk 請用 PuTTYgen 加密，或先轉成 OpenSSH 再加）")
         else:
             notes.append("⚠ 私鑰未加密（可用「加上密碼保護…」補上）")
+    if rec.get("pair_mismatch"):
+        notes.append("⚠ .pub 與私鑰不是同一把（.pub 可能過期——指紋/強度是照 .pub 算的，"
+                     "可用「重建 .pub」修復）")
+    if rec.get("perm_loose"):
+        notes.append(f"⚠ 私鑰檔權限過寬（{rec['perm_loose']}）——Windows OpenSSH 會靜默忽略"
+                     "這種金鑰退回密碼登入（icacls <檔案> /inheritance:r /grant:r <你>:F 可收緊）")
     if rec.get("pub_path") and not rec.get("priv_path"):
         notes.append("ℹ 找不到對應私鑰（可能已刪除或不在掃描範圍）")
     if rec.get("priv_path") and not rec.get("pub_path") and not rec.get("blob"):
@@ -666,6 +728,16 @@ def build_records(folders, errors: list = None, age_days: int = DEFAULT_KEY_AGE_
                                    comment=parsed["comment"], derived=True)
                 else:
                     rec["derive_error"] = derive_err
+            elif pub_path and rec.get("blob") is not None and priv_info and priv_info["encrypted"] is False:
+                # 配對驗證：同 basename 不代表同一把——.pub 過期/被換過的話，
+                # 指紋（所有跨機器比對的主鍵）、強度、agent 對應全都跟著錯，
+                # 而且沒有這個檢查時完全無聲。加密私鑰無法驗證（要 passphrase），略過。
+                derived, _err = derive_pubkey_via_sshkeygen(priv_path)
+                if derived:
+                    dparsed = parse_pubkey_line(derived)
+                    if dparsed and dparsed["blob"] != rec["blob"]:
+                        rec["pair_mismatch"] = True
+            rec["perm_loose"] = check_private_key_permissions(priv_path)
         records.append(rec)
 
     for ppk_path in all_ppk:
@@ -674,6 +746,7 @@ def build_records(folders, errors: list = None, age_days: int = DEFAULT_KEY_AGE_
         rec = {
             "pub_path": None, "priv_path": ppk_path,
             "priv_format": "ppk", "priv_encrypted": cls["encrypted"] if cls else None,
+            "perm_loose": check_private_key_permissions(ppk_path),
         }
         if parsed:
             rec.update(type=parsed["type"], blob=parsed["blob"], comment=parsed["comment"])
@@ -1006,6 +1079,10 @@ class Worker(QThread):
                 self._run_list_agent_keys()
             elif self.mode == "convert_ppk":
                 self._run_convert_ppk()
+            elif self.mode == "rebuild_pub":
+                self._run_rebuild_pub()
+            elif self.mode == "compare_authorized_keys":
+                self._run_compare_authorized_keys()
             else:
                 self.done.emit(False, f"未知模式：{self.mode}")
         except Exception as e:
@@ -1471,6 +1548,78 @@ class Worker(QThread):
         aud_ok = audit_log("convert_ppk", f"{ppk_path} -> {out_path}")
         self.done.emit(True, f"已轉換為 OpenSSH 格式：\n{out_path}\n"
                              "（原 .ppk 保留未動；重新掃描後新檔會出現在報表）" + audit_failed_note(aud_ok))
+
+    def _run_rebuild_pub(self):
+        """從私鑰重建 .pub（配對驗證抓到 stale .pub 時的修復手段）。舊 .pub 先備份。"""
+        priv_path = self.params.get("priv_path", "")
+        pub_path = self.params.get("pub_path", "")
+        if not priv_path or not os.path.exists(priv_path):
+            self.done.emit(False, f"找不到私鑰：{priv_path}")
+            return
+        if not pub_path:
+            pub_path = priv_path + ".pub"
+        derived, reason = derive_pubkey_via_sshkeygen(priv_path)
+        if not derived:
+            self.done.emit(False, f"無法從私鑰推導公鑰：{reason}")
+            return
+        try:
+            if os.path.exists(pub_path):
+                backup = pub_path + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+                shutil.copy2(pub_path, backup)
+            with open(pub_path, "w", encoding="utf-8") as f:
+                f.write(derived + "\n")
+        except OSError as e:
+            self.done.emit(False, f"寫入 .pub 失敗：{e}")
+            return
+        aud_ok = audit_log("rebuild_pub", pub_path)
+        self.done.emit(True, f"已用私鑰重建 .pub：\n{pub_path}\n（舊檔已備份 .bak-時間戳）" + audit_failed_note(aud_ok))
+
+    def _run_compare_authorized_keys(self):
+        """唯讀比對 NAS 上「目前同步身份」的 authorized_keys 與本機金鑰——輪替流程的驗收閉環。
+        只 cat 自己的 authorized_keys，不 sudo、不寫入；撤銷金鑰仍歸 NasGitConnector 管。"""
+        sync_cfg = self.params.get("sync_cfg", {})
+        local_fps = self.params.get("local_fps", {})   # {SHA256:xxx: 描述}
+        if not (sync_cfg.get("host") and sync_cfg.get("user")):
+            self.done.emit(False, "同步設定未填 host/user，請先到「⚙ 雲端同步設定…」設定。")
+            return
+        self.log.emit(f"--- 讀取 {sync_cfg.get('user')}@{sync_cfg.get('host')} 的 authorized_keys ---")
+        cmd = "\n".join([
+            "echo ___BEGIN___",
+            "cat \"$HOME/.ssh/authorized_keys\" 2>/dev/null",
+            "echo ___END___",
+            "true",
+        ])
+        rc, out, err = _sync_ssh(sync_cfg, cmd)
+        if rc != 0:
+            self.done.emit(False, f"連線失敗：{(err or out).strip() or 'SSH 錯誤'}")
+            return
+        remote_lines = [ln.strip() for ln in _between(out).splitlines()
+                        if ln.strip() and not ln.strip().startswith("#")]
+        matched, remote_only = [], []
+        seen_remote_fps = set()
+        for ln in remote_lines:
+            parsed = parse_pubkey_line(ln)
+            fp = ssh_fingerprint(parsed["blob"]) if parsed else ""
+            comment = parsed["comment"] if parsed else "（解析不了的行）"
+            if fp:
+                seen_remote_fps.add(fp)
+            if fp and fp in local_fps:
+                matched.append(f"✔ {fp}  {comment}\n   ↳ 本機：{local_fps[fp]}")
+            else:
+                remote_only.append(f"❓ {fp or '?'}  {comment}\n   ↳ NAS 授權了，但這台機器沒有這把"
+                                   "（別台機器的？還是該撤銷的殘留？）")
+        local_only = [f"⬆ {fp}  {label}" for fp, label in sorted(local_fps.items())
+                      if fp not in seen_remote_fps]
+        report = [f"NAS（{sync_cfg.get('user')}@{sync_cfg.get('host')}）authorized_keys 共 {len(remote_lines)} 行\n"]
+        report.append(f"== 兩邊都有（{len(matched)}）==")
+        report += matched or ["（無）"]
+        report.append(f"\n== 只在 NAS（{len(remote_only)}）==")
+        report += remote_only or ["（無）"]
+        report.append(f"\n== 只在本機（{len(local_only)}）——這些金鑰連不上這個 NAS 身份 ==")
+        report += local_only or ["（無）"]
+        report.append("\nℹ 撤銷 NAS 端金鑰請用 NasGitConnector 的「SSH 金鑰管理」；本工具只讀不寫。")
+        self.result.emit("\n".join(report))
+        self.done.emit(True, f"比對完成：兩邊都有 {len(matched)}、只在 NAS {len(remote_only)}、只在本機 {len(local_only)}。")
 
 
 # ============================================================
@@ -2251,6 +2400,10 @@ class MainWindow(QMainWindow):
         self.convert_b.setEnabled(False)
         self.convert_b.setToolTip("用 puttygen 把 PuTTY .ppk 轉成 OpenSSH 私鑰格式（原檔保留）。")
         self.convert_b.clicked.connect(self.on_convert_ppk)
+        self.rebuild_pub_b = QPushButton("重建 .pub")
+        self.rebuild_pub_b.setEnabled(False)
+        self.rebuild_pub_b.setToolTip("配對驗證抓到 .pub 與私鑰不一致時，用私鑰重新推導 .pub（舊檔備份）。")
+        self.rebuild_pub_b.clicked.connect(self.on_rebuild_pub)
         self.copy_pub_b = QPushButton("複製公鑰")
         self.copy_pub_b.setEnabled(False)
         self.copy_pub_b.clicked.connect(self.on_copy_pub)
@@ -2259,7 +2412,7 @@ class MainWindow(QMainWindow):
         self.open_folder_b.clicked.connect(self.on_open_folder)
         for b in (self.gen_b, self.archive_del_b, self.hard_del_b, self.backup_b,
                   self.view_raw_b, self.encrypt_b, self.rotate_b, self.convert_b,
-                  self.copy_pub_b, self.open_folder_b):
+                  self.rebuild_pub_b, self.copy_pub_b, self.open_folder_b):
             arow.addWidget(b)
         arow.addStretch(1)
         lay.addLayout(arow)
@@ -2277,6 +2430,10 @@ class MainWindow(QMainWindow):
         self.agent_b = QPushButton("ssh-agent 盤點…")
         self.agent_b.setToolTip("列出 ssh-agent 目前載入的金鑰，比對名冊/本次掃描結果。不含 Pageant。")
         self.agent_b.clicked.connect(self.on_agent_keys)
+        self.authcmp_b = QPushButton("NAS 授權比對…")
+        self.authcmp_b.setToolTip("唯讀比對 NAS 上（雲端同步身份）authorized_keys 與本機金鑰——"
+                                  "輪替後驗證「本機這把在遠端到底認不認」。撤銷仍走 NasGitConnector。")
+        self.authcmp_b.clicked.connect(self.on_compare_authorized)
         self.sync_config_b = QPushButton("⚙ 雲端同步設定…")
         self.sync_config_b.clicked.connect(self.on_sync_config)
         self.sync_overview_b = QPushButton("🌐 跨電腦金鑰總覽…")
@@ -2288,6 +2445,7 @@ class MainWindow(QMainWindow):
         brow.addWidget(self.registry_b)
         brow.addWidget(self.known_hosts_b)
         brow.addWidget(self.agent_b)
+        brow.addWidget(self.authcmp_b)
         brow.addWidget(self.sync_config_b)
         brow.addWidget(self.sync_overview_b)
         brow.addStretch(1)
@@ -2321,7 +2479,8 @@ class MainWindow(QMainWindow):
     def _busy(self, b):
         for x in (self.scan_b, self.gen_b, self.archive_mgmt_b, self.audit_b, self.export_b,
                   self.archive_del_b, self.hard_del_b, self.backup_b, self.view_raw_b,
-                  self.encrypt_b, self.rotate_b, self.convert_b, self.agent_b,
+                  self.encrypt_b, self.rotate_b, self.convert_b, self.rebuild_pub_b,
+                  self.agent_b, self.authcmp_b,
                   self.known_hosts_b, self.sync_config_b, self.sync_overview_b, self.registry_b):
             x.setEnabled(not b)
         if not b:
@@ -2416,6 +2575,7 @@ class MainWindow(QMainWindow):
                                   and rec.get("priv_format") != "ppk")
         self.rotate_b.setEnabled(has_priv and rec.get("priv_format") != "ppk")
         self.convert_b.setEnabled(has_priv and rec.get("priv_format") == "ppk")
+        self.rebuild_pub_b.setEnabled(has_priv and bool(rec.get("pair_mismatch")))
         self.copy_pub_b.setEnabled(has_pub_content)
         self.open_folder_b.setEnabled(has)
 
@@ -2649,6 +2809,65 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_mutating_done)
         self.worker.start()
+
+    def on_rebuild_pub(self):
+        rec = self._selected_record()
+        if not rec or not rec.get("priv_path") or not rec.get("pair_mismatch"):
+            return
+        r = QMessageBox.question(
+            self, "重建 .pub",
+            f"將用私鑰重新推導並覆寫：\n{rec.get('pub_path') or rec['priv_path'] + '.pub'}\n"
+            "（舊 .pub 會先備份成 .bak-時間戳）\n\n"
+            "⚠ 先想一下：如果其實是「私鑰被換過、.pub 才是對的」，該修的是私鑰不是 .pub。確定重建？")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._busy(True)
+        self.status.setText("重建 .pub 中…")
+        self.status.setStyleSheet("")
+        keep_worker_alive(self)
+        self.worker = Worker("rebuild_pub", {"priv_path": rec["priv_path"],
+                                             "pub_path": rec.get("pub_path") or ""})
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self._on_mutating_done)
+        self.worker.start()
+
+    def on_compare_authorized(self):
+        sync_cfg = load_sync_config()
+        if not (sync_cfg.get("host") and sync_cfg.get("user")):
+            QMessageBox.information(self, "需要同步設定",
+                                    "這個功能用「⚙ 雲端同步設定…」的連線身份去讀 NAS 上的 authorized_keys，"
+                                    "請先設定 host/user（與金鑰）。")
+            return
+        # 本機指紋集：本次掃描 + 名冊（讀不到名冊就只用掃描結果）
+        local_fps = {}
+        for rec in (getattr(self, "records", None) or []):
+            fp = rec.get("fingerprint")
+            if fp:
+                local_fps.setdefault(fp, rec.get("priv_path") or rec.get("pub_path")
+                                     or rec.get("comment") or "")
+        try:
+            for entry in load_registry().values():
+                fp = entry.get("fingerprint")
+                if fp and fp not in local_fps:
+                    local_fps[fp] = "（名冊）" + (entry.get("comment") or entry.get("pub_path") or "")
+        except Exception:
+            pass
+        if not local_fps:
+            QMessageBox.information(self, "先掃描", "還沒有本機金鑰資料——先跑一次掃描再比對。")
+            return
+        self._busy(True)
+        self.status.setText("讀取 NAS authorized_keys 中…")
+        self.status.setStyleSheet("")
+        keep_worker_alive(self)
+        self.worker = Worker("compare_authorized_keys",
+                             {"sync_cfg": sync_cfg, "local_fps": local_fps})
+        self.worker.log.connect(self.append_log)
+        self.worker.result.connect(self._show_authcmp)
+        self.worker.done.connect(self._on_agent_done)
+        self.worker.start()
+
+    def _show_authcmp(self, report):
+        TextViewDialog(self, "NAS 授權比對", report).exec()
 
     def on_agent_keys(self):
         self._busy(True)
