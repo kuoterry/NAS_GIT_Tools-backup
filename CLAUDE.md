@@ -175,7 +175,7 @@ Three more pieces complete the loop that account creation started:
 
 ### Persistence
 
-Settings/profiles (SSH user/host/remote root, optional saved password, optional identity file path, per-machine profile binding, last-used folder, identity-panel collapsed state) are stored via `QSettings("TerryTools", "NasGitConnector")` — on Windows this is the registry, not a file in this repo. Multiple named "profiles" (e.g. 家中/公司) can each auto-select based on `socket.gethostname()`.
+Settings/profiles (SSH user/host/remote root, optional saved password, optional identity file path, per-machine profile binding, last-used folder, identity-panel collapsed state) are stored via `QSettings("TerryTools", "NasGitConnector")` — on Windows this is the registry, not a file in this repo. Multiple named "profiles" (e.g. 家中/公司) can each auto-select based on `socket.gethostname()`. That binding also powers machine awareness: the window title shows `｜<身份>（<hostname>）` (or `⚠ 本機未綁定身份` when the hostname isn't bound anywhere — previously an unbound machine silently reused the last profile, which is exactly how a company machine ends up on the home identity), and `audit_log()` lines carry `機器=<hostname>（<label>）` via module-level `machine_display()`/`machine_binding_label()` (module functions, not MainWindow methods, because audit_log runs on Worker threads). Key_Management reads the same binding through its existing read-only QSettings bridge (`nas_git_machine_labels()`) for its own title, cross-machine advisories, sync overview, and authorized_keys comparison — one source of truth, both tools display it, neither writes the other's.
 
 ### Per-profile identity file
 

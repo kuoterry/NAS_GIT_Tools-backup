@@ -284,6 +284,27 @@ class TestPairMismatch(unittest.TestCase):
             self.assertFalse(rec.get("pair_mismatch"))
 
 
+class TestHostLabels(unittest.TestCase):
+    def test_label_host_translates(self):
+        labels = {"terry_asus": "家中", "desktop-7f3k2m9": "公司"}
+        self.assertEqual(km.label_host("Terry_ASUS", labels), "Terry_ASUS（家中）")
+        self.assertEqual(km.label_host("DESKTOP-7F3K2M9", labels), "DESKTOP-7F3K2M9（公司）")
+
+    def test_unknown_host_passthrough(self):
+        self.assertEqual(km.label_host("UNKNOWN-PC", {"terry_asus": "家中"}), "UNKNOWN-PC")
+        self.assertEqual(km.label_host("PC", {}), "PC")
+        self.assertEqual(km.label_host("PC", None), "PC")
+
+    def test_advisory_uses_labels(self):
+        rec = {"priv_path": "/x/k", "pub_path": "/x/k.pub", "type": "ssh-ed25519",
+               "strength": "Ed25519", "fingerprint": "SHA256:x",
+               "mtime": time.time(), "priv_encrypted": True, "priv_format": "openssh"}
+        seen = {"SHA256:x": {"PC1": "t", "PC2": "t"}}
+        notes = km.build_advisories(rec, {}, seen, "PC1",
+                                    host_labels={"pc2": "公司"})
+        self.assertIn("PC2（公司）", notes)
+
+
 class TestMergeRegistries(unittest.TestCase):
     def _entry(self, last_seen, comment, **kw):
         e = {"fingerprint": "SHA256:x", "last_seen": last_seen, "comment": comment,

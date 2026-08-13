@@ -57,7 +57,7 @@ try:
 except ImportError:
     pyzipper = None
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -430,7 +430,7 @@ DEFAULT_KEY_AGE_DAYS = 730
 
 
 def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict = None, this_host: str = "",
-                     age_days: int = DEFAULT_KEY_AGE_DAYS) -> str:
+                     age_days: int = DEFAULT_KEY_AGE_DAYS, host_labels: dict = None) -> str:
     notes = []
     strength = rec.get("strength", "") or ""
     if strength.startswith("RSA"):
@@ -475,7 +475,9 @@ def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict 
     if fp and seen_hosts_by_fp:
         others = sorted(h for h in seen_hosts_by_fp.get(fp, {}) if h and h != this_host)
         if others:
-            notes.append(f"⚠ 這把金鑰也在其他電腦（{'、'.join(others)}）登記過，確認是否為刻意複製")
+            # hostname 翻成綁定標籤（家中/公司）——標籤才是給人看的
+            shown = "、".join(label_host(h, host_labels) for h in others)
+            notes.append(f"⚠ 這把金鑰也在其他電腦（{shown}）登記過，確認是否為刻意複製")
     return "；".join(notes) if notes else "—"
 
 
@@ -784,7 +786,8 @@ def build_records(folders, errors: list = None, age_days: int = DEFAULT_KEY_AGE_
             seen_hosts_by_fp.setdefault(fp, {}).update(sh)
     this_host = socket.gethostname() or ""
     for rec in records:
-        rec["advisories"] = build_advisories(rec, fingerprints_seen, seen_hosts_by_fp, this_host, age_days)
+        rec["advisories"] = build_advisories(rec, fingerprints_seen, seen_hosts_by_fp, this_host, age_days,
+                                             host_labels=nas_git_machine_labels())
 
     return records
 
@@ -906,13 +909,38 @@ def read_nas_git_connector_profiles():
         names = [names] if names else []
     result = {}
     for name in (names or []):
+        machines = s.value(f"profiles/{name}/machines", [])
+        if isinstance(machines, str):
+            machines = [machines] if machines else []
         result[name] = {
             "user": s.value(f"profiles/{name}/user", ""),
             "host": s.value(f"profiles/{name}/host", ""),
             "remote_root": s.value(f"profiles/{name}/remote_root", ""),
             "identity_file": s.value(f"profiles/{name}/identity_file", ""),
+            "machines": list(machines or []),
         }
     return result
+
+
+def nas_git_machine_labels():
+    """{hostname(lower): 身份標籤（家中/公司…）} 對照表——來源是 NasGitConnector 的
+    profile 機器綁定（同一份唯讀 bridge）。讓報表把 hostname 翻成人看的標籤；
+    對方沒裝/沒綁定就回空 dict，所有使用端都要能在空表下照常運作。"""
+    labels = {}
+    try:
+        for name, p in read_nas_git_connector_profiles().items():
+            for m in p.get("machines", []):
+                if m and m.strip():
+                    labels[m.strip().lower()] = str(name)
+    except Exception:
+        pass
+    return labels
+
+
+def label_host(hostname: str, labels: dict) -> str:
+    """hostname → 'hostname（標籤）'；查不到標籤就原樣回傳（純函數，可測）。"""
+    lab = (labels or {}).get((hostname or "").strip().lower())
+    return f"{hostname}（{lab}）" if lab else hostname
 
 
 def _sync_ssh(sync_cfg: dict, remote_cmd: str, input_text: str = ""):
@@ -1579,6 +1607,9 @@ class Worker(QThread):
         只 cat 自己的 authorized_keys，不 sudo、不寫入；撤銷金鑰仍歸 NasGitConnector 管。"""
         sync_cfg = self.params.get("sync_cfg", {})
         local_fps = self.params.get("local_fps", {})   # {SHA256:xxx: 描述}
+        fp_hosts = self.params.get("fp_hosts", {})     # {SHA256:xxx: [hostname, ...]}（名冊 seen_hosts）
+        host_labels = self.params.get("host_labels", {})
+        this_host = (socket.gethostname() or "").lower()
         if not (sync_cfg.get("host") and sync_cfg.get("user")):
             self.done.emit(False, "同步設定未填 host/user，請先到「⚙ 雲端同步設定…」設定。")
             return
@@ -1606,8 +1637,14 @@ class Worker(QThread):
             if fp and fp in local_fps:
                 matched.append(f"✔ {fp}  {comment}\n   ↳ 本機：{local_fps[fp]}")
             else:
-                remote_only.append(f"❓ {fp or '?'}  {comment}\n   ↳ NAS 授權了，但這台機器沒有這把"
-                                   "（別台機器的？還是該撤銷的殘留？）")
+                # 名冊的 seen_hosts 若記得這把在別台機器出現過，問號直接變答案
+                others = [h for h in (fp_hosts.get(fp) or []) if h and h.lower() != this_host]
+                if others:
+                    shown = "、".join(label_host(h, host_labels) for h in sorted(others))
+                    remote_only.append(f"🖥 {fp}  {comment}\n   ↳ 名冊記錄：這是「{shown}」上的金鑰（正常）")
+                else:
+                    remote_only.append(f"❓ {fp or '?'}  {comment}\n   ↳ NAS 授權了，但這台機器沒有、"
+                                       "名冊也沒記錄（別台還沒同步？還是該撤銷的殘留？）")
         local_only = [f"⬆ {fp}  {label}" for fp, label in sorted(local_fps.items())
                       if fp not in seen_remote_fps]
         report = [f"NAS（{sync_cfg.get('user')}@{sync_cfg.get('host')}）authorized_keys 共 {len(remote_lines)} 行\n"]
@@ -2270,12 +2307,14 @@ class SyncOverviewDialog(QDialog):
 
     def _populate(self, reg: dict):
         this_host = socket.gethostname() or ""
+        labels = nas_git_machine_labels()   # 一次讀，整表共用（讀 QSettings 不用每列一次）
         rows = [(key, entry) for key, entry in reg.items() if entry.get("fingerprint")]
         rows.sort(key=lambda kv: kv[1].get("last_seen", ""), reverse=True)
         self.table.setRowCount(len(rows))
         for i, (_key, entry) in enumerate(rows):
             seen_hosts = entry.get("seen_hosts") or {}
-            hosts_text = "、".join(sorted(seen_hosts)) if seen_hosts else "（尚未同步過）"
+            hosts_text = ("、".join(label_host(h, labels) for h in sorted(seen_hosts))
+                          if seen_hosts else "（尚未同步過）")
             advisory = "⚠ 也存在其他電腦" if len(seen_hosts) > 1 or (
                 seen_hosts and this_host not in seen_hosts) else "—"
             for col, val in enumerate([
@@ -2315,7 +2354,10 @@ class SyncOverviewDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"金鑰管理工具 v{__version__}")
+        # 標題掛機器標籤（家中/公司，來自 NasGitConnector 的機器綁定，唯讀 bridge）——
+        # 沒綁定/對方沒裝就只顯示 hostname，一樣能分辨在哪台機器
+        _host = socket.gethostname() or "?"
+        self.setWindowTitle(f"金鑰管理工具 v{__version__}｜{label_host(_host, nas_git_machine_labels())}")
         self.setMinimumSize(1120, 660)
         self.worker = None
         self.records = []
@@ -2845,10 +2887,19 @@ class MainWindow(QMainWindow):
             if fp:
                 local_fps.setdefault(fp, rec.get("priv_path") or rec.get("pub_path")
                                      or rec.get("comment") or "")
+        fp_hosts = {}
+        this_host = (socket.gethostname() or "").lower()
         try:
             for entry in load_registry().values():
                 fp = entry.get("fingerprint")
-                if fp and fp not in local_fps:
+                if not fp:
+                    continue
+                sh = entry.get("seen_hosts") or {}
+                if sh:
+                    fp_hosts[fp] = sorted(sh)
+                # 名冊條目只有「本機看過」（seen_hosts 含本機，或從沒同步過）才算「本機有」；
+                # 純粹從別台同步進來的鑰匙不算——它們該走 🖥「別台機器的」標註
+                if fp not in local_fps and (not sh or any(h.lower() == this_host for h in sh)):
                     local_fps[fp] = "（名冊）" + (entry.get("comment") or entry.get("pub_path") or "")
         except Exception:
             pass
@@ -2860,7 +2911,8 @@ class MainWindow(QMainWindow):
         self.status.setStyleSheet("")
         keep_worker_alive(self)
         self.worker = Worker("compare_authorized_keys",
-                             {"sync_cfg": sync_cfg, "local_fps": local_fps})
+                             {"sync_cfg": sync_cfg, "local_fps": local_fps,
+                              "fp_hosts": fp_hosts, "host_labels": nas_git_machine_labels()})
         self.worker.log.connect(self.append_log)
         self.worker.result.connect(self._show_authcmp)
         self.worker.done.connect(self._on_agent_done)
