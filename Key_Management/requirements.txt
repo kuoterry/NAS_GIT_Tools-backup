@@ -1,3 +1,5 @@
 # 金鑰管理工具 — Python 相依套件
 # 安裝： pip install -r requirements.txt
 PyQt6>=6.6
+# 選用：AES 加密 zip 備份用；沒裝時該功能自動退回明文複製並提示，其餘功能不受影響
+pyzipper>=0.3.6
