@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.10.0"
+__version__ = "2.11.0"
 
 import os
 import sys
@@ -125,6 +125,38 @@ def save_git_devs_credential(admin_user: str, host: str, new_username: str, pass
         pass
 
 
+def machine_binding_label() -> str:
+    """本機 hostname 綁定的身份名稱（家中/公司…）；未綁定回空字串。
+
+    讀 QSettings 的 profiles/<name>/machines 清單——跟 MainWindow 的
+    detect_profile_for_machine() 同一份資料，做成模組函式是讓
+    audit_log()（可能在 Worker 執行緒被呼叫）不用摸 UI 物件。"""
+    try:
+        mid = (socket.gethostname() or platform.node() or "").strip().lower()
+        if not mid:
+            return ""
+        st = QSettings("TerryTools", "NasGitConnector")
+        names = st.value("profile_names", [])
+        if isinstance(names, str):
+            names = [names]
+        for name in (names or []):
+            machines = st.value(f"profiles/{name}/machines", [])
+            if isinstance(machines, str):
+                machines = [machines] if machines else []
+            if any((m or "").strip().lower() == mid for m in machines):
+                return str(name)
+    except Exception:
+        pass
+    return ""
+
+
+def machine_display() -> str:
+    """稽核/標題用的本機描述：hostname（綁定標籤）；未綁定就只有 hostname。"""
+    host = (socket.gethostname() or "UNKNOWN").strip()
+    label = machine_binding_label()
+    return f"{host}（{label}）" if label else host
+
+
 def audit_log(user: str, host: str, action: str, detail: str) -> bool:
     """把一筆破壞性操作寫進本機稽核 log；寫入失敗回傳 False 並跳一次性警告。
 
@@ -136,8 +168,9 @@ def audit_log(user: str, host: str, action: str, detail: str) -> bool:
         os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
-            # 機器欄位：多機合併（audit_sync）後才分得出同一身份是從哪台機器動的手
-            f.write(f"{ts}\t{user}@{host}\t{action}\t{detail}\t機器={socket.gethostname()}\n")
+            # 機器欄位：多機合併（audit_sync）後才分得出同一身份是從哪台機器動的手；
+            # 帶綁定標籤（家中/公司）讓合併後的時間軸不用背 hostname
+            f.write(f"{ts}\t{user}@{host}\t{action}\t{detail}\t機器={machine_display()}\n")
         return True
     except OSError as e:
         if not _AUDIT_LOG_WARNED:
@@ -7785,11 +7818,16 @@ class MainWindow(QMainWindow):
         if auto:
             self.machine_label.setText(f"本機電腦名稱：{mid} → 自動對應身份「{auto}」")
             self.machine_label.setStyleSheet("color:#1a7f37;")
+            # 標題掛標籤：在哪台電腦、用哪個身份，不用展開身份面板就看得到
+            self.setWindowTitle(f"NAS Git 專案串接工具 v{__version__}｜{auto}（{mid}）")
         else:
             self.machine_label.setText(
                 f"本機電腦名稱：{mid}（尚未綁定；請選好上面的身份後按「綁定此電腦」）"
             )
             self.machine_label.setStyleSheet("color:#b06f00;")
+            # 未綁定要在標題喊出來：新電腦/重灌改名時只靠「上次的 profile」默默運作，
+            # 在公司機用到家中身份完全無感——這正是要避免的
+            self.setWindowTitle(f"NAS Git 專案串接工具 v{__version__}｜⚠ 本機未綁定身份（{mid}）")
 
     def bind_current_machine(self):
         name = self.profile_combo.currentText()
