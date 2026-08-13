@@ -36,6 +36,7 @@ import hashlib
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from datetime import datetime
 
@@ -46,9 +47,17 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QPlainTextEdit, QComboBox, QCheckBox,
     QFileDialog, QMessageBox, QGroupBox, QInputDialog, QListWidget, QListWidgetItem,
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
+    QSpinBox,
 )
 
-__version__ = "1.4.0"
+# 備份加密（AES zip）是選用功能：pyzipper 沒裝時按鈕流程會退回明文複製並講明原因，
+# 不把它列成硬依賴——這工具的其他功能全部不需要它。
+try:
+    import pyzipper
+except ImportError:
+    pyzipper = None
+
+__version__ = "1.5.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -346,7 +355,13 @@ def scan_folder(folder: str, errors: list = None):
     return pub_files, priv_files, ppk_files, priv_info
 
 
-def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict = None, this_host: str = "") -> str:
+# 金鑰年齡提醒的預設門檻（天）；MainWindow 有 QSpinBox 可調（存 QSettings），
+# build_advisories 收 age_days 參數而不是直接讀設定——保持純函數、可測。
+DEFAULT_KEY_AGE_DAYS = 730
+
+
+def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict = None, this_host: str = "",
+                     age_days: int = DEFAULT_KEY_AGE_DAYS) -> str:
     notes = []
     strength = rec.get("strength", "") or ""
     if strength.startswith("RSA"):
@@ -359,7 +374,11 @@ def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict 
     if rec.get("type") == "ssh-dss":
         notes.append("⚠ DSA 已淘汰，建議更換為 Ed25519")
     if rec.get("priv_path") and rec.get("priv_encrypted") is False:
-        notes.append("ℹ 私鑰未加密")
+        # 裸私鑰=落地即明文。非 .ppk 的可以直接用本工具補密碼（ssh-keygen -p）
+        if rec.get("priv_format") == "ppk":
+            notes.append("⚠ 私鑰未加密（.ppk 請用 PuTTYgen 加密，或先轉成 OpenSSH 再加）")
+        else:
+            notes.append("⚠ 私鑰未加密（可用「加上密碼保護…」補上）")
     if rec.get("pub_path") and not rec.get("priv_path"):
         notes.append("ℹ 找不到對應私鑰（可能已刪除或不在掃描範圍）")
     if rec.get("priv_path") and not rec.get("pub_path") and not rec.get("blob"):
@@ -372,9 +391,9 @@ def build_advisories(rec: dict, fingerprints_seen: dict, seen_hosts_by_fp: dict 
         notes.append("✔ 已自動從私鑰推導出公鑰")
     mtime = rec.get("mtime")
     if mtime:
-        age_days = (time.time() - mtime) / 86400
-        if age_days > 730:
-            notes.append(f"ℹ 已 {int(age_days)} 天未變更，可考慮輪替")
+        age = (time.time() - mtime) / 86400
+        if age > age_days:
+            notes.append(f"ℹ 已 {int(age)} 天未變更，可考慮輪替")
     fp = rec.get("fingerprint")
     if fp and len(fingerprints_seen.get(fp, [])) > 1:
         notes.append("⚠ 與其他檔案指紋相同，可能是重複複製的金鑰")
@@ -425,6 +444,41 @@ def parse_ssh_config(path: str = SSH_CONFIG_PATH):
             for h in current_hosts:
                 mapping.setdefault(idpath, []).append(h)
     return mapping
+
+
+def rewrite_ssh_config_identity(old_path: str, new_path: str, config_path: str = SSH_CONFIG_PATH):
+    """把 SSH config 裡指向 old_path 的 IdentityFile 行改指向 new_path（金鑰輪替用）。
+
+    路徑比對走 _norm_path（跟 parse_ssh_config 同一套），值帶不帶引號都認得；
+    改寫前先備份整份 config（.bak-時間戳）。回傳 (改了幾行, 訊息)。
+    只動 IdentityFile 行本身、保留原縮排，其他行原封不動。"""
+    try:
+        with open(config_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except OSError as e:
+        return 0, f"讀取 SSH config 失敗：{e}"
+    target = _norm_path(old_path)
+    changed = 0
+    out_lines = []
+    for line in lines:
+        s = line.strip()
+        parts = s.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "identityfile" \
+                and _norm_path(parts[1].strip().strip('"')) == target:
+            indent = line[:len(line) - len(line.lstrip())]
+            out_lines.append(f'{indent}IdentityFile "{new_path}"\n')
+            changed += 1
+        else:
+            out_lines.append(line)
+    if not changed:
+        return 0, "SSH config 裡沒有指向舊金鑰的 IdentityFile 行，未改動。"
+    try:
+        shutil.copy2(config_path, config_path + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.writelines(out_lines)
+    except OSError as e:
+        return 0, f"寫入 SSH config 失敗（未改動）：{e}"
+    return changed, f"已把 {changed} 行 IdentityFile 改指向新金鑰（舊檔已備份）。"
 
 
 def append_ssh_config_host(alias: str, hostname: str, user: str, identity_path: str):
@@ -536,7 +590,7 @@ def delete_known_hosts_entry(line_no: int, path: str = KNOWN_HOSTS_PATH):
     return True, f"已刪除第 {line_no + 1} 行（原檔已備份到 {backup_path}）"
 
 
-def build_records(folders, errors: list = None):
+def build_records(folders, errors: list = None, age_days: int = DEFAULT_KEY_AGE_DAYS):
     """掃描所有資料夾，配對公私鑰、補齊指紋/強度/時間/建議，回傳紀錄清單。
 
     folders 先正規化去重、並丟掉已被其他選取資料夾涵蓋的巢狀資料夾——同一資料夾
@@ -644,7 +698,7 @@ def build_records(folders, errors: list = None):
             seen_hosts_by_fp.setdefault(fp, {}).update(sh)
     this_host = socket.gethostname() or ""
     for rec in records:
-        rec["advisories"] = build_advisories(rec, fingerprints_seen, seen_hosts_by_fp, this_host)
+        rec["advisories"] = build_advisories(rec, fingerprints_seen, seen_hosts_by_fp, this_host, age_days)
 
     return records
 
@@ -931,6 +985,14 @@ class Worker(QThread):
                 self._run_delete_known_hosts_entry()
             elif self.mode == "sync_registry":
                 self._run_sync_registry()
+            elif self.mode == "encrypt_key":
+                self._run_encrypt_key()
+            elif self.mode == "rotate_key":
+                self._run_rotate_key()
+            elif self.mode == "list_agent_keys":
+                self._run_list_agent_keys()
+            elif self.mode == "convert_ppk":
+                self._run_convert_ppk()
             else:
                 self.done.emit(False, f"未知模式：{self.mode}")
         except Exception as e:
@@ -938,9 +1000,10 @@ class Worker(QThread):
 
     def _run_scan(self):
         folders = self.params.get("folders", [])
+        age_days = self.params.get("age_days") or DEFAULT_KEY_AGE_DAYS
         self.log.emit(f"掃描 {len(folders)} 個資料夾中…")
         walk_errors = []
-        records = build_records(folders, errors=walk_errors)
+        records = build_records(folders, errors=walk_errors, age_days=age_days)
         for we in walk_errors[:20]:
             self.log.emit(f"⚠ 讀不到：{we}")
         if len(walk_errors) > 20:
@@ -1045,8 +1108,38 @@ class Worker(QThread):
         pub_path = self.params.get("pub_path")
         priv_path = self.params.get("priv_path")
         dest_dir = self.params.get("dest_dir")
+        zip_pass = self.params.get("zip_passphrase", "")
         if not dest_dir:
             self.done.emit(False, "缺少備份目標資料夾。")
+            return
+        if zip_pass:
+            # 加密備份：私鑰複製出去就是敏感物落地，能加密就不要明文散落。
+            # pyzipper（AES zip）是選用依賴，UI 端已確認裝了才會走到這裡。
+            if pyzipper is None:
+                self.done.emit(False, "未安裝 pyzipper，無法產生加密備份（pip install pyzipper）。")
+                return
+            sources = [p for p in (pub_path, priv_path) if p and os.path.exists(p)]
+            if not sources:
+                self.done.emit(False, "找不到要備份的檔案。")
+                return
+            base = os.path.splitext(os.path.basename(priv_path or pub_path))[0]
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            zip_path = os.path.join(dest_dir, f"{base}-keys-{ts}.zip")
+            if os.path.exists(zip_path):
+                self.done.emit(False, f"目的地已有同名壓縮檔，未覆蓋：{zip_path}")
+                return
+            try:
+                with pyzipper.AESZipFile(zip_path, "w", compression=pyzipper.ZIP_LZMA,
+                                         encryption=pyzipper.WZ_AES) as zf:
+                    zf.setpassword(zip_pass.encode("utf-8"))
+                    for p in sources:
+                        zf.write(p, os.path.basename(p))
+            except OSError as e:
+                self.done.emit(False, f"寫入加密備份失敗：{e}")
+                return
+            aud_ok = audit_log("backup", f"{zip_path}（AES 加密 zip，{len(sources)} 檔）")
+            self.done.emit(True, f"已產生加密備份：\n{zip_path}\n"
+                                 "（解壓需要剛才那組密碼；忘了密碼備份等於報廢）" + audit_failed_note(aud_ok))
             return
         copied, skipped = [], []
         for p in (pub_path, priv_path):
@@ -1203,6 +1296,169 @@ class Worker(QThread):
         self.result.emit(merged)
         self.done.emit(True, f"已同步金鑰名冊，共 {len(merged)} 筆（涵蓋所有已同步過的電腦）。")
 
+    def _run_encrypt_key(self):
+        """幫未加密的 OpenSSH/PEM 私鑰補上 passphrase（ssh-keygen -p，原地改寫）。
+        .ppk 不走這裡（ssh-keygen 不認得），UI 端已擋。"""
+        path = self.params.get("path", "")
+        passphrase = self.params.get("passphrase", "")
+        if not path or not os.path.exists(path):
+            self.done.emit(False, f"找不到私鑰檔：{path}")
+            return
+        if not passphrase:
+            self.done.emit(False, "密碼不可為空。")
+            return
+        if not shutil.which("ssh-keygen"):
+            self.done.emit(False, "找不到 ssh-keygen——請先安裝 Windows 內建 OpenSSH 用戶端"
+                                  "（設定 → 應用程式 → 選用功能），再重試。")
+            return
+        args = ["ssh-keygen", "-p", "-P", "", "-N", passphrase, "-f", path]
+        masked_args = list(args)
+        masked_args[args.index("-N") + 1] = "***"
+        self.log.emit("$ " + " ".join(a if a else "''" for a in masked_args))
+        cp = subprocess.run(
+            args, capture_output=True, text=True, timeout=30, input="",
+            creationflags=_NO_WINDOW,
+        )
+        if cp.returncode != 0:
+            self.done.emit(False, "加密失敗：" + (cp.stderr or cp.stdout).strip() +
+                           "\n（若這把私鑰其實已有密碼，掃描的判讀可能過時，請重新掃描確認）")
+            return
+        aud_ok = audit_log("encrypt_key", path)
+        self.done.emit(True, f"已為私鑰加上密碼保護：\n{path}\n"
+                             "（請妥善保管這組密碼——忘了就沒有任何方式救回這把私鑰）" + audit_failed_note(aud_ok))
+
+    def _run_rotate_key(self):
+        """本機金鑰輪替：產新鑰 → （可選）SSH config 改指新鑰 → （可選）封存舊鑰。
+        NAS 端 authorized_keys 的換鑰不歸這裡管——用 NasGitConnector 的「金鑰輪替…」，
+        兩個工具互不寫對方的狀態（既有邊界，維持不變）。"""
+        old_priv = self.params.get("old_priv", "")
+        old_pub = self.params.get("old_pub", "")
+        new_path = self.params.get("new_path", "")
+        key_type = self.params.get("key_type", "ed25519")
+        bits = self.params.get("bits")
+        comment = self.params.get("comment", "")
+        passphrase = self.params.get("passphrase", "")
+        update_config = self.params.get("update_ssh_config", False)
+        archive_old = self.params.get("archive_old", True)
+        if not old_priv or not os.path.exists(old_priv):
+            self.done.emit(False, f"找不到舊私鑰：{old_priv}")
+            return
+        if not new_path:
+            self.done.emit(False, "缺少新金鑰路徑。")
+            return
+        if os.path.exists(new_path) or os.path.exists(new_path + ".pub"):
+            self.done.emit(False, f"新金鑰檔案已存在，未覆蓋：{new_path}")
+            return
+        if not shutil.which("ssh-keygen"):
+            self.done.emit(False, "找不到 ssh-keygen——請先安裝 Windows 內建 OpenSSH 用戶端。")
+            return
+        # 1) 產新鑰（同 _run_generate 的防呆慣例：input=""、timeout、遮罩 -N）
+        args = ["ssh-keygen", "-t", key_type, "-N", passphrase, "-C", comment, "-f", new_path]
+        if bits:
+            args += ["-b", str(bits)]
+        masked_args = list(args)
+        if passphrase:
+            masked_args[args.index("-N") + 1] = "***"
+        self.log.emit("$ " + " ".join(a if a else "''" for a in masked_args))
+        cp = subprocess.run(args, capture_output=True, text=True, timeout=30, input="",
+                            creationflags=_NO_WINDOW)
+        if cp.returncode != 0:
+            self.done.emit(False, "產生新金鑰失敗，輪替未進行：" + (cp.stderr or cp.stdout).strip())
+            return
+        steps = [f"已產生新金鑰對：\n{new_path}\n{new_path}.pub"]
+        # 2) SSH config 改指新鑰（失敗不回滾新鑰——新鑰是好的，講清楚哪步沒做就好）
+        if update_config:
+            changed, msg = rewrite_ssh_config_identity(old_priv, new_path)
+            self.log.emit(msg)
+            steps.append(("✔ " if changed else "⚠ ") + msg)
+        # 3) 封存舊鑰（沿用 archive 慣例：搬進 ~/.key_management/archive/<時間戳>/）
+        if archive_old:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            dest_dir = os.path.join(ARCHIVE_DIR, ts)
+            os.makedirs(dest_dir, exist_ok=True)
+            moved, fail = [], []
+            for p in (old_priv, old_pub):
+                if p and os.path.exists(p):
+                    try:
+                        shutil.move(p, os.path.join(dest_dir, os.path.basename(p)))
+                        moved.append(p)
+                    except OSError as e:
+                        fail.append(f"{p}（{e}）")
+            if moved:
+                steps.append("✔ 舊金鑰已封存到：" + dest_dir)
+            if fail:
+                steps.append("⚠ 舊金鑰封存失敗：" + "; ".join(fail))
+        else:
+            steps.append("ℹ 舊金鑰未封存，仍留在原位。")
+        aud_ok = audit_log("rotate_key", f"{old_priv} -> {new_path}")
+        steps.append("提醒：遠端 authorized_keys（NAS/GitHub…）還沒換——NAS 請用 NasGitConnector 的「金鑰輪替…」。")
+        self.done.emit(True, "\n".join(steps) + audit_failed_note(aud_ok))
+
+    def _run_list_agent_keys(self):
+        """列出 ssh-agent 目前載入的金鑰（ssh-add -l）。只支援 OpenSSH agent；
+        Pageant（PuTTY）走它自己的協定，不在此功能範圍。"""
+        if not shutil.which("ssh-add"):
+            self.done.emit(False, "找不到 ssh-add——請先安裝 Windows 內建 OpenSSH 用戶端。")
+            return
+        cp = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True,
+                            timeout=10, input="", creationflags=_NO_WINDOW)
+        if cp.returncode == 0:
+            lines = [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
+            self.result.emit(lines)
+            self.done.emit(True, f"ssh-agent 目前載入 {len(lines)} 把金鑰。")
+        elif cp.returncode == 1:
+            self.result.emit([])
+            self.done.emit(True, "ssh-agent 有在跑，但目前沒有載入任何金鑰。")
+        else:
+            self.done.emit(False, "連不到 ssh-agent（服務沒啟動？）：" +
+                           (cp.stderr or cp.stdout).strip())
+
+    def _run_convert_ppk(self):
+        """把 .ppk 轉成 OpenSSH 私鑰格式（shell out 到 puttygen）。
+        加密的 .ppk 需提供原密碼，走暫存檔（--old-passphrase-file）不進命令列；
+        各版 puttygen 的 CLI 支援度不一（Windows 版尤其），失敗時原樣回報 stderr。"""
+        ppk_path = self.params.get("ppk_path", "")
+        out_path = self.params.get("out_path", "")
+        passphrase = self.params.get("passphrase", "")
+        if not ppk_path or not os.path.exists(ppk_path):
+            self.done.emit(False, f"找不到 .ppk 檔：{ppk_path}")
+            return
+        if not out_path:
+            self.done.emit(False, "缺少輸出路徑。")
+            return
+        if os.path.exists(out_path):
+            self.done.emit(False, f"輸出檔已存在，未覆蓋：{out_path}")
+            return
+        puttygen = shutil.which("puttygen")
+        if not puttygen:
+            self.done.emit(False, "找不到 puttygen——請安裝 PuTTY（或改用 WinSCP 的金鑰轉換功能）。")
+            return
+        args = [puttygen, ppk_path, "-O", "private-openssh", "-o", out_path]
+        pw_file = None
+        try:
+            if passphrase:
+                fd, pw_file = tempfile.mkstemp(prefix="km_ppk_pw_")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(passphrase + "\n")
+                args += ["--old-passphrase", pw_file]
+            self.log.emit("$ " + " ".join(a if a != pw_file else "***" for a in args))
+            cp = subprocess.run(args, capture_output=True, text=True, timeout=30, input="",
+                                creationflags=_NO_WINDOW)
+        finally:
+            if pw_file:
+                try:
+                    os.remove(pw_file)
+                except OSError:
+                    pass
+        if cp.returncode != 0 or not os.path.exists(out_path):
+            self.done.emit(False, "轉換失敗：" + ((cp.stderr or cp.stdout).strip() or "puttygen 無輸出") +
+                           "\n（此版 puttygen 可能不支援命令列轉換——可改用 PuTTYgen GUI 的 "
+                           "Conversions → Export OpenSSH key，或 WinSCP 的 /keygen）")
+            return
+        aud_ok = audit_log("convert_ppk", f"{ppk_path} -> {out_path}")
+        self.done.emit(True, f"已轉換為 OpenSSH 格式：\n{out_path}\n"
+                             "（原 .ppk 保留未動；重新掃描後新檔會出現在報表）" + audit_failed_note(aud_ok))
+
 
 # ============================================================
 # 對話框
@@ -1314,6 +1570,118 @@ class GenerateKeyDialog(QDialog):
             "ssh_config_alias": self.host_alias_edit.text().strip(),
             "ssh_config_hostname": self.hostname_edit.text().strip(),
             "ssh_config_user": self.ssh_user_edit.text().strip(),
+        }
+
+
+class PassphraseDialog(QDialog):
+    """要一組新密碼（輸入兩次防打錯）。加密私鑰 / 加密備份共用。"""
+
+    def __init__(self, parent, title, hint=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(380)
+        lay = QVBoxLayout(self)
+        if hint:
+            h = QLabel(hint)
+            h.setWordWrap(True)
+            lay.addWidget(h)
+        g = QGridLayout()
+        g.addWidget(QLabel("密碼："), 0, 0)
+        self.p1 = QLineEdit()
+        self.p1.setEchoMode(QLineEdit.EchoMode.Password)
+        g.addWidget(self.p1, 0, 1)
+        g.addWidget(QLabel("再輸入一次："), 1, 0)
+        self.p2 = QLineEdit()
+        self.p2.setEchoMode(QLineEdit.EchoMode.Password)
+        g.addWidget(self.p2, 1, 1)
+        lay.addLayout(g)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._ok)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _ok(self):
+        if not self.p1.text():
+            QMessageBox.information(self, "密碼不可為空", "請輸入密碼。")
+            return
+        if self.p1.text() != self.p2.text():
+            QMessageBox.information(self, "兩次不一致", "兩次輸入的密碼不同，請重打。")
+            return
+        self.accept()
+
+    def passphrase(self):
+        return self.p1.text()
+
+
+class RotateLocalKeyDialog(QDialog):
+    """本機金鑰輪替：產新鑰＋（可選）SSH config 改指新鑰＋（可選）封存舊鑰。
+    遠端 authorized_keys 不在範圍內（NAS 用 NasGitConnector 的「金鑰輪替…」）。"""
+
+    def __init__(self, parent, rec):
+        super().__init__(parent)
+        self.rec = rec
+        old_priv = rec.get("priv_path", "")
+        self.setWindowTitle("金鑰輪替（本機）")
+        self.setMinimumWidth(500)
+        lay = QVBoxLayout(self)
+        info = QLabel(f"舊金鑰：{old_priv}\n"
+                      "流程：產生新金鑰 → （可選）SSH config 的 IdentityFile 改指新鑰 → （可選）封存舊金鑰。\n"
+                      "⚠ 遠端 authorized_keys（NAS/GitHub…）不會自動換——本機換完記得去遠端補上新公鑰。")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        g = QGridLayout()
+        g.addWidget(QLabel("新檔名："), 0, 0)
+        base = os.path.basename(old_priv)
+        self.name_edit = QLineEdit(f"{base}_{datetime.now().strftime('%Y%m%d')}")
+        g.addWidget(self.name_edit, 0, 1)
+        g.addWidget(QLabel("類型："), 1, 0)
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["ed25519", "rsa", "ecdsa"])
+        g.addWidget(self.type_combo, 1, 1)
+        g.addWidget(QLabel("位元數（僅 RSA/ECDSA，留空用預設）："), 2, 0)
+        self.bits_edit = QLineEdit()
+        g.addWidget(self.bits_edit, 2, 1)
+        g.addWidget(QLabel("Comment："), 3, 0)
+        self.comment_edit = QLineEdit(rec.get("comment", "") or "")
+        g.addWidget(self.comment_edit, 3, 1)
+        g.addWidget(QLabel("新密碼（留空＝不加密）："), 4, 0)
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        g.addWidget(self.pass_edit, 4, 1)
+        lay.addLayout(g)
+        hosts = rec.get("ssh_config_hosts") or []
+        self.cfg_check = QCheckBox("SSH config 的 IdentityFile 改指向新金鑰" +
+                                   (f"（目前指到：{'、'.join(hosts)}）" if hosts else "（目前沒有任何區塊指到這把）"))
+        self.cfg_check.setChecked(bool(hosts))
+        lay.addWidget(self.cfg_check)
+        self.archive_check = QCheckBox("封存舊金鑰（搬進封存區，可還原）")
+        self.archive_check.setChecked(True)
+        lay.addWidget(self.archive_check)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("輪替")
+        bb.accepted.connect(self._ok)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _ok(self):
+        if not self.name_edit.text().strip():
+            QMessageBox.information(self, "缺檔名", "請填新金鑰檔名。")
+            return
+        self.accept()
+
+    def values(self):
+        old_priv = self.rec.get("priv_path", "")
+        bits = self.bits_edit.text().strip()
+        return {
+            "old_priv": old_priv,
+            "old_pub": self.rec.get("pub_path") or "",
+            "new_path": os.path.join(os.path.dirname(old_priv), self.name_edit.text().strip()),
+            "key_type": self.type_combo.currentText(),
+            "bits": int(bits) if bits.isdigit() else None,
+            "comment": self.comment_edit.text().strip(),
+            "passphrase": self.pass_edit.text(),
+            "update_ssh_config": self.cfg_check.isChecked(),
+            "archive_old": self.archive_check.isChecked(),
         }
 
 
@@ -1821,6 +2189,14 @@ class MainWindow(QMainWindow):
         frow.addWidget(add_b)
         frow.addWidget(remove_b)
         frow.addStretch(1)
+        frow.addWidget(QLabel("輪替提醒（天）："))
+        self.age_spin = QSpinBox()
+        self.age_spin.setRange(30, 3650)
+        self.age_spin.setValue(int(self.settings.value("advisory_age_days", DEFAULT_KEY_AGE_DAYS)))
+        self.age_spin.setToolTip(f"金鑰超過這個天數未變更就在「建議」欄提醒輪替（預設 {DEFAULT_KEY_AGE_DAYS} 天）。")
+        self.age_spin.valueChanged.connect(
+            lambda v: self.settings.setValue("advisory_age_days", v))
+        frow.addWidget(self.age_spin)
         frow.addWidget(self.scan_b)
         fb.addLayout(frow)
         lay.addWidget(folder_box)
@@ -1850,6 +2226,18 @@ class MainWindow(QMainWindow):
         self.view_raw_b = QPushButton("檢視私鑰原始內容…")
         self.view_raw_b.setEnabled(False)
         self.view_raw_b.clicked.connect(self.on_view_raw)
+        self.encrypt_b = QPushButton("加上密碼保護…")
+        self.encrypt_b.setEnabled(False)
+        self.encrypt_b.setToolTip("幫未加密的私鑰補上 passphrase（ssh-keygen -p，原地改寫）。.ppk 不適用。")
+        self.encrypt_b.clicked.connect(self.on_encrypt_key)
+        self.rotate_b = QPushButton("輪替（產新換舊）…")
+        self.rotate_b.setEnabled(False)
+        self.rotate_b.setToolTip("產生新金鑰、SSH config 改指新鑰、封存舊鑰；遠端 authorized_keys 要另外換。")
+        self.rotate_b.clicked.connect(self.on_rotate_key)
+        self.convert_b = QPushButton(".ppk 轉 OpenSSH…")
+        self.convert_b.setEnabled(False)
+        self.convert_b.setToolTip("用 puttygen 把 PuTTY .ppk 轉成 OpenSSH 私鑰格式（原檔保留）。")
+        self.convert_b.clicked.connect(self.on_convert_ppk)
         self.copy_pub_b = QPushButton("複製公鑰")
         self.copy_pub_b.setEnabled(False)
         self.copy_pub_b.clicked.connect(self.on_copy_pub)
@@ -1857,7 +2245,8 @@ class MainWindow(QMainWindow):
         self.open_folder_b.setEnabled(False)
         self.open_folder_b.clicked.connect(self.on_open_folder)
         for b in (self.gen_b, self.archive_del_b, self.hard_del_b, self.backup_b,
-                  self.view_raw_b, self.copy_pub_b, self.open_folder_b):
+                  self.view_raw_b, self.encrypt_b, self.rotate_b, self.convert_b,
+                  self.copy_pub_b, self.open_folder_b):
             arow.addWidget(b)
         arow.addStretch(1)
         lay.addLayout(arow)
@@ -1872,6 +2261,9 @@ class MainWindow(QMainWindow):
         self.registry_b.clicked.connect(self.on_registry)
         self.known_hosts_b = QPushButton("known_hosts 管理…")
         self.known_hosts_b.clicked.connect(self.on_known_hosts)
+        self.agent_b = QPushButton("ssh-agent 盤點…")
+        self.agent_b.setToolTip("列出 ssh-agent 目前載入的金鑰，比對名冊/本次掃描結果。不含 Pageant。")
+        self.agent_b.clicked.connect(self.on_agent_keys)
         self.sync_config_b = QPushButton("⚙ 雲端同步設定…")
         self.sync_config_b.clicked.connect(self.on_sync_config)
         self.sync_overview_b = QPushButton("🌐 跨電腦金鑰總覽…")
@@ -1882,6 +2274,7 @@ class MainWindow(QMainWindow):
         brow.addWidget(self.audit_b)
         brow.addWidget(self.registry_b)
         brow.addWidget(self.known_hosts_b)
+        brow.addWidget(self.agent_b)
         brow.addWidget(self.sync_config_b)
         brow.addWidget(self.sync_overview_b)
         brow.addStretch(1)
@@ -1915,6 +2308,7 @@ class MainWindow(QMainWindow):
     def _busy(self, b):
         for x in (self.scan_b, self.gen_b, self.archive_mgmt_b, self.audit_b, self.export_b,
                   self.archive_del_b, self.hard_del_b, self.backup_b, self.view_raw_b,
+                  self.encrypt_b, self.rotate_b, self.convert_b, self.agent_b,
                   self.known_hosts_b, self.sync_config_b, self.sync_overview_b, self.registry_b):
             x.setEnabled(not b)
         if not b:
@@ -1942,7 +2336,7 @@ class MainWindow(QMainWindow):
         self.status.setText("掃描中…")
         self.status.setStyleSheet("")
         keep_worker_alive(self)
-        self.worker = Worker("scan", {"folders": folders})
+        self.worker = Worker("scan", {"folders": folders, "age_days": self.age_spin.value()})
         self.worker.log.connect(self.append_log)
         self.worker.result.connect(self.on_scan_result)
         self.worker.done.connect(self.on_scan_done)
@@ -2004,6 +2398,11 @@ class MainWindow(QMainWindow):
         self.hard_del_b.setEnabled(has)
         self.backup_b.setEnabled(has)
         self.view_raw_b.setEnabled(has_priv)
+        # 加密：確定未加密、且不是 .ppk（ssh-keygen 不認得 ppk）
+        self.encrypt_b.setEnabled(has_priv and rec.get("priv_encrypted") is False
+                                  and rec.get("priv_format") != "ppk")
+        self.rotate_b.setEnabled(has_priv and rec.get("priv_format") != "ppk")
+        self.convert_b.setEnabled(has_priv and rec.get("priv_format") == "ppk")
         self.copy_pub_b.setEnabled(has_pub_content)
         self.open_folder_b.setEnabled(has)
 
@@ -2091,20 +2490,38 @@ class MainWindow(QMainWindow):
             return
         # 備份是唯一會把私鑰檔複製到任意使用者選定資料夾（可能是雲端同步資料夾）
         # 的路徑——CSV 匯出含私鑰前會問，這裡比照，含私鑰就先確認一次。
+        zip_pass = ""
         if rec.get("priv_path"):
-            r = QMessageBox.question(
-                self, "備份包含私鑰",
-                f"備份會把「私鑰檔」複製到：\n{d}\n\n"
-                "若該資料夾會同步到雲端（OneDrive/Dropbox 等），私鑰等同外流。\n確定要備份？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if r != QMessageBox.StandardButton.Yes:
-                return
+            if pyzipper is not None:
+                r = QMessageBox.question(
+                    self, "加密備份？",
+                    "要把備份打包成「AES 加密 zip」嗎？\n\n"
+                    "・是：備份落地即加密，放雲端同步資料夾也不算裸奔（忘記密碼＝備份報廢）\n"
+                    "・否：維持原樣明文複製",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes)
+                if r == QMessageBox.StandardButton.Yes:
+                    dlg = PassphraseDialog(self, "設定備份 zip 密碼",
+                                           "解壓縮時需要這組密碼；忘了就沒有任何方式救回備份內容。")
+                    if dlg.exec() != QDialog.DialogCode.Accepted:
+                        return
+                    zip_pass = dlg.passphrase()
+            if not zip_pass:
+                r = QMessageBox.question(
+                    self, "備份包含私鑰",
+                    f"備份會把「私鑰檔」複製到：\n{d}\n\n"
+                    "若該資料夾會同步到雲端（OneDrive/Dropbox 等），私鑰等同外流。\n確定要備份？"
+                    + ("" if pyzipper is not None else "\n\n（提示：pip install pyzipper 之後可改用加密 zip 備份）"),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No)
+                if r != QMessageBox.StandardButton.Yes:
+                    return
         self._busy(True)
         self.status.setText("備份中…")
         keep_worker_alive(self)
         self.worker = Worker("backup", {
-            "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "dest_dir": d})
+            "pub_path": rec.get("pub_path"), "priv_path": rec.get("priv_path"), "dest_dir": d,
+            "zip_passphrase": zip_pass})
         self.worker.log.connect(self.append_log)
         self.worker.done.connect(self._on_backup_done)
         self.worker.start()
@@ -2141,6 +2558,129 @@ class MainWindow(QMainWindow):
     def _show_raw(self, content):
         dlg = TextViewDialog(self, "私鑰原始內容（請小心保管視窗內容，關閉前避免截圖/分享）", content)
         dlg.exec()
+
+    # ---------- 加密私鑰 / 本機輪替 / .ppk 轉換 / ssh-agent 盤點 ----------
+    def _on_mutating_done(self, ok, msg):
+        """encrypt/rotate/convert 共用的收尾：顯示結果，成功就重掃刷新報表與名冊。"""
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        if ok:
+            QMessageBox.information(self, "完成", msg)
+            self.on_scan()
+        else:
+            QMessageBox.warning(self, "失敗", msg)
+
+    def on_encrypt_key(self):
+        rec = self._selected_record()
+        if not rec or not rec.get("priv_path") or rec.get("priv_encrypted") is not False \
+                or rec.get("priv_format") == "ppk":
+            return
+        dlg = PassphraseDialog(
+            self, "設定私鑰密碼",
+            f"將為以下私鑰加上 passphrase（原地改寫，動作會留稽核紀錄）：\n{rec['priv_path']}\n"
+            "⚠ 忘了這組密碼就沒有任何方式救回這把私鑰。")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._busy(True)
+        self.status.setText("加密私鑰中…")
+        self.status.setStyleSheet("")
+        keep_worker_alive(self)
+        self.worker = Worker("encrypt_key", {"path": rec["priv_path"], "passphrase": dlg.passphrase()})
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self._on_mutating_done)
+        self.worker.start()
+
+    def on_rotate_key(self):
+        rec = self._selected_record()
+        if not rec or not rec.get("priv_path") or rec.get("priv_format") == "ppk":
+            return
+        dlg = RotateLocalKeyDialog(self, rec)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._busy(True)
+        self.status.setText("金鑰輪替中…")
+        self.status.setStyleSheet("")
+        keep_worker_alive(self)
+        self.worker = Worker("rotate_key", dlg.values())
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self._on_mutating_done)
+        self.worker.start()
+
+    def on_convert_ppk(self):
+        rec = self._selected_record()
+        if not rec or not rec.get("priv_path") or rec.get("priv_format") != "ppk":
+            return
+        ppk_path = rec["priv_path"]
+        base = os.path.basename(ppk_path)
+        default_name = (base[:-4] if base.lower().endswith(".ppk") else base) + "_openssh"
+        name, okp = QInputDialog.getText(self, ".ppk 轉 OpenSSH",
+                                         "輸出檔名（存到 .ppk 同資料夾）：", text=default_name)
+        if not okp or not name.strip():
+            return
+        passphrase = ""
+        if rec.get("priv_encrypted"):
+            passphrase, okp2 = QInputDialog.getText(
+                self, "原 .ppk 密碼", "這個 .ppk 有加密，請輸入它的原密碼（轉出的檔會沿用同一組）：",
+                QLineEdit.EchoMode.Password)
+            if not okp2:
+                return
+        self._busy(True)
+        self.status.setText(".ppk 轉換中…")
+        self.status.setStyleSheet("")
+        keep_worker_alive(self)
+        self.worker = Worker("convert_ppk", {
+            "ppk_path": ppk_path,
+            "out_path": os.path.join(os.path.dirname(ppk_path), name.strip()),
+            "passphrase": passphrase})
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self._on_mutating_done)
+        self.worker.start()
+
+    def on_agent_keys(self):
+        self._busy(True)
+        self.status.setText("查詢 ssh-agent 中…")
+        self.status.setStyleSheet("")
+        keep_worker_alive(self)
+        self.worker = Worker("list_agent_keys", {})
+        self.worker.log.connect(self.append_log)
+        self.worker.result.connect(self._show_agent_keys)
+        self.worker.done.connect(self._on_agent_done)
+        self.worker.start()
+
+    def _on_agent_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        if not ok:
+            QMessageBox.warning(self, "ssh-agent 盤點失敗", msg)
+
+    def _show_agent_keys(self, lines):
+        """agent 指紋比對本次掃描結果＋名冊，標出「這台機器管不到的鑰匙」。"""
+        known = {}
+        for rec in (getattr(self, "records", None) or []):
+            fp = rec.get("fingerprint")
+            if fp:
+                known.setdefault(fp, rec.get("priv_path") or rec.get("pub_path")
+                                 or rec.get("comment") or "")
+        try:
+            for entry in load_registry().values():
+                fp = entry.get("fingerprint")
+                if fp and fp not in known:
+                    known[fp] = "（名冊）" + (entry.get("comment") or entry.get("pub_path") or "")
+        except Exception:
+            pass  # 名冊讀不到就只比對本次掃描，盤點本身照樣能看
+        out = []
+        for ln in lines:
+            fp = next((t for t in ln.split() if t.startswith("SHA256:")), "")
+            if fp and fp in known:
+                out.append(f"✔ {ln}\n   ↳ 對應：{known[fp]}")
+            else:
+                out.append(f"❓ {ln}\n   ↳ 不在名冊/本次掃描中（別台機器的金鑰？或還沒加進掃描資料夾）")
+        if not out:
+            out = ["（ssh-agent 目前沒有載入任何金鑰）"]
+        out.append("\nℹ 只盤點 OpenSSH ssh-agent（ssh-add -l）；PuTTY 的 Pageant 不在範圍。")
+        TextViewDialog(self, "ssh-agent 盤點", "\n".join(out)).exec()
 
     # ---------- 複製公鑰 / 開啟資料夾 ----------
     def on_copy_pub(self):
