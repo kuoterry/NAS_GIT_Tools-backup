@@ -74,3 +74,5 @@ Thumbs.db
 Desktop.ini
 ~$*
 *.tmp
+
+.vscode/settings.json
