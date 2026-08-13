@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 import os
 import sys
@@ -78,6 +78,7 @@ TOOL_SCRIPT_NAMES = [
     "ci_daily_violation_report.sh",
     "git_stats_report.sh",
     "send_email.py",
+    "offsite_backup_sync.sh",
 ]
 
 
@@ -2311,6 +2312,29 @@ class Worker(QThread):
             "    echo \"$err\" | tail -n 3 | sed 's/^/       /'",
             "  fi",
             "done",
+            # 封存區：mv 封存的項目仍是 bare repo，remote.offsite-backup 設定跟著搬進去了，
+            # 一起推才不會「封存＝退出災難備援」。只在「全部」模式掃（有選取＝使用者指名清單，
+            # 不加料）；tar.gz 與沒設定備份的封存項照實回報數量，不沉默（回報不變量）。
+            "a_skip=0",
+            "if [ -z \"$FILTER\" ]; then",
+            "  for arch in \"$BASE\"/_archived/*; do",
+            "    [ -e \"$arch\" ] || continue",
+            "    name=\"_archived/$(basename \"$arch\")\"",
+            "    if [ ! -d \"$arch\" ] || [ ! -e \"$arch/HEAD\" ] || "
+            "[ -z \"$(git --git-dir=\"$arch\" config --get remote.offsite-backup.url 2>/dev/null)\" ]; then",
+            "      a_skip=$((a_skip+1)); continue",
+            "    fi",
+            "    n=$((n+1))",
+            "    if err=$(git --git-dir=\"$arch\" push --mirror offsite-backup 2>&1 >/dev/null); then",
+            "      echo \"[OK]   $name\"",
+            "      git --git-dir=\"$arch\" config nasgit.lastbackup \"$(date +%s)\" 2>/dev/null",
+            "    else",
+            "      echo \"[FAIL] $name\"",
+            "      echo \"$err\" | tail -n 3 | sed 's/^/       /'",
+            "    fi",
+            "  done",
+            "  [ \"$a_skip\" -gt 0 ] && echo \"[  ]   封存區另有 $a_skip 項未涵蓋（tar.gz 封存或未設定離站備份），NAS 硬碟壞掉時這些會一起消失\"",
+            "fi",
             "[ \"$n\" = 0 ] && echo '（沒有設定離站備份的倉庫）'",
         ]
         ok, body, hint = self._ssh_block(script, timeout=3600)
@@ -2681,7 +2705,24 @@ class Worker(QThread):
             "    b_warn=$((b_warn+1))",
             "  fi",
             "done",
-            "if [ \"$b_conf\" = 0 ]; then echo '[  ] 沒有任何倉庫設定離站備份（NAS 硬碟壞掉時 _archived 也會一起消失）'; elif [ \"$b_warn\" = 0 ]; then echo \"[OK] $b_conf 個設定離站備份的倉庫最近 14 天內都有成功推送\"; fi",
+            # 封存區內仍是 bare repo 且設定了離站備份的項目也要盯新鮮度——排程腳本會推它們，
+            # 健檢涵蓋範圍必須跟同步涵蓋範圍一致，不然「設了備份卻推不動」在封存區就隱形了。
+            "for arch in \"$BASE\"/_archived/*; do",
+            "  [ -d \"$arch\" ] && [ -e \"$arch/HEAD\" ] || continue",
+            "  url=$(git --git-dir=\"$arch\" config --get remote.offsite-backup.url 2>/dev/null)",
+            "  [ -n \"$url\" ] || continue",
+            "  b_conf=$((b_conf+1))",
+            "  n=\"_archived/$(basename \"$arch\")\"",
+            "  last=$(git --git-dir=\"$arch\" config --get nasgit.lastbackup 2>/dev/null)",
+            "  if [ -z \"$last\" ]; then",
+            "    echo \"[  ] $n：設定了離站備份，但沒有成功推送的時戳紀錄（從未推過，或最後一次成功是在加入時戳功能之前）\"",
+            "    b_warn=$((b_warn+1))",
+            "  elif [ $(( (now - last) / 86400 )) -ge 14 ]; then",
+            "    echo \"[  ] $n：離站備份已 $(( (now - last) / 86400 )) 天沒成功推送\"",
+            "    b_warn=$((b_warn+1))",
+            "  fi",
+            "done",
+            "if [ \"$b_conf\" = 0 ]; then echo '[  ] 沒有任何倉庫設定離站備份（NAS 硬碟壞掉時 _archived 也會一起消失）'; elif [ \"$b_warn\" = 0 ]; then echo \"[OK] $b_conf 個設定離站備份的倉庫（含封存區）最近 14 天內都有成功推送\"; fi",
             "echo",
             "echo '== 封存區 =='",
             "if [ -d \"$BASE/_archived\" ] && [ -n \"$(ls -A \"$BASE/_archived\" 2>/dev/null)\" ]; then",
@@ -6286,7 +6327,8 @@ class MainWindow(QMainWindow):
         self.mirror_sync_btn.setToolTip("對選取的鏡像庫執行 remote update；沒選就同步全部鏡像。")
         self.mirror_sync_btn.clicked.connect(self.on_sync_mirrors)
         self.backup_sync_btn = QPushButton("同步離站備份")
-        self.backup_sync_btn.setToolTip("對選取的倉庫執行 push --mirror 到其離站備份目的地；沒選就同步全部已設定備份的倉庫。")
+        self.backup_sync_btn.setToolTip("對選取的倉庫執行 push --mirror 到其離站備份目的地；"
+                                        "沒選就同步全部已設定備份的倉庫（含封存區內仍是 bare repo 的封存項）。")
         self.backup_sync_btn.clicked.connect(self.on_backup_sync)
         self.kind_scan_btn = QPushButton("來源批次比對…")
         self.kind_scan_btn.setToolTip("用 GitHub 帳號 fork 狀態＋本機殘留 remote，幫還沒分類的倉庫批次建議來源分類。")
