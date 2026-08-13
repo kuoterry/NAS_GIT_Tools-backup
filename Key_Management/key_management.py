@@ -57,7 +57,7 @@ try:
 except ImportError:
     pyzipper = None
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -92,15 +92,28 @@ _PEM_HEADERS = {
 }
 
 
-def audit_log(action: str, detail: str):
-    """所有管理動作（產生/封存/刪除/備份/還原/檢視私鑰原始內容）都留一筆本機紀錄。"""
+def audit_log(action: str, detail: str) -> bool:
+    """所有管理動作（產生/封存/刪除/備份/還原/檢視私鑰原始內容）都留一筆本機紀錄。
+
+    回傳寫入是否成功——呼叫端用 audit_failed_note() 把失敗附註進完成訊息。
+    （1.4.0～1.5.0 的呼叫端已經在用這個回傳值，函式卻沒 return、
+    audit_failed_note 也從未定義：動作本身做完，成功訊息卻被 NameError
+    吞成「發生未預期錯誤」。修於 1.5.1。）"""
     try:
         os.makedirs(APP_DIR, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"{ts}\t{action}\t{detail}\n")
+        return True
     except OSError:
-        pass
+        return False
+
+
+def audit_failed_note(aud_ok: bool) -> str:
+    """稽核寫入失敗時要附加在完成訊息尾端的警語；成功時回空字串。"""
+    if aud_ok:
+        return ""
+    return f"\n⚠ 稽核紀錄寫入失敗（{AUDIT_LOG_PATH}），這筆動作沒有留下本機紀錄。"
 
 
 # ============================================================

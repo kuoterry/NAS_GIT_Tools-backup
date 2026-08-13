@@ -111,3 +111,13 @@ Fix: `$newrev` all zeros → `continue` (nothing to check on a delete); `$oldrev
 Verified before committing, in a throwaway local bare repo with the engine installed as its `pre-receive` (`POLICY_MODE=strict` exported into the push): old engine reproduced the fatal and accepted a deliberately non-compliant commit message on a new branch; new engine reported the violation and blocked it; a compliant new branch and a follow-up push to an existing branch both stayed clean. The engine's hardcoded `export PATH=/usr/sbin:/usr/bin:/sbin:/bin` has to be stripped from the *test copy* of the hook for this to run under Windows git-bash — it's needed on the NAS, so don't "fix" it in the source.
 
 Note the fix only reaches production when someone clicks "升級 CI 引擎" in the GUI — committing it here changes what gets deployed, not what is currently running.
+
+---
+
+## 2026-08-13 — Key_Management 每個成功的封存/刪除/備份都回報「發生未預期錯誤」（1.4.0～1.5.0）
+
+`eb4dbe2`（2026-08-13 稍早的「逐檔稽核」強化）讓每個破壞性動作照抄手足工具的慣例：`aud_ok = audit_log(...)` 之後把 `audit_failed_note(aud_ok)` 附在完成訊息尾端。問題是慣例只搬了呼叫端——`audit_failed_note()` 在 Key_Management 裡從未被定義，而它的 `audit_log()` 也沒有 `return`（手足版本回 `bool`）。動作本身（檔案已搬進封存區/已刪除/已備份）全部做完之後，成功路徑在組訊息時炸 `NameError`，被 `Worker.run()` 的 `except Exception` 吞成 `done(False, "發生未預期錯誤：name 'audit_failed_note' is not defined")`——**檔案真的被處理了，UI 卻報失敗**，且因 `ok=False` 不觸發重掃，報表繼續顯示已不存在的金鑰。1.5.0 的新功能（encrypt_key/rotate_key/convert_ppk/加密備份）照抄同一慣例，把受影響路徑從 5 條擴到 9 條。
+
+為什麼活了兩個版本沒被抓到：`python -c "import key_management"` 的驗證抓不到執行期 `NameError`；1.5.0 新加的 unittest 只測純函數，而這隻蟲正好長在 Worker 的成功路徑上。由第三方細讀代理發現（grep「呼叫了但沒定義」），不是使用者回報。
+
+修法（1.5.1）：`audit_log()` 回傳 `bool`、補上 `audit_failed_note()` 定義；`tests/test_key_management.py` 新增 `TestAuditPlumbing`，直接呼叫 `Worker._run_delete` 的封存成功路徑斷言 `done(True, …)`——教訓入庫：**純函數測試蓋不到「動作做完、回報路徑才炸」這種洞，關鍵 Worker 路徑要有煙霧測試**。

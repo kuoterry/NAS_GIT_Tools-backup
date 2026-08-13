@@ -177,6 +177,49 @@ class TestRewriteSshConfigIdentity(unittest.TestCase):
             self.assertFalse(any(fn.startswith("config.bak-") for fn in os.listdir(d)))
 
 
+class TestAuditPlumbing(unittest.TestCase):
+    """1.4.0～1.5.0 的真實事故：audit_log 沒 return、audit_failed_note 沒定義，
+    動作做完卻在成功路徑炸 NameError 被吞成「發生未預期錯誤」。
+    這裡直接打 Worker 的成功路徑，純函數測試蓋不到這種洞。"""
+
+    def test_audit_log_returns_bool(self):
+        orig_app, orig_log = km.APP_DIR, km.AUDIT_LOG_PATH
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                km.APP_DIR = d
+                km.AUDIT_LOG_PATH = os.path.join(d, "audit.log")
+                self.assertIs(km.audit_log("test", "detail"), True)
+        finally:
+            km.APP_DIR, km.AUDIT_LOG_PATH = orig_app, orig_log
+
+    def test_audit_failed_note_both_branches(self):
+        self.assertEqual(km.audit_failed_note(True), "")
+        self.assertIn("稽核紀錄寫入失敗", km.audit_failed_note(False))
+
+    def test_worker_archive_delete_success_path(self):
+        orig = (km.APP_DIR, km.AUDIT_LOG_PATH, km.ARCHIVE_DIR)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                km.APP_DIR = d
+                km.AUDIT_LOG_PATH = os.path.join(d, "audit.log")
+                km.ARCHIVE_DIR = os.path.join(d, "archive")
+                priv = os.path.join(d, "id_test")
+                pub = priv + ".pub"
+                for p in (priv, pub):
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.write("dummy\n")
+                results = []
+                w = km.Worker("delete", {"pub_path": pub, "priv_path": priv, "hard": False})
+                w.done.connect(lambda ok, msg: results.append((ok, msg)))
+                w._run_delete()
+                self.assertTrue(results, "done 沒發射")
+                ok, msg = results[0]
+                self.assertTrue(ok, f"封存成功路徑回報失敗：{msg}")
+                self.assertFalse(os.path.exists(priv))
+        finally:
+            km.APP_DIR, km.AUDIT_LOG_PATH, km.ARCHIVE_DIR = orig
+
+
 class TestMergeRegistries(unittest.TestCase):
     def _entry(self, last_seen, comment, **kw):
         e = {"fingerprint": "SHA256:x", "last_seen": last_seen, "comment": comment,
