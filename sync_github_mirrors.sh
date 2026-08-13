@@ -19,6 +19,16 @@ CONF="$BASE/config/tg_bot.conf"   # 選用：內含 BOT_TOKEN= 與 CHAT_ID=
 
 mkdir -p "$BASE/logs"
 
+# 互斥鎖：上一輪還在跑（大庫＋慢網路可能超過排程間隔）就直接讓路，
+# 兩份 remote update 同時打同一個 bare repo 的失敗很難事後診斷。
+# mkdir 是原子操作，BusyBox 也適用，不需要 flock。
+LOCK="$BASE/.lock-mirror_sync"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | SKIP | 上一輪還在跑（$LOCK 存在），本輪略過" >> "$LOG"
+    exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
 # 讀取 Telegram 設定（存在才啟用通知）
 BOT_TOKEN=""; CHAT_ID=""
 [ -f "$CONF" ] && . "$CONF"

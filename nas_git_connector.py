@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.9.1"
+__version__ = "2.10.0"
 
 import os
 import sys
@@ -909,6 +909,8 @@ class Worker(QThread):
             self._run_repo_log()
         elif self.mode == "repo_branches":
             self._run_repo_branches()
+        elif self.mode == "branch_delete":
+            self._run_branch_delete()
         elif self.mode == "merged_branches":
             self._run_merged_branches()
         elif self.mode == "grep_all":
@@ -935,6 +937,8 @@ class Worker(QThread):
             self._run_local_gen_ssh_key()
         elif self.mode == "list_git_devs_users":
             self._run_list_git_devs_users()
+        elif self.mode == "list_user_keys":
+            self._run_list_user_keys()
         elif self.mode == "clone":
             self._run_clone()
         elif self.mode == "create_mirror":
@@ -959,6 +963,8 @@ class Worker(QThread):
             self._run_tg_conf_set()
         elif self.mode == "ci_profile_get":
             self._run_ci_profile_get()
+        elif self.mode == "notify_test":
+            self._run_notify_test()
         elif self.mode == "ci_profile_set":
             self._run_ci_profile_set()
         elif self.mode == "audit_sync":
@@ -1071,11 +1077,23 @@ class Worker(QThread):
             "    upstream=$(git --git-dir=\"$d\" config --get nasgit.upstream 2>/dev/null)",
             "  fi",
             "  sz=$(du -sk \"$d\" 2>/dev/null | cut -f1); [ -z \"$sz\" ] && sz=0",
+            # 徽章資料：離站備份天數（''=未設定 / -1=設了沒推成功過 / N=距上次成功天數）、
+            # 原生分支保護旗標、description 首行——同一趟 SSH 順手多讀，成本近零
+            "  bkd=''",
+            "  if [ -n \"$(git --git-dir=\"$d\" config --get remote.offsite-backup.url 2>/dev/null)\" ]; then",
+            "    last=$(git --git-dir=\"$d\" config --get nasgit.lastbackup 2>/dev/null)",
+            "    if [ -n \"$last\" ]; then bkd=$(( ($(date +%s) - last) / 86400 )); else bkd=-1; fi",
+            "  fi",
+            "  prot=''",
+            "  if [ \"$(git --git-dir=\"$d\" config --get receive.denyNonFastForwards 2>/dev/null)\" = true ] || "
+            "[ \"$(git --git-dir=\"$d\" config --get receive.denyDeletes 2>/dev/null)\" = true ]; then prot=1; fi",
+            "  desc=$(head -1 \"$d/description\" 2>/dev/null | cut -c1-80 | tr '\\t' ' ')",
+            "  case \"$desc\" in 'Unnamed repository'*) desc='';; esac",
             "  if [ -z \"$info\" ]; then",
-            "    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\" \"$mu\" \"$sz\" \"$kind\" \"$upstream\"",
+            "    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$name\" \"空庫（無 commit）\" \"$pol\" \"$mu\" \"$sz\" \"$kind\" \"$upstream\" \"$bkd\" \"$prot\" \"$desc\"",
             "  else",
             "    dt=${info%%|*}; br=${info#*|}",
-            "    printf '%s\\t%s (%s)\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\" \"$mu\" \"$sz\" \"$kind\" \"$upstream\"",
+            "    printf '%s\\t%s (%s)\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$name\" \"$dt\" \"$br\" \"$pol\" \"$mu\" \"$sz\" \"$kind\" \"$upstream\" \"$bkd\" \"$prot\" \"$desc\"",
             "  fi",
             "done",
             "echo ___END___",
@@ -1110,7 +1128,14 @@ class Worker(QThread):
                 size_kb = 0
             kind = parts[5].strip() if len(parts) > 5 else ""
             upstream = parts[6].strip() if len(parts) > 6 else ""
-            items.append((name, status, pol, mirror, size_kb, kind, upstream))
+            bkd_raw = parts[7].strip() if len(parts) > 7 else ""
+            try:
+                bkd = int(bkd_raw) if bkd_raw else None
+            except ValueError:
+                bkd = None
+            prot = bool(parts[8].strip()) if len(parts) > 8 else False
+            desc = parts[9].strip() if len(parts) > 9 else ""
+            items.append((name, status, pol, mirror, size_kb, kind, upstream, bkd, prot, desc))
         items.sort(key=lambda t: t[0].lower())
         self.repos.emit(items)
         n_empty = sum(1 for t in items if t[1].startswith("空庫"))
@@ -1138,22 +1163,28 @@ class Worker(QThread):
             self.done.emit(False, f"找不到、或不是有效的裸倉庫，已中止：{path}")
             return
 
+        # policy 檔跟著倉庫走：留在原地的話，日後「同名重建」會靜默繼承上一代的
+        # CI 規則（幽靈 policy，出事完全查不出來源）。archive/backup_delete 搬成
+        # 封存 sidecar（<name>.<ts>.policy，還原時一起搬回），hard_delete 一併刪除。
+        pf = f"{root}/ci_policies/{name}.policy"
         if mode == "archive":
             cmd = (
                 f"ts=$(date +%Y%m%d-%H%M%S); mkdir -p '{root}/_archived' && "
-                f"mv '{path}' '{root}/_archived/{name}.'$ts && echo ___OK___"
+                f"mv '{path}' '{root}/_archived/{name}.'$ts && "
+                f"{{ [ ! -f '{pf}' ] || mv '{pf}' '{root}/_archived/{name}.'$ts'.policy'; }} && echo ___OK___"
             )
-            okmsg = f"已安全下庄：搬到封存區 {root}/_archived/（可還原）\n倉庫：{name}"
+            okmsg = f"已安全下庄：搬到封存區 {root}/_archived/（可還原，CI policy 一併封存）\n倉庫：{name}"
         elif mode == "backup_delete":
             cmd = (
                 f"ts=$(date +%Y%m%d-%H%M%S); mkdir -p '{root}/_archived' && "
                 f"tar -czf '{root}/_archived/{name}.'$ts'.tar.gz' -C '{root}' '{name}' && "
-                f"rm -rf '{path}' && echo ___OK___"
+                f"rm -rf '{path}' && "
+                f"{{ [ ! -f '{pf}' ] || mv '{pf}' '{root}/_archived/{name}.'$ts'.tar.gz.policy'; }} && echo ___OK___"
             )
-            okmsg = f"已打包備份到 {root}/_archived/ 後刪除\n倉庫：{name}"
+            okmsg = f"已打包備份到 {root}/_archived/ 後刪除（CI policy 一併封存）\n倉庫：{name}"
         else:  # hard_delete
-            cmd = f"rm -rf '{path}' && echo ___OK___"
-            okmsg = f"已直接刪除（不可還原）\n倉庫：{name}"
+            cmd = f"rm -rf '{path}' && rm -f '{pf}' && echo ___OK___"
+            okmsg = f"已直接刪除（不可還原，CI policy 一併移除）\n倉庫：{name}"
 
         rc, out, _ = self._ssh(cmd)
         if rc == 0 and "___OK___" in out:
@@ -1386,6 +1417,8 @@ class Worker(QThread):
             f"pol='{pol}'",
             "mkdir -p \"$BASE/ci_policies\"",
             "pf=\"$BASE/ci_policies/$name.policy\"",
+            # 覆寫前備份——全檔其他設定寫入點都有 .bak 慣例，這裡是最高頻的一個卻漏了
+            "[ -f \"$pf\" ] && cp \"$pf\" \"$pf.bak-$(date +%Y%m%d-%H%M%S)\"",
             "if [ \"$pol\" = none ]; then",
             "  printf '# %s\\nPOLICY=none\\n' \"$name\" > \"$pf\"",
             "else",
@@ -1430,6 +1463,7 @@ class Worker(QThread):
             "mkdir -p \"$BASE/ci_policies\"",
             f"for name in {quoted}; do",
             "  pf=\"$BASE/ci_policies/$name.policy\"",
+            "  [ -f \"$pf\" ] && cp \"$pf\" \"$pf.bak-$(date +%Y%m%d-%H%M%S)\"",
             "  if [ \"$pol\" = none ]; then",
             "    printf '# %s\\nPOLICY=none\\n' \"$name\" > \"$pf\"",
             "  else",
@@ -1827,9 +1861,10 @@ class Worker(QThread):
             "--format='%(refname:short)|%(committerdate:short)|%(authorname)|%(subject)' refs/heads 2>/dev/null | "
             "while IFS='|' read -r rn cd an su; do",
             "    [ \"$rn\" = \"$base\" ] && continue",
-            "    printf '  %s  |  %s  |  %s  |  %s\\n' \"$rn\" \"$cd\" \"$an\" \"$su\"",
+            "    printf 'ROW\\t%s\\t%s\\t%s\\t%s\\n' \"$rn\" \"$cd\" \"$an\" \"$su\"",
             "  done",
             "fi",
+            "echo \"BASE_BRANCH\t$base\"",
             "echo ___END___",
             "true",
         ])
@@ -1837,8 +1872,51 @@ class Worker(QThread):
         if rc != 0:
             self.done.emit(False, "讀取已合併分支失敗：" + self._err_hint(err, rc))
             return
-        self.hooks.emit(self._between(out))
-        self.done.emit(True, f"已讀取 {name} 的已合併分支清單。")
+        rows = []
+        base_branch = ""
+        for ln in self._between(out).splitlines():
+            p = ln.split("\t")
+            if p[0] == "ROW" and len(p) >= 5:
+                rows.append((p[1], p[2], p[3], p[4]))
+            elif p[0] == "BASE_BRANCH" and len(p) >= 2:
+                base_branch = p[1]
+        self.repos.emit(rows)
+        self.hooks.emit(base_branch)
+        self.done.emit(True, f"「{name}」已合併進 {base_branch or '?'} 的分支：{len(rows)} 個。")
+
+    # --- 刪除指定分支（管理端 update-ref，不經 push、不受 receive.denyDeletes 限制）---
+    # merged-branches 對話框的批次刪除用；預設分支在遠端再擋一次（UI 已不列它，雙保險）。
+    def _run_branch_delete(self):
+        c = self.cfg
+        root = c["remote_root"]
+        name = c.get("repo_name", "")
+        branches = [b for b in c.get("branch_names", []) if b.strip()]
+        if not is_safe_name(name):
+            self.done.emit(False, f"倉庫名稱不合規：{name!r}")
+            return
+        if not branches:
+            self.done.emit(False, "沒有要刪除的分支。")
+            return
+        self.log.emit(f"--- 刪除分支：{name}（{len(branches)} 個）---")
+        lines = [
+            f"BASE='{root}'; repo=\"$BASE/{name}\"",
+            "base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
+        ]
+        for b in branches:
+            lines += [
+                f"b={shq(b)}",
+                "if [ \"$b\" = \"$base\" ]; then echo \"[SKIP] $b（預設分支不可刪）\"",
+                "elif git --git-dir=\"$repo\" update-ref -d \"refs/heads/$b\" 2>/dev/null; then echo \"[OK] $b\"",
+                "else echo \"[FAIL] $b\"; fi",
+            ]
+        ok, body, hint = self._ssh_block(lines)
+        if not ok:
+            self.done.emit(False, f"刪除分支失敗：{hint}")
+            return
+        self.hooks.emit(body)
+        nok = body.count("[OK] ")
+        nbad = body.count("[FAIL] ") + body.count("[SKIP] ")
+        self.done.emit(nbad == 0, f"分支刪除完成：成功 {nok}、略過/失敗 {nbad}。")
 
     # --- 跨所有倉庫全文搜尋（各庫預設分支下）---
     def _run_grep_all(self):
@@ -1857,7 +1935,9 @@ class Worker(QThread):
             "  name=$(basename \"$repo\")",
             "  base=$(git --git-dir=\"$repo\" symbolic-ref --short HEAD 2>/dev/null)",
             "  [ -z \"$base\" ] && continue",
-            "  git --git-dir=\"$repo\" grep -n -I -e \"$PATTERN\" \"$base\" 2>/dev/null | "
+            # -c core.quotePath=false：CJK 檔名不再被八進位轉義，搜尋結果的「開啟」
+            # 才解得回真實路徑（2026-07-16 的 accepted limitation，其實一個 -c 就解）
+            "  git --git-dir=\"$repo\" -c core.quotePath=false grep -n -I -e \"$PATTERN\" \"$base\" 2>/dev/null | "
             "awk -v b=\"$base\" -v n=\"$name\" "
             "'{ print \"HIT\\t\" n \"\\t\" substr($0, length(b) + 2) }'",
             "done",
@@ -2209,6 +2289,46 @@ class Worker(QThread):
                 items.append((parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()))
         self.repos.emit(items)
         self.done.emit(True, f"共 {len(items)} 個 git_devs 帳號。")
+
+    # --- 檢視某個 git_devs 帳號的 authorized_keys 內容（唯讀）---
+    # 之前只看得到「金鑰數=3」，答不出是哪三把、輪替後舊的真的拔了沒。
+    # 讀不到（別人 home 的 700 .ssh）就誠實回報 CANT_READ，UI 端改走
+    # 「產生 sudo 檢視指令」的既有貼上模式——回報不變量：讀不到不得謊稱沒金鑰。
+    def _run_list_user_keys(self):
+        target = self.cfg.get("target_user", "")
+        if not is_safe_username(target):
+            self.done.emit(False, f"帳號名稱不合規：{target!r}")
+            return
+        self.log.emit(f"--- 檢視 {target} 的 authorized_keys ---")
+        ok, body, hint = self._ssh_block([
+            f"u='{target}'",
+            "home=$(grep \"^$u:\" /etc/passwd | cut -d: -f6)",
+            "if [ -z \"$home\" ]; then echo NO_USER",
+            "elif [ ! -e \"$home/.ssh/authorized_keys\" ] && [ ! -r \"$home/.ssh\" ] 2>/dev/null; then",
+            # .ssh 目錄不可讀時，「檔案不存在」與「讀不到」分不出來——一律回 CANT_READ
+            "  if [ -r \"$home/.ssh/authorized_keys\" ]; then echo READABLE_ANYWAY; else echo CANT_READ; fi",
+            "elif [ ! -f \"$home/.ssh/authorized_keys\" ]; then echo NO_FILE",
+            "elif [ -r \"$home/.ssh/authorized_keys\" ]; then",
+            "  grep -vE '^[[:space:]]*(#|$)' \"$home/.ssh/authorized_keys\" | while read -r ln; do",
+            "    printf 'KEY\\t%s\\n' \"$ln\"",
+            "  done",
+            "  echo LIST_OK",
+            "else echo CANT_READ; fi",
+        ])
+        if not ok:
+            self.done.emit(False, f"查詢失敗：{hint}")
+            return
+        self.hooks.emit(body)
+        if "NO_USER" in body:
+            self.done.emit(False, f"找不到帳號：{target}")
+        elif "CANT_READ" in body:
+            self.done.emit(False, f"讀不到 {target} 的 authorized_keys（目錄權限 700，非 root 進不去）——"
+                                  "可用「產生 sudo 檢視指令」貼到有 sudo 的終端機看。")
+        elif "NO_FILE" in body:
+            self.done.emit(True, f"{target} 沒有 authorized_keys 檔（沒有任何金鑰）。")
+        else:
+            nk = body.count("KEY\t")
+            self.done.emit(True, f"{target} 共 {nk} 把金鑰。")
 
     # --- 從 NAS clone 到本地（本機執行 git clone，走金鑰/plink）---
     def _run_clone(self):
@@ -2870,6 +2990,36 @@ class Worker(QThread):
             "  echo \"[OK] 磁碟使用率 $pct%\"",
             "fi",
             "echo",
+            "echo '== 通知管道 =='",
+            "tgf=\"$BASE/config/tg_bot.conf\"",
+            "if [ -f \"$tgf\" ] && grep -q '^BOT_TOKEN=..*' \"$tgf\" && grep -q '^CHAT_ID=..*' \"$tgf\"; then",
+            "  echo '[OK] Telegram 設定存在（實際送達請用「Telegram 通知設定…」的測試按鈕驗證）'",
+            "else",
+            "  echo '[  ] Telegram 設定缺失或空白（config/tg_bot.conf）——引擎/排程腳本的即時通知全是啞的'",
+            "fi",
+            "smtpf='/volume1/NAS_Safety/login_watch/config.json'",
+            "if [ -f \"$smtpf\" ]; then",
+            "  if python3 -c \"import json,sys;c=json.load(open('$smtpf'));s=c.get('smtp');sys.exit(0 if s and s.get('enabled',True) else 1)\" 2>/dev/null; then",
+            "    echo '[OK] SMTP 設定可讀（send_email.py 依賴這份）'",
+            "  else",
+            "    echo '[  ] SMTP 設定存在但缺 smtp 區塊或未啟用——email 通知寄不出去'",
+            "  fi",
+            "else",
+            "  echo \"[  ] 找不到 SMTP 設定（$smtpf）——所有 email 通知從未寄出過\"",
+            "fi",
+            "echo",
+            "echo '== 孤兒 CI policy =='",
+            "orph=0",
+            "for pf in \"$BASE\"/ci_policies/*.policy; do",
+            "  [ -f \"$pf\" ] || continue",
+            "  pn=$(basename \"$pf\" .policy)",
+            "  if [ ! -d \"$BASE/$pn\" ]; then",
+            "    echo \"[  ] $pn：policy 檔存在但倉庫不在（刪庫殘留——同名重建會靜默繼承這份規則）\"",
+            "    orph=$((orph+1))",
+            "  fi",
+            "done",
+            "[ \"$orph\" = 0 ] && echo '[OK] 沒有孤兒 policy 檔'",
+            "echo",
             "echo '== 日誌 =='",
             "[ -d \"$BASE/logs\" ] && echo '[OK] logs 目錄存在' || echo '[  ] 無 logs 目錄'",
             "echo ___END___",
@@ -3002,6 +3152,51 @@ class Worker(QThread):
             self.done.emit(True, "已更新 Telegram 通知設定（舊檔已備份）。")
         else:
             self.done.emit(False, "更新 Telegram 通知設定失敗（連線或權限問題）。")
+
+    # --- 通知管道實測：真的發一則 Telegram、寄一封測試信，回報「實際結果」---
+    # 全系統的告警出口只有這兩條管道，而它們過去是唯一沒被監測的元件：token 過期、
+    # chat 被踢、SMTP 設定讀不到——症狀全是「一切安靜」，跟「一切正常」長得一模一樣。
+    def _run_notify_test(self):
+        root = self.cfg["remote_root"]
+        self.log.emit("--- 通知管道測試（Telegram + email）---")
+        ok, body, hint = self._ssh_block([
+            f"BASE='{root}'",
+            "f=\"$BASE/config/tg_bot.conf\"; BOT_TOKEN=\"\"; CHAT_ID=\"\"",
+            "[ -f \"$f\" ] && . \"$f\"",
+            "if [ -z \"$BOT_TOKEN\" ] || [ -z \"$CHAT_ID\" ]; then",
+            "  echo 'TG_UNCONFIGURED'",
+            "else",
+            "  resp=$(curl -s -m 15 -X POST \"https://api.telegram.org/bot$BOT_TOKEN/sendMessage\" "
+            "--data-urlencode \"chat_id=$CHAT_ID\" "
+            "--data-urlencode 'text=🔔 NasGitConnector 通知測試（看到這則表示 Telegram 管道正常）')",
+            "  case \"$resp\" in",
+            "    *'\"ok\":true'*) echo 'TG_OK' ;;",
+            "    '') echo 'TG_FAIL（curl 無回應——NAS 對外網路？）' ;;",
+            "    *) echo 'TG_FAIL'; printf '%s\\n' \"$resp\" | head -c 300 ;;",
+            "  esac",
+            "fi",
+            "if [ -f \"$BASE/tools/send_email.py\" ]; then",
+            # send_email.py 的契約：成功時完全無輸出、失敗只印 stderr 警告且 exit 0——
+            # 所以「有無輸出」就是成敗判定，不能看 exit code
+            "  out=$(printf '%s\\n' '這是 NasGitConnector 的通知測試信（看到這封表示 email 管道正常）。' | "
+            "python3 \"$BASE/tools/send_email.py\" --subject 'NasGitConnector 通知測試' 2>&1)",
+            "  if [ -n \"$out\" ]; then echo 'MAIL_FAIL'; printf '%s\\n' \"$out\"; else echo 'MAIL_OK'; fi",
+            "else",
+            "  echo 'MAIL_NOSCRIPT（tools/send_email.py 未部署）'",
+            "fi",
+        ], timeout=120)
+        if not ok:
+            self.done.emit(False, f"通知測試失敗：{hint}")
+            return
+        self.hooks.emit(body)
+        tg_ok = "TG_OK" in body
+        mail_ok = "MAIL_OK" in body
+        summary = []
+        summary.append("Telegram：" + ("✅ 已送出（去聊天室確認有收到）" if tg_ok else "❌ " +
+                       ("未設定" if "TG_UNCONFIGURED" in body else "發送失敗，見詳情")))
+        summary.append("email：" + ("✅ 已送出（去信箱確認有收到）" if mail_ok else "❌ " +
+                       ("腳本未部署" if "MAIL_NOSCRIPT" in body else "寄送失敗，見詳情")))
+        self.done.emit(tg_ok or mail_ok, "\n".join(summary))
 
     # --- 讀取全部 CI profile（ci_profiles/*.conf）內容 ---
     # 這些是「共用」設定檔：一個 .conf 影響掛在該 policy 上的所有 repo，
@@ -3257,7 +3452,8 @@ class Worker(QThread):
         root = self.cfg["remote_root"]
         logfile = self.cfg.get("logfile", "")
         n = int(self.cfg.get("log_lines", 200))
-        if logfile not in ("git_push.log", "ci_violation.log", "post_receive_debug.log"):
+        if logfile not in ("git_push.log", "ci_violation.log", "post_receive_debug.log",
+                           "mirror_sync.log", "offsite_backup.log", "healthcheck.log"):
             self.done.emit(False, f"不支援的日誌：{logfile!r}")
             return
         self.log.emit(f"--- 讀取日誌 {logfile}（最後 {n} 筆）---")
@@ -3401,6 +3597,8 @@ class Worker(QThread):
             "for e in \"$A\"/*; do",
             "  [ -e \"$e\" ] || continue",
             "  bn=$(basename \"$e\")",
+            # .policy sidecar 是封存項的附屬檔（還原/清除時跟主項一起處理），不獨立列出
+            "  case \"$bn\" in *.policy) continue;; esac",
             "  if [ -d \"$e\" ]; then t=dir; else t=file; fi",
             "  sz=$(du -sh \"$e\" 2>/dev/null | cut -f1)",
             "  printf 'ENTRY\\t%s\\t%s\\t%s\\n' \"$bn\" \"$t\" \"$sz\"",
@@ -3441,9 +3639,21 @@ class Worker(QThread):
             "  tgt=\"$BASE/$orig\"",
             "  if [ -e \"$tgt\" ]; then echo \"TARGET_EXISTS $orig\"; echo ___END___; exit 0; fi",
             "  mv \"$e\" \"$tgt\" && echo \"RESTORED $orig\"",
+            # 封存時搬出來的 policy sidecar 一併還原（沒有 sidecar 的舊封存項不受影響）
+            "  if [ -f \"$e.policy\" ]; then",
+            "    mkdir -p \"$BASE/ci_policies\"",
+            "    mv \"$e.policy\" \"$BASE/ci_policies/$orig.policy\" && echo \"POLICY_RESTORED $orig\"",
+            "  fi",
             "else",
             "  case \"$arch\" in",
-            "    *.tar.gz) tar -xzf \"$e\" -C \"$BASE\" && echo EXTRACTED ;;",
+            "    *.tar.gz)",
+            "      tar -xzf \"$e\" -C \"$BASE\" && echo EXTRACTED",
+            "      if [ -f \"$e.policy\" ]; then",
+            "        orig=$(printf '%s' \"$arch\" | sed 's/\\.[0-9]\\{8\\}-[0-9]\\{6\\}\\.tar\\.gz$//')",
+            "        mkdir -p \"$BASE/ci_policies\"",
+            "        mv \"$e.policy\" \"$BASE/ci_policies/$orig.policy\" && echo \"POLICY_RESTORED $orig\"",
+            "      fi",
+            "      ;;",
             "    *) echo UNKNOWN_FILE ;;",
             "  esac",
             "fi",
@@ -3481,7 +3691,8 @@ class Worker(QThread):
             lines += [
                 f"e=\"$A/{a}\"",
                 f"if [ ! -e \"$e\" ]; then echo '[NOTFOUND] {a}'",
-                f"elif rm -rf \"$e\"; then echo '[OK] {a}'",
+                # .policy sidecar 跟主項同生共死（清單不單獨列它，留著會變孤兒檔）
+                f"elif rm -rf \"$e\" \"$e.policy\"; then echo '[OK] {a}'",
                 f"else echo '[FAIL] {a}'; fi",
             ]
         ok, body, hint = self._ssh_block(lines)
@@ -3675,8 +3886,8 @@ class Worker(QThread):
             )
             return
 
-        # 2-7 NAS HEAD 指向本分支＋記錄來源分類（合併成一條 SSH；
-        # NAS 上已有 nasgit.kind 就不覆蓋，見 CLAUDE.md）
+        # 2-7 NAS HEAD 指向本分支＋記錄來源分類＋（可選）CI/離站備份/描述一次到位
+        # （全部併進同一條 SSH——串接流程維持兩條往返，新增串接期設定不開第三條，見 CLAUDE.md）
         post_lines = [
             f"repo='{remote_repo_path}'",
             f"git --git-dir=\"$repo\" symbolic-ref HEAD refs/heads/{shq(branch)} && echo HEAD_OK",
@@ -3685,11 +3896,58 @@ class Worker(QThread):
         if not existing_kind:
             kind_lines, kind_label = self._repo_kind_config_lines(prev_origin)
             post_lines += kind_lines
+        # CI policy：新庫剛建好是設 strict 成本最低的時刻——以前只能事後回瀏覽分頁補設，
+        # 最重要的保護落在最容易忘記的時間點
+        extras = []
+        ci_policy = c.get("ci_policy", "")
+        if ci_policy in ("soft", "strict"):
+            post_lines += [
+                f"mkdir -p '{root}/ci_policies'",
+                f"pf='{root}/ci_policies/{repo_name}.policy'",
+                "[ -f \"$pf\" ] && cp \"$pf\" \"$pf.bak-$(date +%Y%m%d-%H%M%S)\"",
+                f"printf '# %s\\nPOLICY=%s\\nPROFILE=%s\\n' '{repo_name}' '{ci_policy}' '{ci_policy}' > \"$pf\"",
+                "chgrp git_devs \"$pf\" 2>/dev/null",
+                "echo CI_OK",
+            ]
+            extras.append(f"CI policy＝{ci_policy}")
+        backup_url = (c.get("backup_url", "") or "").strip()
+        if backup_url and re.match(r"^(https://|http://|git@|ssh://|file://)[A-Za-z0-9@._:/~?=&%+\-]+$", backup_url):
+            post_lines += [
+                f"git --git-dir=\"$repo\" remote remove offsite-backup 2>/dev/null",
+                f"git --git-dir=\"$repo\" remote add offsite-backup {shq(backup_url)}",
+                # 同 BackupDialog：拔 fetch refspec，不然 push 後長出 refs/remotes 污染備份
+                "git --git-dir=\"$repo\" config --unset-all remote.offsite-backup.fetch 2>/dev/null",
+                "echo BK_OK",
+            ]
+            extras.append("離站備份目的地")
+        elif backup_url:
+            self.log.emit("⚠ 離站備份 URL 格式不合規，本次未設定（可事後用「離站備份…」補）")
+        description = (c.get("description", "") or "").strip()
+        if description:
+            d64 = base64.b64encode(description.encode("utf-8")).decode("ascii")
+            post_lines += [
+                f"printf '%s' '{d64}' | base64 -d > \"$repo/description\"",
+                "echo DESC_OK",
+            ]
+            extras.append("描述")
         ok, body, _hint = self._ssh_block(post_lines)
         if ok and "HEAD_OK" in body:
             self.log.emit(f"✔ 已將 NAS 預設分支(HEAD)指向 {branch}")
         if kind_label:
             self.log.emit(f"ℹ 來源分類：{kind_label}")
+        if extras:
+            applied = []
+            if "CI_OK" in body:
+                applied.append(f"CI policy＝{ci_policy}")
+            if "BK_OK" in body:
+                applied.append("離站備份目的地")
+            if "DESC_OK" in body:
+                applied.append("描述")
+            if applied:
+                self.log.emit("✔ 串接期設定已套用：" + "、".join(applied))
+            missing = len(extras) - len(applied)
+            if missing:
+                self.log.emit(f"⚠ 有 {missing} 項串接期設定沒有確認成功，請到瀏覽分頁檢查")
 
         self.done.emit(True, f"完成！專案已就地接上 NAS。\nNAS 倉庫：{remote_repo_path}")
 
@@ -3808,6 +4066,7 @@ class TextViewDialog(QDialog):
         self._text = text
 
         lay = QVBoxLayout(self)
+        self._is_markdown = markdown
         if markdown:
             view = QTextBrowser()
             view.setReadOnly(True)
@@ -3829,12 +4088,32 @@ class TextViewDialog(QDialog):
                     view.centerCursor()
                 except (ValueError, TypeError):
                     pass
+        self._view = view
         lay.addWidget(view, stretch=1)
+
+        # 搜尋列＋警告過濾：健檢/CI 總表/fsck/log 全走這個對話框，動一處全部受益。
+        # markdown 檢視（.md 預覽）不掛這排——setMarkdown 後行號對不上原文，過濾無意義。
+        if not markdown:
+            srow = QHBoxLayout()
+            self.search_edit = QLineEdit()
+            self.search_edit.setPlaceholderText("搜尋（Enter=下一個）…")
+            self.search_edit.returnPressed.connect(self._find_next)
+            srow.addWidget(self.search_edit, stretch=1)
+            find_btn = QPushButton("找下一個")
+            find_btn.clicked.connect(self._find_next)
+            srow.addWidget(find_btn)
+            self.warn_only_cb = QCheckBox("只看警告（[!!]/[FAIL]/[  ]/⚠/‼）")
+            self.warn_only_cb.toggled.connect(self._apply_filter)
+            srow.addWidget(self.warn_only_cb)
+            lay.addLayout(srow)
 
         row = QHBoxLayout()
         copy_btn = QPushButton("複製全部")
         copy_btn.clicked.connect(self._copy)
         row.addWidget(copy_btn)
+        save_btn = QPushButton("另存為…")
+        save_btn.clicked.connect(self._save_as)
+        row.addWidget(save_btn)
         if terminal_cfg is not None:
             self._terminal_cfg = terminal_cfg
             term_btn = QPushButton(f"開啟終端機（{terminal_cfg.get('user', '')}@{terminal_cfg.get('host', '')}）…")
@@ -3848,6 +4127,41 @@ class TextViewDialog(QDialog):
 
     def _copy(self):
         QApplication.clipboard().setText(self._text)
+
+    def _find_next(self):
+        needle = self.search_edit.text()
+        if not needle:
+            return
+        if not self._view.find(needle):
+            # 繞回開頭再找一次，找不到才算真的沒有
+            cur = self._view.textCursor()
+            cur.movePosition(cur.MoveOperation.Start)
+            self._view.setTextCursor(cur)
+            if not self._view.find(needle):
+                QMessageBox.information(self, "搜尋", f"找不到：{needle}")
+
+    WARN_MARKERS = ("[!!]", "[FAIL]", "[  ]", "⚠", "‼", "[WOULD-FIX]")
+
+    def _apply_filter(self, warn_only):
+        if warn_only:
+            kept = [ln for ln in self._text.splitlines()
+                    if any(m in ln for m in self.WARN_MARKERS) or ln.startswith("== ")]
+            self._view.setPlainText("\n".join(kept) or "（沒有任何警告行）")
+        else:
+            self._view.setPlainText(self._text)
+
+    def _save_as(self):
+        default_name = re.sub(r"[\\/:*?\"<>|]", "_", self.windowTitle())[:40] or "輸出"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "另存為", f"{default_name}_{datetime.now().strftime('%Y%m%d-%H%M')}.txt",
+            "文字檔 (*.txt);;所有檔案 (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self._text)
+        except OSError as e:
+            QMessageBox.warning(self, "存檔失敗", str(e))
 
     def _open_terminal(self):
         ok, msg = open_admin_terminal(self._terminal_cfg)
@@ -4565,12 +4879,38 @@ class NotifyConfigDialog(QDialog):
         self.status = QLabel("讀取中…")
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
+        test_row = QHBoxLayout()
+        self.test_btn = QPushButton("🔔 發送測試通知（Telegram＋email）")
+        self.test_btn.setToolTip("真的各發一則測試訊息，回報實際送達結果——通知管道是唯一沒被監測的元件，"
+                                 "token 過期/SMTP 壞掉的症狀就是「一切安靜」。")
+        self.test_btn.clicked.connect(self.on_test)
+        self.test_btn.setEnabled(False)
+        test_row.addWidget(self.test_btn)
+        test_row.addStretch(1)
+        lay.addLayout(test_row)
         self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         self.bb.accepted.connect(self.on_save)
         self.bb.rejected.connect(self.reject)
         self.bb.setEnabled(False)
         lay.addWidget(self.bb)
         self._load()
+
+    def on_test(self):
+        self.test_btn.setEnabled(False)
+        self.bb.setEnabled(False)
+        self.status.setText("測試通知發送中…（會真的發一則 Telegram＋一封信）")
+        self.status.setStyleSheet("")
+        self.worker = Worker(dict(self.cfg), mode="notify_test")
+        self.worker.hooks.connect(lambda body: None)
+        self.worker.done.connect(self._on_test_done)
+        self.worker.start()
+
+    def _on_test_done(self, ok, msg):
+        self.test_btn.setEnabled(True)
+        self.bb.setEnabled(True)
+        self.status.setText(msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        (QMessageBox.information if ok else QMessageBox.warning)(self, "通知測試結果", msg)
 
     def _load(self):
         self.worker = Worker(dict(self.cfg), mode="tg_conf_get")
@@ -4612,6 +4952,116 @@ class NotifyConfigDialog(QDialog):
         else:
             self.status.setText("❌ " + msg)
             self.status.setStyleSheet("color:#b00020;")
+
+
+# ============================================================
+# 已合併分支 對話框（勾選批次刪除——之前只能列出，清理得跳出 GUI 手打 push :branch）
+# ============================================================
+class MergedBranchesDialog(QDialog):
+    def __init__(self, parent, cfg, repo_name):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.repo_name = repo_name
+        self.worker = None
+        self.base_branch = ""
+        self.setWindowTitle(f"已合併分支 — {repo_name}")
+        self.resize(640, 440)
+        lay = QVBoxLayout(self)
+        self.info = QLabel("已完全合併進預設分支的分支。本 repo 的慣例是「合併後的分支不刪」（見 CLAUDE.md）——"
+                           "要清理的話勾選後按刪除，動作走管理端 update-ref（不經 push，也會留本機稽核）。")
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+        self.list = QListWidget()
+        lay.addWidget(self.list, stretch=1)
+        row = QHBoxLayout()
+        self.refresh_b = QPushButton("重新整理")
+        self.refresh_b.clicked.connect(self.refresh)
+        self.del_b = QPushButton("刪除勾選的分支…")
+        self.del_b.setEnabled(False)
+        self.del_b.clicked.connect(self.on_delete)
+        close_b = QPushButton("關閉")
+        close_b.clicked.connect(self.accept)
+        row.addWidget(self.refresh_b)
+        row.addWidget(self.del_b)
+        row.addStretch(1)
+        row.addWidget(close_b)
+        lay.addLayout(row)
+        self.status = QLabel("讀取中…")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.refresh()
+
+    def _busy(self, b):
+        self.refresh_b.setEnabled(not b)
+        self.del_b.setEnabled(not b and self.list.count() > 0)
+
+    def refresh(self):
+        self._busy(True)
+        self.status.setText("讀取中…")
+        self.status.setStyleSheet("")
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        self.worker = Worker(cfg, mode="merged_branches")
+        self.worker.repos.connect(self._on_rows)
+        self.worker.hooks.connect(self._on_base)
+        self.worker.done.connect(self._on_load_done)
+        self.worker.start()
+
+    def _on_base(self, base):
+        self.base_branch = base
+
+    def _on_rows(self, rows):
+        self.list.clear()
+        for rn, cd, an, su in rows:
+            it = QListWidgetItem(f"{rn}    ·    {cd}    ·    {an}    ·    {su}")
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Unchecked)
+            it.setData(Qt.ItemDataRole.UserRole, rn)
+            self.list.addItem(it)
+
+    def _on_load_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("" if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("" if ok else "color:#b00020;")
+
+    def _checked(self):
+        return [self.list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self.list.count())
+                if self.list.item(i).checkState() == Qt.CheckState.Checked]
+
+    def on_delete(self):
+        names = self._checked()
+        if not names:
+            self.status.setText("先勾選要刪的分支。")
+            return
+        r = QMessageBox.question(
+            self, "確認刪除分支",
+            f"將從「{self.repo_name}」刪除 {len(names)} 個分支：\n" +
+            "\n".join("・" + n for n in names[:12]) +
+            ("\n…" if len(names) > 12 else "") +
+            "\n\n這些分支已合併進預設分支，commit 不會消失，但分支這個「功能索引」會沒了"
+            "（本 repo 慣例是留著）。確定刪除？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._busy(True)
+        self.status.setText("刪除中…")
+        cfg = dict(self.cfg)
+        cfg["repo_name"] = self.repo_name
+        cfg["branch_names"] = names
+        self._pending = names
+        self.worker = Worker(cfg, mode="branch_delete")
+        self.worker.done.connect(self._on_deleted)
+        self.worker.start()
+
+    def _on_deleted(self, ok, msg):
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        if ok or "成功" in msg:
+            audit_log(self.cfg.get("user", ""), self.cfg.get("host", ""),
+                      "branch_delete", f"{self.repo_name}: {', '.join(getattr(self, '_pending', []))}")
+        self.refresh()
 
 
 # ============================================================
@@ -5417,11 +5867,15 @@ class GitDevsUsersDialog(QDialog):
         lay.addWidget(self.list, stretch=1)
         row = QHBoxLayout()
         self.refresh_b = QPushButton("重新整理")
+        self.view_keys_b = QPushButton("檢視此帳號金鑰…")
+        self.view_keys_b.setToolTip("列出這個帳號 authorized_keys 的每一把金鑰（型別/註解/SHA256 指紋）——"
+                                    "輪替後驗證舊金鑰真的拔掉了沒。讀不到會提供 sudo 檢視指令。")
         self.add_key_b = QPushButton("幫選取帳號新增金鑰…")
         self.rotate_b = QPushButton("金鑰輪替…")
         self.remove_b = QPushButton("移除選取帳號…")
         self.close_b = QPushButton("關閉")
         row.addWidget(self.refresh_b)
+        row.addWidget(self.view_keys_b)
         row.addWidget(self.add_key_b)
         row.addWidget(self.rotate_b)
         row.addWidget(self.remove_b)
@@ -5433,6 +5887,7 @@ class GitDevsUsersDialog(QDialog):
         lay.addWidget(self.status)
 
         self.refresh_b.clicked.connect(self.refresh)
+        self.view_keys_b.clicked.connect(self.on_view_keys)
         self.add_key_b.clicked.connect(self.on_add_key)
         self.rotate_b.clicked.connect(self.on_rotate)
         self.remove_b.clicked.connect(self.on_remove)
@@ -5440,8 +5895,65 @@ class GitDevsUsersDialog(QDialog):
         self.refresh()
 
     def _busy(self, b):
-        for x in (self.refresh_b, self.add_key_b, self.rotate_b, self.remove_b):
+        for x in (self.refresh_b, self.view_keys_b, self.add_key_b, self.rotate_b, self.remove_b):
             x.setEnabled(not b)
+
+    def on_view_keys(self):
+        username = self._selected_username()
+        if not username:
+            return
+        self._busy(True)
+        self.status.setText(f"讀取 {username} 的金鑰中…")
+        self.status.setStyleSheet("")
+        self._keys_user = username
+        cfg = dict(self.cfg)
+        cfg["target_user"] = username
+        self.worker = Worker(cfg, mode="list_user_keys")
+        self.worker.hooks.connect(self._on_keys_body)
+        self.worker.done.connect(self._on_keys_done)
+        self.worker.start()
+
+    def _on_keys_body(self, body):
+        self._keys_body = body
+
+    def _on_keys_done(self, ok, msg):
+        self._busy(False)
+        self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        body = getattr(self, "_keys_body", "")
+        username = getattr(self, "_keys_user", "")
+        if "CANT_READ" in body:
+            # 非 root 讀不到別人 home 的 700 .ssh——沿用「產生指令貼到 sudo 終端機」模式
+            r = QMessageBox.question(
+                self, "讀不到金鑰檔",
+                f"{username} 的 authorized_keys 需要 root 才能讀。\n要產生 sudo 檢視指令嗎？")
+            if r == QMessageBox.StandardButton.Yes:
+                script = "\n".join([
+                    "sudo -v",
+                    f"HOME_DIR=$(grep '^{username}:' /etc/passwd | cut -d: -f6)",
+                    "sudo cat \"$HOME_DIR/.ssh/authorized_keys\"",
+                    "# 每行可用 ssh-keygen -lf /dev/stdin <<< '該行內容' 算指紋",
+                ])
+                dlg = TextViewDialog(self, f"檢視 {username} 的 authorized_keys（貼到 sudo 終端機）",
+                                     script, terminal_cfg=self.cfg)
+                dlg.exec()
+            return
+        if not ok:
+            return
+        lines = []
+        idx = 0
+        for ln in body.splitlines():
+            if not ln.startswith("KEY\t"):
+                continue
+            idx += 1
+            key_line = ln[4:]
+            parts = key_line.split(None, 2)
+            ktype = parts[0] if parts else "?"
+            comment = parts[2] if len(parts) > 2 else "（無註解）"
+            lines.append(f"{idx}. {ktype}  {comment}\n   {ssh_fingerprint(key_line)}")
+        text = (f"{username} 的 authorized_keys（{idx} 把）：\n\n" + "\n".join(lines)) if lines \
+            else f"{username} 沒有任何金鑰。"
+        TextViewDialog(self, f"{username} 的金鑰明細", text).exec()
 
     def _selected_username(self):
         it = self.list.currentItem()
@@ -6491,7 +7003,9 @@ class RepoKindScanDialog(QDialog):
         gh_ci = {k.lower(): v for k, v in self.gh_result.items()}
         local_ci = {k.lower(): v for k, v in self.local_result.items()}
         self.table.setRowCount(0)
-        for name, status, pol, mirror, size_kb, kind, upstream in self.all_repos:
+        for row_data in self.all_repos:
+            # list tuple 已擴充到 10 欄（備份天數/保護/描述），這裡只用前 7 欄
+            name, status, pol, mirror, size_kb, kind, upstream = row_data[:7]
             if mirror:
                 continue  # 鏡像庫分類固定由 remote.origin.mirror 決定，不列入建議
             bare = name[:-4] if name.endswith(".git") else name
@@ -6719,6 +7233,21 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("主分支："), 0, 2)
         self.branch_edit = QLineEdit(self.settings.value("branch", "develop"))
         grid.addWidget(self.branch_edit, 0, 3)
+        # 串接期設定一次到位：新庫剛建好是設 CI/備份成本最低的時刻，
+        # 事後補設全靠記得（而最重要的設定正落在最容易忘記的時間點）
+        grid.addWidget(QLabel("CI policy："), 1, 0)
+        self.connect_ci_combo = QComboBox()
+        self.connect_ci_combo.addItems(["不設定（之後再說）", "soft（違規只警告）", "strict（違規擋 push）"])
+        self.connect_ci_combo.setToolTip("串接完成時直接寫 ci_policies/<repo>.policy，不用事後回瀏覽分頁補設。")
+        grid.addWidget(self.connect_ci_combo, 1, 1)
+        grid.addWidget(QLabel("描述（可空）："), 1, 2)
+        self.connect_desc_edit = QLineEdit()
+        self.connect_desc_edit.setPlaceholderText("這個庫是幹嘛的（寫進 description 檔）")
+        grid.addWidget(self.connect_desc_edit, 1, 3)
+        grid.addWidget(QLabel("離站備份 URL（可空）："), 2, 0)
+        self.connect_backup_edit = QLineEdit()
+        self.connect_backup_edit.setPlaceholderText("git@github.com:<me>/<repo>-backup.git（專用空私有庫）")
+        grid.addWidget(self.connect_backup_edit, 2, 1, 1, 3)
         cp.addWidget(rb)
 
         btn_row = QHBoxLayout()
@@ -6762,8 +7291,13 @@ class MainWindow(QMainWindow):
         self.filter_edit.setPlaceholderText("輸入關鍵字即時篩選…")
         self.filter_edit.textChanged.connect(self.apply_repo_filter)
         self.sort_combo = QComboBox()
-        self.sort_combo.addItems(["排序：名稱", "排序：大小（大到小）", "排序：最近活動"])
+        self.sort_combo.addItems(["排序：名稱", "排序：大小（大到小）", "排序：最近活動", "排序：離站備份最舊"])
         self.sort_combo.currentIndexChanged.connect(lambda _=None: self.apply_repo_filter(self.filter_edit.text()))
+        self.no_backup_cb = QCheckBox("只看沒離站備份")
+        self.no_backup_cb.setToolTip("NAS 硬碟壞掉時會全滅的那批——以前只能跑全站健檢在文字堆裡找。")
+        self.no_backup_cb.toggled.connect(lambda _=None: self.apply_repo_filter(self.filter_edit.text()))
+        self.no_ci_cb = QCheckBox("只看 CI 停用")
+        self.no_ci_cb.toggled.connect(lambda _=None: self.apply_repo_filter(self.filter_edit.text()))
         self.mirror_reg_btn = QPushButton("註冊鏡像…")
         self.mirror_reg_btn.setToolTip("讓 NAS 直接對應一個 GitHub 倉庫（git clone --mirror）。")
         self.mirror_reg_btn.clicked.connect(self.on_create_mirror)
@@ -6782,6 +7316,8 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.ci_status_btn)
         top_row.addWidget(self.upgrade_btn)
         top_row.addWidget(self.filter_edit, stretch=1)
+        top_row.addWidget(self.no_backup_cb)
+        top_row.addWidget(self.no_ci_cb)
         top_row.addWidget(self.sort_combo)
         bp.addLayout(top_row)
 
@@ -6878,7 +7414,7 @@ class MainWindow(QMainWindow):
         tools_row.addWidget(self.log_btn)
         self.merged_btn = QPushButton("已合併分支…")
         self.merged_btn.setEnabled(False)
-        self.merged_btn.setToolTip("列出已完全合併進預設分支、可考慮清理的分支（僅列出，不會自動刪除）。")
+        self.merged_btn.setToolTip("列出已完全合併進預設分支的分支，可勾選批次刪除（管理端 update-ref，留本機稽核）。")
         self.merged_btn.clicked.connect(self.on_merged_branches)
         tools_row.addWidget(self.merged_btn)
         self.diff_btn = QPushButton("Diff 比較…")
@@ -6995,7 +7531,7 @@ class MainWindow(QMainWindow):
         og.addWidget(self.restore_backup_btn, 3, 0)
         mp.addWidget(ops_box)
 
-        log_box = QGroupBox("日誌檢視（最後 200 筆）")
+        log_box = QGroupBox("日誌檢視")
         lg = QGridLayout(log_box)
         self.push_log_btn = QPushButton("推送日誌 git_push.log")
         self.push_log_btn.clicked.connect(lambda: self.on_view_log("git_push.log", "推送日誌"))
@@ -7003,6 +7539,17 @@ class MainWindow(QMainWindow):
         self.viol_log_btn.clicked.connect(lambda: self.on_view_log("ci_violation.log", "CI 違規日誌"))
         self.dbg_log_btn = QPushButton("post-receive 除錯日誌")
         self.dbg_log_btn.clicked.connect(lambda: self.on_view_log("post_receive_debug.log", "post-receive 除錯日誌"))
+        # 三支排程腳本的 log 是「排程還活著嗎」唯一的直接證據，之前 GUI 一支都打不開
+        self.mirror_log_btn = QPushButton("鏡像同步日誌")
+        self.mirror_log_btn.clicked.connect(lambda: self.on_view_log("mirror_sync.log", "鏡像同步日誌"))
+        self.backup_log_btn = QPushButton("離站備份日誌")
+        self.backup_log_btn.clicked.connect(lambda: self.on_view_log("offsite_backup.log", "離站備份日誌"))
+        self.hc_log_btn = QPushButton("排程健檢日誌")
+        self.hc_log_btn.clicked.connect(lambda: self.on_view_log("healthcheck.log", "排程健檢日誌"))
+        self.log_lines_spin = QSpinBox()
+        self.log_lines_spin.setRange(50, 5000)
+        self.log_lines_spin.setValue(200)
+        self.log_lines_spin.setToolTip("讀取最後幾筆")
         self.audit_log_btn = QPushButton("本機操作稽核紀錄")
         self.audit_log_btn.setToolTip("這套工具在本機做過的刪除/砍 tag/砍金鑰/GC/批次清封存等破壞性動作紀錄。")
         self.audit_log_btn.clicked.connect(self.on_view_audit_log)
@@ -7013,8 +7560,16 @@ class MainWindow(QMainWindow):
         lg.addWidget(self.push_log_btn, 0, 0)
         lg.addWidget(self.viol_log_btn, 0, 1)
         lg.addWidget(self.dbg_log_btn, 0, 2)
-        lg.addWidget(self.audit_log_btn, 1, 0)
-        lg.addWidget(self.audit_sync_btn, 1, 1)
+        lg.addWidget(self.mirror_log_btn, 1, 0)
+        lg.addWidget(self.backup_log_btn, 1, 1)
+        lg.addWidget(self.hc_log_btn, 1, 2)
+        lg.addWidget(self.audit_log_btn, 2, 0)
+        lg.addWidget(self.audit_sync_btn, 2, 1)
+        lines_row = QHBoxLayout()
+        lines_row.addWidget(QLabel("筆數："))
+        lines_row.addWidget(self.log_lines_spin)
+        lines_row.addStretch(1)
+        lg.addLayout(lines_row, 2, 2)
         mp.addWidget(log_box)
 
         self.maint_status = QLabel("維運動作都會走目前選定的身份（金鑰/plink）。")
@@ -7355,6 +7910,7 @@ class MainWindow(QMainWindow):
 
     # --- 收集設定 ---
     def collect_cfg(self) -> dict:
+        ci_map = {0: "", 1: "soft", 2: "strict"}
         return {
             "project_path": self.path_edit.text().strip(),
             "repo_name": self.repo_edit.text().strip() or os.path.basename(self.path_edit.text().strip()),
@@ -7364,6 +7920,13 @@ class MainWindow(QMainWindow):
             "remote_root": self.root_edit.text().strip() or "/volume1/Git_Server",
             "password": self.pw_edit.text(),
             "identity_file": self.identity_file_edit.text().strip(),
+            # 串接期一次到位的三個可選設定（見 _run_connect 2-7）
+            "ci_policy": ci_map.get(self.connect_ci_combo.currentIndex(), ""),
+            "backup_url": self.connect_backup_edit.text().strip(),
+            "description": self.connect_desc_edit.text().strip(),
+            # 來源分類的 fork 判斷要用（先前只有 collect_identity_cfg 帶）
+            "github_login": self.settings.value("github_login", "", type=str),
+            "github_token": self.settings.value("github_token", "", type=str),
         }
 
     def save_settings(self, cfg):
@@ -7418,7 +7981,8 @@ class MainWindow(QMainWindow):
         for b in (self.hc_btn, self.repair_btn, self.new_user_btn, self.disk_btn, self.notify_btn,
                   self.git_devs_list_btn, self.git_devs_cred_btn, self.deploy_tools_btn,
                   self.ci_profile_btn, self.restore_backup_btn, self.audit_sync_btn,
-                  self.push_log_btn, self.viol_log_btn, self.dbg_log_btn):
+                  self.push_log_btn, self.viol_log_btn, self.dbg_log_btn,
+                  self.mirror_log_btn, self.backup_log_btn, self.hc_log_btn):
             b.setEnabled(not busy)
         has_sel = len(self.repo_list.selectedItems()) > 0
         self.delete_btn.setEnabled(not busy and has_sel)
@@ -7534,7 +8098,8 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_repos(self, items: list):
-        # items: (name, status, policy, mirror_url, size_kb, kind, upstream)；容錯舊格式
+        # items: (name, status, policy, mirror_url, size_kb, kind, upstream,
+        #         backup_days, protect, desc)；容錯舊格式
         norm = []
         for it in items:
             if isinstance(it, (list, tuple)):
@@ -7548,9 +8113,12 @@ class MainWindow(QMainWindow):
                     size_kb = 0
                 kind = str(it[5]) if len(it) > 5 else ""
                 upstream = str(it[6]) if len(it) > 6 else ""
-                norm.append((name, status, pol, mirror, size_kb, kind, upstream))
+                bkd = it[7] if len(it) > 7 and isinstance(it[7], int) else None
+                prot = bool(it[8]) if len(it) > 8 else False
+                desc = str(it[9]) if len(it) > 9 else ""
+                norm.append((name, status, pol, mirror, size_kb, kind, upstream, bkd, prot, desc))
             else:
-                norm.append((str(it), "", "none", "", 0, "", ""))
+                norm.append((str(it), "", "none", "", 0, "", "", None, False, ""))
         self._all_repos = norm
         self._update_kind_tab_counts()
         self.apply_repo_filter(self.filter_edit.text())
@@ -7571,6 +8139,11 @@ class MainWindow(QMainWindow):
         rows = [r for r in self._all_repos if not text or text in r[0].lower()]
         if tab_kind != "all":
             rows = [r for r in rows if effective_repo_kind(r[3], r[5] if len(r) > 5 else "") == tab_kind]
+        # 風險篩選：這兩個問題（沒備份/沒 CI）以前只能跑全站健檢在文字堆裡找
+        if getattr(self, "no_backup_cb", None) is not None and self.no_backup_cb.isChecked():
+            rows = [r for r in rows if not r[3] and (len(r) < 8 or r[7] is None)]
+        if getattr(self, "no_ci_cb", None) is not None and self.no_ci_cb.isChecked():
+            rows = [r for r in rows if not r[3] and r[2] == "none"]
         sort_idx = self.sort_combo.currentIndex() if hasattr(self, "sort_combo") else 0
         if sort_idx == 1:  # 大小（大到小）
             rows.sort(key=lambda r: r[4], reverse=True)
@@ -7579,6 +8152,17 @@ class MainWindow(QMainWindow):
                 m = re.match(r"^(\d{4}-\d{2}-\d{2})", r[1])
                 return (0, m.group(1)) if m else (1, "")
             rows.sort(key=activity_key, reverse=True)
+        elif sort_idx == 3:  # 離站備份最舊（未設定 > 未推過 > 天數多到少）
+            def backup_key(r):
+                bkd = r[7] if len(r) > 7 else None
+                if r[3]:
+                    return -2  # 鏡像庫本身就是副本，排最後
+                if bkd is None:
+                    return 100001
+                if bkd == -1:
+                    return 100000
+                return bkd
+            rows.sort(key=backup_key, reverse=True)
         else:  # 名稱
             rows.sort(key=lambda r: r[0].lower())
         # 重建前記住目前選取；否則打字篩選/重新整理都會把選取（含批次 CI 的多選）清掉
@@ -7588,12 +8172,27 @@ class MainWindow(QMainWindow):
             name, status, pol, mirror, size_kb = row[0], row[1], row[2], row[3], row[4]
             kind = row[5] if len(row) > 5 else ""
             upstream = row[6] if len(row) > 6 else ""
+            bkd = row[7] if len(row) > 7 else None
+            prot = row[8] if len(row) > 8 else False
+            desc = row[9] if len(row) > 9 else ""
             eff_kind = effective_repo_kind(mirror, kind)
             ci = {"soft": "CI:soft", "strict": "CI:strict"}.get(pol, "CI:—")
             parts = [name]
             if status:
                 parts.append(status)
             parts.append(ci)
+            # 備份徽章（鏡像庫不標——它本身就是別處的副本）
+            if not mirror:
+                if bkd is None:
+                    parts.append("無備份")
+                elif bkd == -1:
+                    parts.append("備份:未推過⚠")
+                elif bkd >= 14:
+                    parts.append(f"備份:{bkd}天前⚠")
+                else:
+                    parts.append(f"備份:{bkd}天前")
+            if prot:
+                parts.append("🔒")
             parts.append(fmt_size_kb(size_kb))
             if eff_kind in REPO_KIND_MARK:
                 parts.append(REPO_KIND_MARK[eff_kind])
@@ -7603,10 +8202,15 @@ class MainWindow(QMainWindow):
             it.setData(Qt.ItemDataRole.UserRole + 2, mirror)
             it.setData(Qt.ItemDataRole.UserRole + 3, kind)
             it.setData(Qt.ItemDataRole.UserRole + 4, upstream)
+            tips = []
+            if desc:
+                tips.append(desc)
             if mirror:
-                it.setToolTip(f"GitHub 鏡像 ← {mirror}")
+                tips.append(f"GitHub 鏡像 ← {mirror}")
             elif upstream:
-                it.setToolTip(f"來源 ← {upstream}")
+                tips.append(f"來源 ← {upstream}")
+            if tips:
+                it.setToolTip("\n".join(tips))
             if status.startswith("空庫"):
                 it.setForeground(Qt.GlobalColor.gray)
             self.repo_list.addItem(it)
@@ -8022,7 +8626,8 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def on_view_log(self, logfile, title):
-        self._start_maint("log", title, extra={"logfile": logfile, "log_lines": 200})
+        self._start_maint("log", title, extra={"logfile": logfile,
+                                               "log_lines": self.log_lines_spin.value()})
 
     def on_view_audit_log(self):
         try:
@@ -8287,17 +8892,9 @@ class MainWindow(QMainWindow):
             self.browse_status.setText("請先在清單選一個倉庫。")
             return
         cfg = dict(self.collect_identity_cfg())
-        cfg["repo_name"] = name
         self.save_current_profile(silent=True)
-        self._ci_title = f"已合併分支 — {name}"
-        self.browse_status.setText(f"讀取「{name}」已合併分支中…")
-        self.browse_status.setStyleSheet("")
-        self.set_busy(True)
-        self.worker = Worker(cfg, mode="merged_branches")
-        self.worker.log.connect(self.append_log)
-        self.worker.hooks.connect(self.on_ci_result)
-        self.worker.done.connect(self.on_ci_done)
-        self.worker.start()
+        dlg = MergedBranchesDialog(self, cfg, name)
+        dlg.exec()
 
     def on_repo_gc(self):
         names = self._selected_repo_names()
