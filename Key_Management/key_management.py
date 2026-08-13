@@ -57,7 +57,7 @@ try:
 except ImportError:
     pyzipper = None
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -941,6 +941,30 @@ def label_host(hostname: str, labels: dict) -> str:
     """hostname → 'hostname（標籤）'；查不到標籤就原樣回傳（純函數，可測）。"""
     lab = (labels or {}).get((hostname or "").strip().lower())
     return f"{hostname}（{lab}）" if lab else hostname
+
+
+def open_ssh_terminal(sync_cfg: dict):
+    """用雲端同步身份開一個可互動的 ssh 終端機視窗（sudo 診斷/貼指令用）。
+
+    Windows 限定（CREATE_NEW_CONSOLE）；獨立實作、不 import 手足工具的
+    open_admin_terminal()——兩工具不共用程式碼的邊界維持不變，只是照同一個慣例。
+    回傳 (ok, 訊息)。"""
+    if os.name != "nt":
+        return False, "開啟終端機功能目前只支援 Windows。"
+    user = (sync_cfg.get("user") or "").strip()
+    host = (sync_cfg.get("host") or "").strip()
+    if not (user and host):
+        return False, "同步設定未填 host/user。"
+    args = ["ssh"]
+    identity = (sync_cfg.get("identity_file") or "").strip()
+    if identity:
+        args += ["-i", identity, "-o", "IdentitiesOnly=yes"]
+    args.append(f"{user}@{host}")
+    try:
+        subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        return True, f"已開啟 {user}@{host} 的終端機視窗。"
+    except OSError as e:
+        return False, f"開啟失敗：{e}"
 
 
 def _sync_ssh(sync_cfg: dict, remote_cmd: str, input_text: str = ""):
@@ -2476,6 +2500,9 @@ class MainWindow(QMainWindow):
         self.authcmp_b.setToolTip("唯讀比對 NAS 上（雲端同步身份）authorized_keys 與本機金鑰——"
                                   "輪替後驗證「本機這把在遠端到底認不認」。撤銷仍走 NasGitConnector。")
         self.authcmp_b.clicked.connect(self.on_compare_authorized)
+        self.terminal_b = QPushButton("🖥 開啟 NAS 終端機")
+        self.terminal_b.setToolTip("用雲端同步身份開一個 ssh 視窗（sudo 診斷、貼指令用）。Windows 限定。")
+        self.terminal_b.clicked.connect(self.on_open_terminal)
         self.sync_config_b = QPushButton("⚙ 雲端同步設定…")
         self.sync_config_b.clicked.connect(self.on_sync_config)
         self.sync_overview_b = QPushButton("🌐 跨電腦金鑰總覽…")
@@ -2488,6 +2515,7 @@ class MainWindow(QMainWindow):
         brow.addWidget(self.known_hosts_b)
         brow.addWidget(self.agent_b)
         brow.addWidget(self.authcmp_b)
+        brow.addWidget(self.terminal_b)
         brow.addWidget(self.sync_config_b)
         brow.addWidget(self.sync_overview_b)
         brow.addStretch(1)
@@ -2920,6 +2948,20 @@ class MainWindow(QMainWindow):
 
     def _show_authcmp(self, report):
         TextViewDialog(self, "NAS 授權比對", report).exec()
+
+    def on_open_terminal(self):
+        # 不掛 _busy：開終端機不佔 Worker，掃描跑到一半也能開視窗查東西
+        sync_cfg = load_sync_config()
+        if not (sync_cfg.get("host") and sync_cfg.get("user")):
+            QMessageBox.information(self, "需要同步設定",
+                                    "用「⚙ 雲端同步設定…」的連線身份開終端機，請先設定 host/user。")
+            return
+        ok, msg = open_ssh_terminal(sync_cfg)
+        if ok:
+            self.status.setText("✔ " + msg)
+            self.status.setStyleSheet("color:#1a7f37;")
+        else:
+            QMessageBox.warning(self, "開啟終端機失敗", msg)
 
     def on_agent_keys(self):
         self._busy(True)
