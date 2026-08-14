@@ -193,5 +193,42 @@ class TestAuditKeyScript(unittest.TestCase):
             self.assertEqual(len(f.readlines()), 1)
 
 
+class TestVersionResource(unittest.TestCase):
+    """exe 的 Windows 版本資源必須跟 __version__ 對得起來。
+
+    在這之前版本只存在於檔名（build_exe.bat 的 copy 產生），exe 內部查不到任何
+    版號可以佐證——檔名一旦錯了沒人看得出來。這幾個測試盯的就是那條產生路徑。
+    """
+
+    def setUp(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, root)
+        import get_version
+        self.gv = get_version
+        self.root = root
+
+    def test_read_version_matches_module(self):
+        # get_version.py 用 regex 讀原始碼，import 的是真的執行結果，兩邊必須一致
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            self.assertEqual(self.gv.read_version(), ngc.__version__)
+        finally:
+            os.chdir(cwd)
+
+    def test_version_tuple_always_four_ints(self):
+        self.assertEqual(self.gv.version_tuple("2.12.3"), (2, 12, 3, 0))
+        self.assertEqual(self.gv.version_tuple("1.9"), (1, 9, 0, 0))
+        self.assertEqual(self.gv.version_tuple("2.0.0rc1"), (2, 0, 0, 0))
+
+    def test_rendered_file_is_valid_python_and_carries_the_version(self):
+        # PyInstaller 是直接 eval 這個檔案的，語法錯了會在建置最後一刻才炸
+        text = self.gv.render_version_file("2.12.3")
+        compile(text, "version_info.txt", "exec")   # 語法錯的話這裡就會丟 SyntaxError
+        self.assertIn("filevers=(2, 12, 3, 0)", text)
+        self.assertIn("StringStruct('FileVersion', '2.12.3')", text)
+        self.assertIn("StringStruct('ProductVersion', '2.12.3')", text)
+
+
 if __name__ == "__main__":
     unittest.main()

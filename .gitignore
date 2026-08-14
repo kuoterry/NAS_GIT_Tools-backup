@@ -76,3 +76,6 @@ Desktop.ini
 *.tmp
 
 .vscode/settings.json
+
+# PyInstaller 版本資源檔（build_exe.bat 每次建置由 get_version.py 重新產生）
+version_info.txt

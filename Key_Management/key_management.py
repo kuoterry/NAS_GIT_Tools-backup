@@ -58,7 +58,7 @@ try:
 except ImportError:
     pyzipper = None
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
