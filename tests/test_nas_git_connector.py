@@ -175,6 +175,16 @@ class TestAuditKeyScript(unittest.TestCase):
         self.assertIn("新增=" + ngc.ssh_fingerprint(new), line)
         self.assertIn("撤銷=" + ngc.ssh_fingerprint(old), line)
 
+    def test_notes_only_call_has_no_key_fields(self):
+        # 移除帳號沒有金鑰可記，但「同時刪除 DSM 帳號」不可逆，非留紀錄不可
+        ngc.audit_key_script({"user": "u", "host": "h"}, "gen_removeuser_script", "git_user9",
+                             notes=[("同時刪除DSM帳號", "是"), ("移除後成員", "kuoterry Git_User1")])
+        line = self._line()
+        self.assertIn("同時刪除DSM帳號=是", line)
+        self.assertIn("移除後成員=kuoterry Git_User1", line)
+        self.assertNotIn("SHA256:", line)
+        self.assertIn("未知", line)
+
     def test_single_line_per_call(self):
         # audit_sync 靠 sort -u 合併多機紀錄，一筆換行就會把時間軸切爛
         ngc.audit_key_script({"user": "u", "host": "h"}, "gen_addkey_script",
