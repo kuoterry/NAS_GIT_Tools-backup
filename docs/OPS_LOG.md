@@ -8,6 +8,14 @@ NAS 端手動維運操作紀錄——記錄**不經 GUI 工具**、因此不會�
 
 ---
 
+## 2026-08-14 — 家機（Terry_ASUS）全面排除三把無主金鑰（唯讀檢查）
+
+接續下面「第三來源」待辦，回家後在家機做本機排除比對，未動 NAS：
+
+- **動作**：算出家機 `~/.ssh` 全部公鑰與 `.ppk` 的 SHA256 指紋——`id_ed25519`＝`bJM6…`、`id_rsa`＝`Ejun…`、`id_ed25519_git_user2`＝`UGd6…`、`openssh.ppk`＝`Ejun…`（同 id_rsa）、`ASUS_putty.ppk`＝`zM/FH…`、`putty_id_rsa.pub`＝`zM/FH…`（同一把的 RFC4716 匯出檔）。PuTTY 註冊表 sessions 只有 `NAS_DS418` 一筆，指向 `openssh.ppk`。
+- **結論**：`jpGF…`、`5yCe…`、`Znict…` 三把**都不是家機的**。家機＋公司機名冊皆已排除。
+- **待辦**：`Znict…`（rsa-key-20251211）最可能藏在**公司機的 `.ppk`**——KM 只掃 OpenSSH 公鑰、不掃 `.ppk`，公司機名冊 6 筆排除不了 PuTTY 金鑰，下次到公司照本條做法掃 `*.ppk` 指紋＋查 PuTTY sessions。`5yCe…`（sshfs-nas）查路由器 sshfs／手機／舊機器。`jpGF…` 問 git_user2 私鑰持有者。三把確認無主後才用 GUI「SSH 金鑰管理」撤。
+
 ## 2026-08-14 — 手動把家機名冊從 .bak 合併回 NAS，並放寬 km_registry_sync.json 權限
 
 跨機器金鑰名冊同步一直是壞的（兩台用不同身份、檔案 600、互相蓋掉，完整經過見 [`INCIDENTS.md`](INCIDENTS.md) 2026-08-14）。程式已修（Key_Management 1.9.0），但 NAS 上當下那份已經只剩公司機的資料，需要手動補救。
