@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.12.0"
+__version__ = "2.12.1"
 
 import os
 import sys
@@ -391,6 +391,32 @@ def ssh_fingerprint(line: str) -> str:
         return "?"
     digest = hashlib.sha256(raw).digest()
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def audit_key_script(cfg: dict, action: str, target_user: str, keys) -> bool:
+    """記錄「產生了一段會改動某帳號 authorized_keys 的腳本」。
+
+    keys 是 [(標籤, 公鑰整行), ...]，只取指紋與註解寫進稽核，公鑰本體不寫
+    （指紋才是事後跟 Key_Management 名冊、KM 的 NAS 比對報表對得起來的欄位）。
+
+    為什麼這件事非記不可：補金鑰/輪替這兩個對話框只「產生腳本」，實際執行是
+    使用者自己貼到 SSH 視窗，不經 Worker，所以既不在 DESTRUCTIVE_MODES、也不會
+    被 on_ci_done 記到。結果是透過這兩條路加上去的金鑰在本機零痕跡——2026-08-14
+    在 git_user2 的 authorized_keys 上翻出兩把查無來源的 ❓ 金鑰（名冊沒有、稽核
+    沒有、本機磁碟也沒有），就是這個缺口造成的，沒有任何紀錄能還原是誰、什麼時候
+    加的，也就沒人敢撤。
+
+    刻意記成「腳本已產生」而不是「已新增金鑰」：這裡並不知道使用者到底有沒有真的
+    去執行那段腳本。寫成既成事實會讓稽核紀錄說謊，而這個檔案的價值完全建立在
+    「寫進去的都是真的」——這跟健檢「讀不到資料就報無法確認、絕不報 [OK]」是同一條規矩。
+    """
+    parts = [f"帳號={target_user}"]
+    for label, pubkey in keys:
+        comment = (pubkey.split(None, 2) + ["", "", ""])[2].strip()
+        fp = ssh_fingerprint(pubkey)
+        parts.append(f"{label}={fp}" + (f"（{comment}）" if comment else ""))
+    parts.append("狀態=腳本已產生，是否實際執行未知")
+    return audit_log(cfg.get("user", ""), cfg.get("host", ""), action, "　".join(parts))
 
 
 # Key_Management（同倉庫的獨立姊妹工具）本機金鑰名冊路徑。兩工具原則上完全獨立、
@@ -6265,6 +6291,8 @@ class AddKeyForUserDialog(QDialog):
             self.status.setStyleSheet("color:#b00020;")
             return
         script = self._build_script(pubkey)
+        audit_key_script(self.cfg, "gen_addkey_script", self.username,
+                         [("新增", pubkey)])
         dlg = TextViewDialog(self, f"幫既有帳號新增金鑰 — 待執行指令（{self.username}）", script,
                              terminal_cfg=self.cfg)
         dlg.exec()
@@ -6431,6 +6459,10 @@ class RotateKeyDialog(QDialog):
             self.status.setStyleSheet("color:#b00020;")
             return
         script = self._build_script(new_pubkey, old_pubkey)
+        keys = [("新增", new_pubkey)]
+        if old_pubkey:
+            keys.append(("撤銷", old_pubkey))
+        audit_key_script(self.cfg, "gen_rotatekey_script", self.username, keys)
         dlg = TextViewDialog(self, f"金鑰輪替 — 待執行指令（{self.username}）", script)
         dlg.exec()
         self.status.setText("✔ 指令已產生，請複製貼到有 sudo 權限的 SSH 視窗執行。")
