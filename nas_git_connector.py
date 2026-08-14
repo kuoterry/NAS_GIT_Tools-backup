@@ -19,7 +19,7 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.12.1"
+__version__ = "2.12.2"
 
 import os
 import sys
@@ -393,15 +393,17 @@ def ssh_fingerprint(line: str) -> str:
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
-def audit_key_script(cfg: dict, action: str, target_user: str, keys) -> bool:
-    """記錄「產生了一段會改動某帳號 authorized_keys 的腳本」。
+def audit_key_script(cfg: dict, action: str, target_user: str, keys=(), notes=()) -> bool:
+    """記錄「產生了一段會改動某個 git_devs 帳號的腳本」。
 
     keys 是 [(標籤, 公鑰整行), ...]，只取指紋與註解寫進稽核，公鑰本體不寫
     （指紋才是事後跟 Key_Management 名冊、KM 的 NAS 比對報表對得起來的欄位）。
+    notes 是 [(標籤, 值), ...]，給沒有金鑰、但同樣改動帳號權限的動作用（例如移除
+    帳號要記移除後的成員名單、有沒有連 DSM 帳號一起砍）。
 
-    為什麼這件事非記不可：補金鑰/輪替這兩個對話框只「產生腳本」，實際執行是
-    使用者自己貼到 SSH 視窗，不經 Worker，所以既不在 DESTRUCTIVE_MODES、也不會
-    被 on_ci_done 記到。結果是透過這兩條路加上去的金鑰在本機零痕跡——2026-08-14
+    為什麼這件事非記不可：建帳號/移除帳號/補金鑰/輪替這四個對話框都只「產生腳本」，
+    實際執行是使用者自己貼到 SSH 視窗，不經 Worker，所以既不在 DESTRUCTIVE_MODES、
+    也不會被 on_ci_done 記到。結果是透過這幾條路動過的權限在本機零痕跡——2026-08-14
     在 git_user2 的 authorized_keys 上翻出兩把查無來源的 ❓ 金鑰（名冊沒有、稽核
     沒有、本機磁碟也沒有），就是這個缺口造成的，沒有任何紀錄能還原是誰、什麼時候
     加的，也就沒人敢撤。
@@ -415,6 +417,8 @@ def audit_key_script(cfg: dict, action: str, target_user: str, keys) -> bool:
         comment = (pubkey.split(None, 2) + ["", "", ""])[2].strip()
         fp = ssh_fingerprint(pubkey)
         parts.append(f"{label}={fp}" + (f"（{comment}）" if comment else ""))
+    for label, value in notes:
+        parts.append(f"{label}={value}")
     parts.append("狀態=腳本已產生，是否實際執行未知")
     return audit_log(cfg.get("user", ""), cfg.get("host", ""), action, "　".join(parts))
 
@@ -5826,6 +5830,11 @@ class CreateGitDevsUserDialog(QDialog):
             f"「{username}」的登入密碼已寫入本機檔案：\n{GIT_DEVS_CRED_LOG_PATH}\n\n"
             "這是明碼檔案，請自行妥善保護（例如搬到有加密的資料夾），不需要的紀錄記得定期清理。")
         script = self._build_script(username, pubkey, member_list, exists, password)
+        # 密碼已經另外留底在 GIT_DEVS_CRED_LOG_PATH，這裡只記指紋，不重複寫入機密
+        audit_key_script(self.cfg, "gen_createuser_script", username,
+                         keys=[("金鑰", pubkey)],
+                         notes=[("帳號原本已存在", "是" if exists else "否"),
+                                ("加入後成員", " ".join(member_list + [username]))])
         dlg = TextViewDialog(self, f"新增 git_devs 帳號 — 待執行指令（{username}）", script,
                              terminal_cfg=self.cfg)
         dlg.exec()
@@ -6148,6 +6157,11 @@ class RemoveGitDevsUserDialog(QDialog):
                 "移除後 git_devs 會變成空群組，這風險太大，工具不會自動產生這種指令，請先確認清單，必要時手動處理。")
             return
         script = self._build_script(remaining, exists)
+        # 「同時刪除 DSM 帳號」不可逆，是這裡最該留下紀錄的一格
+        audit_key_script(self.cfg, "gen_removeuser_script", self.username,
+                         notes=[("同時刪除DSM帳號",
+                                 "是" if self.cb_delete_account.isChecked() else "否"),
+                                ("移除後成員", " ".join(remaining))])
         dlg = TextViewDialog(self, f"移除 git_devs 帳號 — 待執行指令（{self.username}）", script)
         dlg.exec()
 
