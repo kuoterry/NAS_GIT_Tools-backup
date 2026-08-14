@@ -33,6 +33,7 @@ import csv
 import json
 import base64
 import hashlib
+import locale
 import shutil
 import socket
 import subprocess
@@ -57,7 +58,7 @@ try:
 except ImportError:
     pyzipper = None
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -379,7 +380,13 @@ def check_private_key_permissions(path: str):
         if os.name != "nt":
             mode = os.stat(path).st_mode & 0o077
             return f"group/other 可存取（mode …{oct(os.stat(path).st_mode)[-3:]}）" if mode else ""
+        # icacls 是唯一輸出「系統語系編碼」而非 UTF-8 的 subprocess（繁中 Windows
+        # 上是 cp950）。這裡不指定 encoding 的話，直譯器在 UTF-8 模式下
+        # （PYTHONUTF8=1，或未來 Python 預設值改掉）會丟 UnicodeDecodeError——
+        # 那個例外不在下面的 except 清單裡，會一路炸穿整趟掃描，不是只讓這個
+        # 權限檢查回空字串。明確指定系統語系＋errors="replace"，兩種模式行為一致。
         cp = subprocess.run(["icacls", path], capture_output=True, text=True,
+                            encoding=locale.getpreferredencoding(False), errors="replace",
                             timeout=10, input="", creationflags=_NO_WINDOW)
         if cp.returncode != 0:
             return ""
@@ -1390,21 +1397,45 @@ class Worker(QThread):
         hostname = socket.gethostname() or "UNKNOWN"
         self.log.emit("--- 跨機器同步金鑰名冊 ---")
 
+        # 「檔案不存在」與「檔案讀不到」必須分得出來。以前兩者都變成空的遠端名冊，
+        # 而空的遠端名冊合併完就會被推回去——等於把別台機器的資料整份蓋掉。
+        # 這不是假設：NAS 上的 km_registry_sync.json 是 600，家機用 kuoterry、
+        # 公司機用 git_user2 同步，誰推誰就把檔案鎖成只有自己讀得到，另一台讀
+        # 失敗被 `true` 吞掉、當成空的、再推回去蓋掉對方（2026-08-14 查出來，
+        # 家機 8 筆全被公司機的 6 筆蓋掉，靠 NAS 端 .bak 才救回來）。
         pull_cmd = "\n".join([
-            "echo ___BEGIN___",
             f"f='{remote_root}/config/km_registry_sync.json'",
-            "if [ -f \"$f\" ]; then cat \"$f\"; else echo '{}'; fi",
+            "if [ ! -e \"$f\" ]; then echo ___MISSING___; exit 0; fi",
+            "if [ ! -r \"$f\" ]; then echo ___UNREADABLE___; exit 0; fi",
+            "echo ___BEGIN___",
+            "cat \"$f\" || { echo ___CATFAIL___; exit 0; }",
             "echo ___END___",
-            "true",
         ])
         rc, out, err = _sync_ssh(sync_cfg, pull_cmd)
         if rc != 0:
             self.done.emit(False, f"讀取雲端金鑰名冊失敗：{(err or out).strip()}")
             return
-        try:
-            remote_reg = json.loads(_between(out) or "{}")
-        except json.JSONDecodeError:
+        if "___UNREADABLE___" in out or "___CATFAIL___" in out:
+            self.done.emit(False,
+                           "雲端金鑰名冊存在、但這個身份讀不到（權限不足），為避免把別台機器"
+                           "的資料蓋掉，已中止同步。\n\n"
+                           f"請在 NAS 上放寬權限，例如：\n"
+                           f"  chmod 660 {remote_root}/config/km_registry_sync.json\n"
+                           f"  chgrp git_devs {remote_root}/config/km_registry_sync.json\n\n"
+                           "（兩台機器用不同 SSH 身份同步時會遇到這個問題：舊版推送後會把檔案"
+                           "鎖成 600，只有推送者自己讀得到。）")
+            return
+        if "___MISSING___" in out:
             remote_reg = {}
+            self.log.emit("雲端還沒有金鑰名冊，這次是第一次建立。")
+        else:
+            try:
+                remote_reg = json.loads(_between(out) or "{}")
+            except json.JSONDecodeError:
+                self.done.emit(False, "雲端金鑰名冊解析失敗（JSON 壞掉），為避免蓋掉它已中止同步。"
+                                      "\n請檢查 NAS 上的 km_registry_sync.json，必要時從同目錄的"
+                                      " .bak-<時間戳> 還原。")
+                return
 
         local_reg = load_registry()
         merged = merge_registries(local_reg, remote_reg, hostname)
@@ -1427,16 +1458,29 @@ class Worker(QThread):
             "mkdir -p \"$d\"",
             "[ -f \"$f\" ] && cp \"$f\" \"$f.bak-$(date +%Y%m%d-%H%M%S)\"",
             "base64 -d > \"$f.new\" && [ -s \"$f.new\" ] && mv \"$f.new\" \"$f\"",
-            "chmod 600 \"$f\"",
+            # 660 而不是 600：兩台機器各用自己的 git_devs 身份同步，600 會讓
+            # 對方讀不到自己推的檔案（見上面 pull 那段的註解）。config/ 本來就是
+            # drwxrwsr-x git_devs setgid，新檔會自動帶到 git_devs 群組。
+            # 失敗不中止（檔案已經推上去了），但要說出來——靜默的權限失敗正是
+            # 這個 bug 當初能活這麼久的原因。
+            "chmod 660 \"$f\" 2>/dev/null || echo ___PERMFAIL___",
+            "chgrp git_devs \"$f\" 2>/dev/null || echo ___PERMFAIL___",
             "echo ___OK___",
         ])
         rc2, out2, err2 = _sync_ssh(sync_cfg, push_cmd, input_text=b64)
         if rc2 != 0 or "___OK___" not in out2:
             self.done.emit(False, f"推送雲端金鑰名冊失敗：{(err2 or out2).strip()}")
             return
+        perm_note = ""
+        if "___PERMFAIL___" in out2:
+            perm_note = ("\n⚠ 雲端檔案的權限/群組設定失敗，別台機器用不同身份同步時可能讀不到。"
+                         f"\n　請手動執行：chmod 660 與 chgrp git_devs {remote_root}/config/km_registry_sync.json")
         audit_log("sync_registry", f"host={hostname} merged_keys={len(merged)}")
         self.result.emit(merged)
-        self.done.emit(True, f"已同步金鑰名冊，共 {len(merged)} 筆（涵蓋所有已同步過的電腦）。")
+        hosts = sorted({h for e in merged.values() for h in (e.get("seen_hosts") or {})})
+        labels = nas_git_machine_labels()
+        hosts_text = "、".join(label_host(h, labels) for h in hosts) if hosts else "（無）"
+        self.done.emit(True, f"已同步金鑰名冊，共 {len(merged)} 筆。\n涵蓋電腦：{hosts_text}" + perm_note)
 
     def _run_encrypt_key(self):
         """幫未加密的 OpenSSH/PEM 私鑰補上 passphrase（ssh-keygen -p，原地改寫）。
@@ -2425,6 +2469,18 @@ class MainWindow(QMainWindow):
         self.age_spin.valueChanged.connect(
             lambda v: self.settings.setValue("advisory_age_days", v))
         frow.addWidget(self.age_spin)
+        # 掃描後自動同步：名冊的 seen_hosts 就是「這把鑰匙在哪幾台電腦出現過」那份
+        # 紀錄，合併本來就與先後順序無關（per-fingerprint、seen_hosts 聯集）。
+        # 少掉「掃完還要記得再按一次同步」這一步，兩台各按一次「開始掃描」就夠。
+        self.autosync_check = QCheckBox("掃描後自動同步")
+        self.autosync_check.setToolTip(
+            "掃描完成後自動跑一次跨機器同步，把本機結果併進雲端名冊、也把別台的帶回來。\n"
+            "需要先設定「⚙ 雲端同步設定…」；沒設定就自動略過，不會報錯。")
+        self.autosync_check.setChecked(
+            self.settings.value("autosync_after_scan", False, type=bool))
+        self.autosync_check.toggled.connect(
+            lambda v: self.settings.setValue("autosync_after_scan", v))
+        frow.addWidget(self.autosync_check)
         frow.addWidget(self.scan_b)
         fb.addLayout(frow)
         lay.addWidget(folder_box)
@@ -2592,6 +2648,33 @@ class MainWindow(QMainWindow):
         self._busy(False)
         self.status.setText(("✔ " if ok else "❌ ") + msg.replace("\n", "　"))
         self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        if ok and self.autosync_check.isChecked():
+            self._start_autosync()
+
+    def _start_autosync(self):
+        """掃描成功後接著跑一次跨機器同步。設定不全就安靜略過——自動流程不該
+        因為「還沒設定雲端同步」每次掃描都跳一個錯誤給使用者看。"""
+        cfg = load_sync_config()
+        if not (cfg.get("user") and cfg.get("host") and cfg.get("identity_file")):
+            self.status.setText(self.status.text() + "　（未設定雲端同步，略過自動同步）")
+            return
+        self._busy(True)
+        self.status.setText("掃描完成，同步中…")
+        self.status.setStyleSheet("")
+        keep_worker_alive(self)
+        self.worker = Worker("sync_registry", {"sync_cfg": cfg})
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self._on_autosync_done)
+        self.worker.start()
+
+    def _on_autosync_done(self, ok, msg):
+        self._busy(False)
+        # 同步失敗不能吃掉——這個功能存在的理由就是「同步靜默失敗了兩個月沒人發現」
+        self.status.setText(("✔ 掃描完成｜同步：" if ok else "❌ 掃描完成，但同步失敗：")
+                            + msg.replace("\n", "　"))
+        self.status.setStyleSheet("color:#1a7f37;" if ok else "color:#b00020;")
+        if not ok:
+            QMessageBox.warning(self, "自動同步失敗", msg)
 
     # ---------- 表格 ----------
     def _row_values(self, rec):

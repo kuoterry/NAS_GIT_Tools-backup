@@ -330,5 +330,26 @@ class TestMergeRegistries(unittest.TestCase):
         self.assertEqual(set(merged["SHA256:x"]["seen_hosts"]), {"PC1", "PC2"})
 
 
+class TestPrivateKeyPermissionsNeverCrashesScan(unittest.TestCase):
+    """icacls 是唯一輸出系統語系編碼（繁中 Windows 是 cp950）的 subprocess。
+
+    以前沒指定 encoding，直譯器跑在 UTF-8 模式時（PYTHONUTF8=1）解碼會丟
+    UnicodeDecodeError——而那個例外不在函式的 except 清單裡，會炸穿整趟掃描，
+    不是只讓權限檢查回空字串。這個測試在兩種模式下都要過。
+    """
+
+    def test_returns_string_and_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "k")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("dummy")
+            self.assertIsInstance(km.check_private_key_permissions(p), str)
+
+    def test_missing_file_is_not_an_error(self):
+        self.assertIsInstance(
+            km.check_private_key_permissions(os.path.join(tempfile.gettempdir(), "no-such-key-xyz")),
+            str)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,24 @@ NAS 端手動維運操作紀錄——記錄**不經 GUI 工具**、因此不會�
 
 ---
 
+## 2026-08-14 — 手動把家機名冊從 .bak 合併回 NAS，並放寬 km_registry_sync.json 權限
+
+跨機器金鑰名冊同步一直是壞的（兩台用不同身份、檔案 600、互相蓋掉，完整經過見 [`INCIDENTS.md`](INCIDENTS.md) 2026-08-14）。程式已修（Key_Management 1.9.0），但 NAS 上當下那份已經只剩公司機的資料，需要手動補救。
+
+- **動作**：取 `/volume1/Git_Server/config/km_registry_sync.json.bak-20260813-201251`（家機 `Terry_ASUS` 8 筆）與公司機本機名冊 6 筆，用 `merge_registries()` 合併成 14 筆（指紋無重疊），寫回本機 `registry.json`（先備份 `registry.json.bak-20260814-110345`），再以 `git_user2` 身份推回 NAS，推之前照慣例 `cp` 一份 `.bak-<時間戳>`。
+- **權限**：`chmod 660` ＋ `chgrp git_devs`，結果 `-rw-rw---- 1 git_user2 git_devs`。
+- **驗證**：以 `kuoterry` 身份（另一個身份）實際讀取該檔成功，`entries: 14`、`seen_hosts: {'Terry_ASUS': 8, 'ACER_NB': 6}`。修好前這一步是 Permission denied。
+- **附帶**：把 `Terry_ASUS` 綁到 NasGitConnector 的「家中 (kuoterry)」身份（原本 `machines` 是空的，所以標籤只會顯示 hostname）。綁定清單在 profile 同步時是聯集，不會踢掉別台。公司機這台目前綁在名為 `Git_User1` 的身份上，所以標籤顯示「ACER_NB（Git_User1）」——要顯示成「公司」得自己把該身份改名，工具不會猜。
+
+## 2026-08-14 — `git_user2` 兩把 ❓ 解掉一把
+
+承上，名冊合併後重新比對：
+
+- **`SHA256:UGd6fB9FZDqric/U6h2FjjdiHmVjoNXIdEFX3iz9NFE`（註解 `git_user2`）確認是家機 `Terry_ASUS` 的金鑰，不可撤。**
+- **`SHA256:jpGFBvLBqUzKd3d4IZ5S+iLXFsdPho+mF/NMMBcsXEY` 仍無主**——家機名冊裡三把 `git_user2` 註解的金鑰（`1h0dbSPZ…`／`PQw3Nfb…`／`UGd6fB9…`）都不是它。
+- kuoterry 的 `bJM6…`(sshfs-nas)、`Ejun…` 確認是家機的。**`5yCe…`(sshfs-nas)、`Znict…`(rsa-key-20251211) 仍無主**——注意家機有一把 `zM/FH+H+…` 註解同樣是 `rsa-key-20251211`，但**指紋不同、是另一把**，不能拿註解當歸屬證據。
+- 三把無主金鑰（`jpGF…`、`5yCe…`、`Znict…`）維持不撤。兩台機器現在都在名冊裡了，下一步要確認的是「有沒有第三個來源」（手機、路由器 sshfs、舊機器），確認沒有才撤。
+
 ## 2026-08-14 — 公司機（ACER_NB）跑完 Key_Management 掃描，回頭結掉 8/13 的待辦
 
 接續下面 2026-08-13 那條的「等公司機跑過掃描再重比對」。公司機 `ACER_NB`（綁定身份 `Git_User1`）已掃描，`~/.key_management/registry.json` 有 6 筆、`seen_hosts` 全部只有 `ACER_NB`。
