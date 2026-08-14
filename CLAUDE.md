@@ -16,7 +16,7 @@ This repo also contains `Key_Management/`, a completely separate PyQt6 tool (own
 
 [`docs/OPS_LOG.md`](docs/OPS_LOG.md) is the third of the three write-somewhere-else destinations, and the split between them is a rule, not a preference — **`CLAUDE.md` = how the code works now, `INCIDENTS.md` = things that broke and why, `OPS_LOG.md` = normal manual NAS maintenance**. `OPS_LOG.md` exists specifically to cover admin actions taken **outside the GUI** (a hand-run `ssh` session, a manual `authorized_keys` edit), because `audit_log()` only records what this tool itself did — an operation done by hand leaves no trace anywhere otherwise. Anything done *through* the GUI is already audited and does not belong there. Entries are newest-first, and each records 動作 / 原因 / 驗證 / 待辦, including deliberately-deferred follow-ups (the 2026-08-13 entry, for example, leaves three unattributed NAS-only keys in place pending evidence from the office machine — that pending state lives nowhere else).
 
-A few loose top-level files are one-off or personal-workflow scripts, not part of the GUI tool itself: `fix_git_user3_home_acl.sh` is a point-in-time diagnostic/fix script written for the `git_user3` incident (see "Creating new `git_devs` accounts" below) and kept only as a historical reference, not a reusable tool — its ACL theory was later superseded by the home-directory-ownership root cause found for that same incident. `sync-git-identity.ps1`/`sync-git-identity.md` is an unrelated personal utility for keeping `git config user.name` distinct per machine across this user's own repos (home vs office), documented in its own `.md` — it has nothing to do with the NAS connector or the `git_devs` account system.
+A few loose top-level files are one-off or personal-workflow scripts, not part of the GUI tool itself: `fix_git_user3_home_acl.sh` is a point-in-time diagnostic/fix script written for the `git_user3` incident (see "Creating new `git_devs` accounts" below) and kept only as a historical reference, not a reusable tool — its ACL theory was later superseded by the home-directory-ownership root cause found for that same incident. `sync-git-identity.ps1`/`sync-git-identity.md` is an unrelated personal utility for keeping `git config user.name` distinct per machine across this user's own repos (home vs office), documented in its own `.md` — it has nothing to do with the NAS connector or the `git_devs` account system. `how to ues it.txt` (sic — the typo is in the tracked filename) is a single-line leftover from `chore: initial project setup` containing nothing but `python .\nas_git_connector.py`; the Commands section below superseded it long ago. Left in place deliberately — renaming or deleting it buys nothing and only churns history.
 
 ## Commands
 
@@ -33,6 +33,14 @@ build_exe.bat                          # build dist\NasGitConnector.exe (onefile
 ```
 cd Key_Management && py -m unittest discover -s tests
 ```
+
+### After any merge or edit of this file, check it for conflict markers
+
+```
+grep -n "^<<<<<<<\|^>>>>>>>" CLAUDE.md    # must print nothing
+```
+
+This file is long and its paragraphs are single enormous lines (the `Worker` bullet alone is ~4000 characters on one line), so almost any concurrent edit conflicts on a whole paragraph, and the resulting `<<<<<<<`/`>>>>>>>` markers sit invisibly inside dense prose — a set survived a commit and went unnoticed until 2026-08-14. Resolving is **not** "keep the longer side": arbitrate against the code. For the `Worker` mode list specifically, the `if/elif` chain in `Worker._dispatch()` is the authority (that's what caught it — the stale side was missing seven modes that exist in the dispatch chain).
 
 `NAS_Safety/login_watch/` has no build step and nothing to run on Windows — it targets the NAS's python3 and needs root plus `.SYNOCONNDB`; see its own `README.md` for the deploy/verify sequence.
 
