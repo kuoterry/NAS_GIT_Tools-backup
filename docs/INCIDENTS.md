@@ -134,3 +134,42 @@ Note the fix only reaches production when someone clicks "升級 CI 引擎" in t
 **部署當天的第三個坑（差點重演同一型）**：NAS 上其實一直存在舊的 conf 檔，用的是**另一套變數名與 yes/no 值**（`PROTECT_MASTER=yes`、`CHECK_COMMIT_FORMAT=`、`CHECK_BRANCH=`）——以前引擎不讀所以無所謂，新引擎一上線 source 進來，`"yes"` 過不了 `[ "$PROTECT_MASTER" = "1" ]`，master 保護在 soft repo 上**再次靜默失效**。當場抓到（部署後立刻 `cat` 全部 conf 檢查行尾與內容），修法雙管齊下：引擎加 `__flag()` 正規化（1/yes/true/on 都算開）、NAS 端 conf 改寫成正典旋鈕名（舊檔備份）。教訓：**啟用一個「一直存在但從未被讀」的設定檔之前，先看檔案裡實際寫了什麼**——它的內容從未被任何執行路徑驗證過。
 
 驗證：拋棄式 bare repo 真 push 11 案例全過（合規放行、壞訊息 strict 擋/soft 放、master 兩種 policy 都擋、2MB 超限擋、BOT_TOKEN 樣式擋、新分支 `--not --all` 路徑、yes 值正規化、CHECK_COMMIT_MSG=no 停用生效、log 欄位對齊日報 awk）。新引擎已部署 NAS（舊引擎與舊 conf 均有 .bak）。
+
+---
+
+## 2026-08-14 — 跨機器金鑰名冊同步兩個月來每次都「成功」，實際上兩台機器互相覆蓋
+
+症狀是從一個無關的問題查起的：`git_user2` 的 `authorized_keys` 有兩把查不到來源的 ❓ 金鑰。查證過程中發現本機 `registry.json` 的 6 筆條目 `seen_hosts` **全部只有 `ACER_NB`**——公司機自己。名冊設計上有 `seen_hosts`（這把鑰匙在哪幾台電腦出現過，聯集、只加不減）＋ `label_host()`（hostname 翻成家中/公司），也就是說「這把是公司機還是家機的」這個能力**早就做好了**，但從來沒有一次真的合併到對方的資料。
+
+NAS 上一看就清楚：
+
+```
+-rw-------  1 git_user2  git_devs  4641  Aug 14 09:38  km_registry_sync.json
+-rw-------  1 kuoterry   git_devs  8283  Aug 13 20:12  km_registry_sync.json.bak-20260813-201251
+```
+
+檔案是 **600**，而兩台機器用**不同 SSH 身份**同步（家機 `kuoterry`、公司機 `git_user2`）。誰推誰就把檔案鎖成只有自己讀得到。實測確認：
+
+```
+$ ssh kuoterry@... head -c 60 /volume1/Git_Server/config/km_registry_sync.json
+head: cannot open '...' for reading: Permission denied
+```
+
+兩段程式合起來把這個權限錯誤變成靜默的資料破壞：
+
+- push（`_run_sync_registry`）結尾是 `chmod 600 "$f"`——`mv "$f.new" "$f"` 之後檔案屬於推送者，chmod 成功，於是每次推送都重新把對方鎖在門外。
+- pull 是 `if [ -f "$f" ]; then cat "$f"; else echo '{}'; fi` 後面接一行 `true`。`cat` 因權限失敗只往 stderr 噴，`true` 讓整段 rc=0，`_between(out)` 回空字串，`json.loads("" or "{}")` 得到 `{}`——**「檔案不存在」與「檔案讀不到」被壓成同一個結果**。
+
+於是流程變成：拉不到（當成遠端是空的）→ 跟本機合併（等於沒合併）→ 把只有自己資料的版本推回去，蓋掉對方的 → 回報「已同步金鑰名冊，共 N 筆（涵蓋所有已同步過的電腦）」。訊息裡那句「涵蓋所有已同步過的電腦」尤其誤導，因為它從來就只涵蓋一台。
+
+跟 `ci_violation.log` 沒有寫入者、`build_exe.bat` 版號複製靜默失敗是同一個形狀：**停止運作的檢查/同步與正常運作的檢查/同步，在畫面上長得一模一樣。**
+
+修法（Key_Management 1.9.0）：
+
+1. push 改 `chmod 660` ＋ `chgrp git_devs`（`config/` 本來就是 `drwxrwsr-x git_devs` setgid），失敗會回報 `___PERMFAIL___` 並在成功訊息後面附警告——不再靜默。
+2. pull 用 `___MISSING___` / `___UNREADABLE___` / `___CATFAIL___` 三個標記把「不存在」「讀不到」「讀失敗」分開。讀不到就**中止同步**（附上該下的 `chmod`/`chgrp` 指令），絕不繼續推送——寧可不同步，也不能拿空的遠端去蓋掉別台的資料。JSON 解析失敗同樣中止（以前是靜靜當成空 dict）。
+3. 成功訊息改成實際列出涵蓋了哪幾台機器（`seen_hosts` 聯集後跑 `label_host()`），而不是宣稱「所有已同步過的電腦」。一台機器名單就是同步沒生效的直接證據。
+
+資料救回：NAS 端 `.bak-20260813-201251` 保有家機那份 8 筆（`seen_hosts` 全部 `Terry_ASUS`），與公司機的 6 筆合併成 14 筆推回 NAS，權限改 660，並實測 `kuoterry` 身份讀得到。順帶解掉原本那兩把 ❓ 之一：`SHA256:UGd6fB9FZDqric/…`（註解 `git_user2`）就在家機名冊裡，不能撤。
+
+附帶收穫：`check_private_key_permissions()` 呼叫 `icacls` 時沒指定 `encoding`。繁中 Windows 的 `icacls` 輸出是 cp950，直譯器在 UTF-8 模式下（`PYTHONUTF8=1`，或未來 Python 改預設值）解碼會丟 `UnicodeDecodeError`，而該例外不在函式的 `except (OSError, TimeoutExpired)` 清單裡，會**炸穿整趟掃描**，不是只讓權限檢查回空字串。跑 `PYTHONUTF8=1 python -m unittest` 時 2 個測試炸出來才發現。改成明確指定 `locale.getpreferredencoding(False)` ＋ `errors="replace"`，兩種模式行為一致，並補了測試。
