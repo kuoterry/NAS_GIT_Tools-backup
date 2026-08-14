@@ -42,9 +42,19 @@ if errorlevel 1 (
 echo.
 
 echo [2/3] Packaging...
+rem Generate the Windows version resource from __version__ so that
+rem right-click - Properties - Details shows the real version. Without this the
+rem version only exists in the filename, which nothing verifies against the exe.
+%PY% "%~dp0get_version.py" --version-file "%~dp0version_info.txt"
+if not exist "%~dp0version_info.txt" (
+  echo [ERROR] Could not generate version_info.txt - check __version__ in nas_git_connector.py.
+  pause
+  exit /b 1
+)
 rem --add-data: bundle the server-side scheduled scripts so the frozen exe can
 rem deploy them to NAS tools/ and hash-compare them in the health check.
 %PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name NasGitConnector ^
+  --version-file "%~dp0version_info.txt" ^
   --add-data "sync_github_mirrors.sh;." ^
   --add-data "ci_daily_violation_report.sh;." ^
   --add-data "git_stats_report.sh;." ^

@@ -350,6 +350,30 @@ class TestPrivateKeyPermissionsNeverCrashesScan(unittest.TestCase):
             km.check_private_key_permissions(os.path.join(tempfile.gettempdir(), "no-such-key-xyz")),
             str)
 
+class TestVersionResource(unittest.TestCase):
+    """exe 的 Windows 版本資源必須跟 __version__ 對得起來（見姊妹專案的同名測試）。"""
+
+    def setUp(self):
+        self.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, self.root)
+        import get_version
+        self.gv = get_version
+
+    def test_read_version_matches_module(self):
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            self.assertEqual(self.gv.read_version(), km.__version__)
+        finally:
+            os.chdir(cwd)
+
+    def test_rendered_file_is_valid_python_and_carries_the_version(self):
+        text = self.gv.render_version_file("1.9.1")
+        compile(text, "version_info.txt", "exec")
+        self.assertIn("filevers=(1, 9, 1, 0)", text)
+        self.assertIn("StringStruct('FileVersion', '1.9.1')", text)
+        self.assertIn("StringStruct('InternalName', 'KeyManagement')", text)
+
 
 if __name__ == "__main__":
     unittest.main()

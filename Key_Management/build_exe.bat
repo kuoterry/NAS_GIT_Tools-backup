@@ -42,7 +42,18 @@ if errorlevel 1 (
 echo.
 
 echo [2/3] Packaging...
-%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name KeyManagement key_management.py
+rem Generate the Windows version resource from __version__ so that
+rem right-click - Properties - Details shows the real version. Without this the
+rem version only exists in the filename, which nothing verifies against the exe.
+%PY% "%~dp0get_version.py" --version-file "%~dp0version_info.txt"
+if not exist "%~dp0version_info.txt" (
+  echo [ERROR] Could not generate version_info.txt - check __version__ in key_management.py.
+  pause
+  exit /b 1
+)
+%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name KeyManagement ^
+  --version-file "%~dp0version_info.txt" ^
+  key_management.py
 if errorlevel 1 (
   echo [ERROR] Packaging failed. See messages above.
   pause
