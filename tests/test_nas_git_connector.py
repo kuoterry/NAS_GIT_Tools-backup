@@ -124,5 +124,64 @@ class TestMergeProfiles(unittest.TestCase):
         self.assertIn("公司", merged)
 
 
+class TestAuditKeyScript(unittest.TestCase):
+    """補金鑰/輪替腳本的稽核落地。
+
+    這條路徑的洞是真的被踩到的：2026-08-14 在 git_user2 的 authorized_keys 上
+    翻出兩把查無來源的金鑰，因為當時這兩個對話框只產生腳本、什麼都沒記。
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self._orig = ngc.AUDIT_LOG_PATH
+        ngc.AUDIT_LOG_PATH = os.path.join(self._dir, "audit.log")
+
+    def tearDown(self):
+        ngc.AUDIT_LOG_PATH = self._orig
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _line(self):
+        with open(ngc.AUDIT_LOG_PATH, encoding="utf-8") as f:
+            return f.read().strip()
+
+    # 合成金鑰（ed25519 wire format，內容是 0x00..0x1f），不是任何真實帳號的金鑰
+    PUB = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f"
+           " git_user2")
+
+    def test_records_fingerprint_not_the_key_body(self):
+        # 指紋才是事後跟 Key_Management 名冊／NAS 比對報表對得起來的欄位；
+        # 公鑰本體不該進稽核（比對用不到，只是把檔案撐大）
+        ok = ngc.audit_key_script({"user": "kuoterry", "host": "nas"},
+                                  "gen_addkey_script", "git_user2", [("新增", self.PUB)])
+        self.assertTrue(ok)
+        line = self._line()
+        self.assertIn(ngc.ssh_fingerprint(self.PUB), line)
+        self.assertNotIn("AAAAIAABAgMEBQYHCAkKCwwNDg8Q", line)
+        self.assertIn("帳號=git_user2", line)
+        self.assertIn("gen_addkey_script", line)
+
+    def test_never_claims_the_script_was_run(self):
+        # 這裡不可能知道使用者有沒有真的去貼那段腳本，寫成既成事實＝稽核說謊
+        ngc.audit_key_script({"user": "u", "host": "h"}, "gen_addkey_script",
+                             "git_user2", [("新增", self.PUB)])
+        self.assertIn("未知", self._line())
+
+    def test_rotation_records_both_directions(self):
+        old = self.PUB
+        new = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB7l1n8s5b1BsD0hZzYq0dQ2M4vXk9CkGZ3rTfWpQqLm rotated"
+        ngc.audit_key_script({"user": "u", "host": "h"}, "gen_rotatekey_script",
+                             "git_user2", [("新增", new), ("撤銷", old)])
+        line = self._line()
+        self.assertIn("新增=" + ngc.ssh_fingerprint(new), line)
+        self.assertIn("撤銷=" + ngc.ssh_fingerprint(old), line)
+
+    def test_single_line_per_call(self):
+        # audit_sync 靠 sort -u 合併多機紀錄，一筆換行就會把時間軸切爛
+        ngc.audit_key_script({"user": "u", "host": "h"}, "gen_addkey_script",
+                             "git_user2", [("新增", self.PUB)])
+        with open(ngc.AUDIT_LOG_PATH, encoding="utf-8") as f:
+            self.assertEqual(len(f.readlines()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

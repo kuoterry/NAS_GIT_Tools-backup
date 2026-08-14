@@ -8,6 +8,22 @@ NAS 端手動維運操作紀錄——記錄**不經 GUI 工具**、因此不會�
 
 ---
 
+## 2026-08-14 — 公司機（ACER_NB）跑完 Key_Management 掃描，回頭結掉 8/13 的待辦
+
+接續下面 2026-08-13 那條的「等公司機跑過掃描再重比對」。公司機 `ACER_NB`（綁定身份 `Git_User1`）已掃描，`~/.key_management/registry.json` 有 6 筆、`seen_hosts` 全部只有 `ACER_NB`。
+
+- **`MtN55…`（`kuoterry-git`，ed25519）確認有主，不撤。** 就是公司機 `C:\Users\kuote\.ssh\id_ed25519`，名冊 `first_seen` 2026-07-13。8/13 研判「是公司機的金鑰」正確。
+- **`5yCe…`（`sshfs-nas`）與 `Znict…`（`rsa-key-20251211`）仍無主，維持不撤。** 公司機掃描後名冊裡沒有這兩把。但**跨機器同步至今沒有真的合併過家機的資料**（6 筆的 `seen_hosts` 都只有 `ACER_NB`，家機的 `bJM6…`/`Ejun…` 完全沒出現在名冊裡），所以「兩台都掃過了還是無主」這個結論**還不成立**，目前只證明了「不是公司機的」。撤銷前要先讓家機把名冊 push 上 NAS、公司機拉下來合併。
+- 現況 `kuoterry` 的 authorized_keys 共 5 行：`5yCe…`(sshfs-nas)、`bJM6…`(sshfs-nas)、`Znict…`(rsa-key-20251211)、`Ejun…`(kuoterry@kcc3713.synology.me)、`MtN55…`(kuoterry-git)。唯讀 `cat` 取得，沒有做任何修改。
+
+## 2026-08-14 — `git_user2` 的 authorized_keys 有兩把查無來源的金鑰（暫不處理）
+
+Key_Management 對 `git_user2` 做 NAS 比對，3 行裡只有 1 行對得上本機（`xKlme…` = `id_ed25519_git_user2`），另外兩把 `jpGF…`、`UGd6…` 在**名冊、本機稽核紀錄、本機磁碟三處都查不到**。
+
+- **暫不撤銷**，理由同上：家機名冊還沒合併進來，這兩把有可能是家機或 `git_user2` 私鑰持有者手上的金鑰。撤錯會直接鎖掉對方，而且沒有任何紀錄能還原是哪一把。
+- **查不到不是意外，是工具的缺口**：`AddKeyForUserDialog`／`RotateKeyDialog` 只產生腳本、由人手貼到 SSH 視窗執行，不經 `Worker`，所以不在 `DESTRUCTIVE_MODES`、也沒有任何 `done` handler 會記——透過這兩條路加上去的金鑰在本機完全沒有痕跡。已於 v2.12.1 補上 `audit_key_script()`（記帳號＋指紋，狀態註明「腳本已產生，是否實際執行未知」）。`CreateGitDevsUserDialog`／`RemoveGitDevsUserDialog` 同一個缺口尚未補。
+- 順帶查到：`id_ed25519_new`（`3zO/XFV…`，註解 `git_user2`）在 2026-07-15 就已從 **kuoterry**（不是 git_user2）的 authorized_keys 撤掉——稽核紀錄有 `ssh_keys_delete` 那筆，指紋比對吻合。跟 8/13 撤掉的 `Git_User1` 那把是同一種身份交叉，只是早一個月清掉。這把私鑰目前在公司機 `~/.ssh/` 閒置、名冊仍標 `active`（KM 的 status 只有 `active`/`missing` 兩種，沒有「已輪替/已作廢」，所以直接改名冊沒用，下次掃描會被覆寫回 `active`）；要退役得用 KM 的「封存（安全刪除）」把金鑰檔搬進封存區，下次掃描才會翻成 `missing` 並留下 history 事件。
+
 ## 2026-08-13 — 撤銷 kuoterry authorized_keys 中 Git_User1 的金鑰（身份交叉）
 
 - **動作**：從 NAS `kuoterry` 的 `~/.ssh/authorized_keys` 移除指紋 `SHA256:CqIY44pKGw9E0adNCPyR8iN07WGOw3fCMOOuoeVsWjE`（註解 `Git_User1@kcc3713.synology.me`，RSA 4096）。手動 SSH 執行，比照工具慣例先備份：`authorized_keys.bak-20260813-204154`。
