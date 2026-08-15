@@ -22,11 +22,19 @@ A few loose top-level files are one-off or personal-workflow scripts, not part o
 
 ```
 pip install -r requirements.txt        # PyQt6 (runtime); pyinstaller only needed to build the exe
-python .\nas_git_connector.py          # run the GUI directly
+python .\nas_git_connector.py          # run the GUI directly (no args = GUI)
+python .\nas_git_connector.py list     # CLI mode — any arg switches to CLI (see "CLI mode" below)
 py -m unittest discover -s tests       # pure-function regression tests (stdlib only)
 py -m unittest tests.test_nas_git_connector.TestShq.test_plain   # single test
 build_exe.bat                          # build dist\NasGitConnector.exe (onefile/windowed, via PyInstaller)
 ```
+
+### CLI mode (both tools)
+
+`main()` in both `nas_git_connector.py` and `Key_Management/key_management.py` dispatches to `cli_main(sys.argv[1:])` whenever **any** argument is present; no args keeps the exact prior GUI behavior. Scope rule (deliberate): **CLI covers only queries and schedulable maintenance syncs — destructive operations (delete/rename repos, CI changes, key/account management) stay GUI-only**, where the confirmation gates live. Shared conventions: reports/data on stdout, progress + SSH command echo on stderr (`--quiet` silences it), stdout/stderr reconfigured to UTF-8 at entry (scheduled tasks redirect output, and Windows' cp950 default would crash `print` on the emoji/CJK in reports), exit codes 0=ok / 1=operation failed / 2=bad args or identity config. The `dist\` exes are `--windowed` builds with no console — CLI is for `python` invocation only.
+
+- **NAS connector subcommands**: `test`, `list [--json]`, `detail <repo>`, `healthcheck`, `disk-usage`, `sync-mirrors [repo …]`, `backup-sync [repo …]` (empty list = all, matching the GUI's 空=全部 convention), `log <logfile> [-n N]`. Identity comes from the same QSettings profiles the GUI writes — resolution order `--profile` > hostname binding (`machine_binding_label()`) > `last_profile`, with `--host/--user/--root/--identity-file` per-field overrides (`--host 192.168.1.101` for the at-home DDNS fallback). Implementation: `cli_run_worker()` drives the existing `Worker` **synchronously** (calls `run()` directly, never `start()` — signals are same-thread direct connections, so no Qt event loop is needed; a `QCoreApplication` is created only so QObject machinery works headless). All remote logic is reused, none duplicated.
+- **Key_Management subcommands** (local-only, no NAS sync in CLI): `scan [--folder …] [--age-days N] [--json]` (updates `registry.json`, same OSError-doesn't-eat-results convention as the GUI), `list [--json]` (registry, read-only), `audit [--folder …] [--json]` (scan **without** touching the registry, print only records with advisories, **exit 1 if any found** — the scriptable "is anything wrong" check). Default folders come from the GUI's saved `scan_folders` QSettings, falling back to `~/.ssh`.
 
 `Key_Management/` is built and tested the same way but **only from inside its own folder** — it has its own `requirements.txt`, `build_exe.bat`, `get_version.py`, and `tests/`, and `py -m unittest discover -s tests` run from the repo root will not pick its suite up:
 

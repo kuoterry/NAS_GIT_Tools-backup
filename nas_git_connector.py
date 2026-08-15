@@ -19,8 +19,9 @@ NAS Git 專案串接工具 (PyQt6 GUI 版)
 作者備註：NAS Git 根目錄固定 /volume1/Git_Server；遠端一律落在這裡。
 """
 
-__version__ = "2.12.3"
+__version__ = "2.13.0"
 
+import argparse
 import os
 import sys
 import re
@@ -41,7 +42,7 @@ import time
 import tempfile
 from datetime import datetime, timezone
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QCoreApplication
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -9184,7 +9185,181 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
 
+# ============================================================
+# CLI 模式：python nas_git_connector.py <子指令> …（不帶參數＝原本的 GUI）
+# 供排程/腳本使用，只涵蓋查詢與可排程的維運同步；破壞性操作（刪庫、改名、
+# CI 設定、金鑰/帳號管理…）一律留在 GUI，那裡才有確認閘。
+# 輸出約定：報表/資料走 stdout、進度與 SSH 指令回音走 stderr（--quiet 關掉）；
+# 結束碼 0=成功、1=操作失敗、2=參數或身份設定問題。
+# 注意：dist\ 的 exe 是 --windowed 建置、沒有 console，CLI 請用 python 直跑。
+# ============================================================
+
+CLI_REPO_FIELDS = ("name", "status", "ci_policy", "mirror_url", "size_kb",
+                   "kind", "upstream", "backup_days", "protected", "description")
+
+
+def cli_repo_items_to_dicts(items):
+    """把 _run_list 發出的 10 欄 tuple 轉成 dict 清單（--json 輸出用）。
+
+    參數 items 是 repos signal 的 tuple 清單；欄位不足時防禦性補 None，
+    與 GUI 消費端「slice defensively」同一約定。回傳 list[dict]。
+    """
+    out = []
+    for t in items:
+        out.append({field: (t[i] if len(t) > i else None)
+                    for i, field in enumerate(CLI_REPO_FIELDS)})
+    return out
+
+
+def cli_format_repo_table(items):
+    """把 _run_list 的 tuple 清單排成 tab 分隔的人讀表格（純函式，tests 有釘）。
+
+    參數 items 同 cli_repo_items_to_dicts；回傳多行字串，欄位依序為
+    名稱/狀態/CI/大小/來源分類/離站備份/保護/描述，tab 分隔方便 cut/awk。
+    """
+    if not items:
+        return "（沒有倉庫）"
+    kind_marks = {"own": "🏠自己", "fork": "🍴fork", "clone": "📥clone"}
+    lines = []
+    for d in cli_repo_items_to_dicts(items):
+        mark = "↺鏡像" if d["mirror_url"] else kind_marks.get(d["kind"] or "", "未分類")
+        size_mb = (d["size_kb"] or 0) / 1024
+        bkd = d["backup_days"]
+        if bkd is None:
+            backup = "無備份"
+        elif bkd == -1:
+            backup = "備份:未成功"
+        else:
+            backup = f"備份:{bkd}天前"
+        prot = "🔒" if d["protected"] else ""
+        lines.append("\t".join([d["name"] or "", d["status"] or "", d["ci_policy"] or "none",
+                                f"{size_mb:.1f}MB", mark, backup, prot, d["description"] or ""]))
+    return "\n".join(lines)
+
+
+def cli_resolve_cfg(args):
+    """從 QSettings 身份設定合成 Worker cfg；回 (cfg, None) 或 (None, 錯誤訊息)。
+
+    身份選擇順序：--profile 指定 > hostname 綁定（machine_binding_label）>
+    last_profile。--host/--user/--root/--identity-file 逐欄覆寫既有值
+    （在家 DDNS 連不上時 --host 192.168.1.101）。依賴 QSettings("TerryTools",
+    "NasGitConnector") 既有的 profiles/* 結構，與 GUI 共用同一份資料。
+    """
+    st = QSettings("TerryTools", "NasGitConnector")
+    names = st.value("profile_names", [])
+    if isinstance(names, str):
+        names = [names]
+    names = list(names) if names else []
+    name = args.profile or machine_binding_label() or st.value("last_profile", "", type=str)
+    if args.profile and args.profile not in names:
+        return None, (f"找不到身份「{args.profile}」；現有身份：{'、'.join(names) or '（無，請先開 GUI 設定）'}")
+
+    def pv(key, default=""):
+        return st.value(f"profiles/{name}/{key}", default, type=str) if name else default
+
+    cfg = {
+        "user": (args.user or pv("user", "kuoterry") or "kuoterry"),
+        "host": (args.host or pv("host", "kcc3713.synology.me") or "kcc3713.synology.me"),
+        "remote_root": (args.root or pv("remote_root", "/volume1/Git_Server") or "/volume1/Git_Server"),
+        "password": pv("password", ""),
+        "identity_file": (args.identity_file or pv("identity_file", "")),
+        "github_login": st.value("github_login", "", type=str),
+        "github_token": st.value("github_token", "", type=str),
+    }
+    return cfg, None
+
+
+def cli_run_worker(cfg, mode, quiet=False):
+    """同步驅動一次 Worker（呼叫 run()，不 start() 開執行緒）。
+
+    參數 cfg/mode 同 Worker 建構子；quiet=True 時不把 log signal 轉印到 stderr。
+    signals 都在主執行緒直連、當場觸發，不需要 Qt event loop。
+    回傳 dict：ok / msg（done 內容）、hooks（報表文字清單）、repos（tuple 清單）。
+    """
+    if QCoreApplication.instance() is None:
+        # 存成函式屬性讓 QCoreApplication 活到行程結束，避免被回收
+        cli_run_worker._app = QCoreApplication(sys.argv[:1])
+    res = {"ok": False, "msg": "", "hooks": [], "repos": []}
+    w = Worker(cfg, mode=mode)
+    if not quiet:
+        w.log.connect(lambda s: print(s, file=sys.stderr))
+    w.hooks.connect(lambda s: res["hooks"].append(s))
+    w.repos.connect(lambda items: res["repos"].extend(items))
+    w.done.connect(lambda ok, msg: res.update(ok=ok, msg=msg))
+    w.run()
+    return res
+
+
+def cli_main(argv):
+    """CLI 進入點：解析參數、跑對應的 Worker mode、印結果。回傳結束碼 int。"""
+    # 重導向到檔案/管線時 Windows 預設 cp950，表格裡的 emoji/CJK 會讓 print 拋
+    # UnicodeEncodeError——排程情境幾乎都有重導向，先統一成 UTF-8。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+    ap = argparse.ArgumentParser(
+        prog="nas_git_connector.py",
+        description="NAS Git 連接器 CLI 模式（查詢＋排程維運；不帶任何參數則開 GUI）")
+    ap.add_argument("--profile", help="使用指定身份（預設：hostname 綁定的身份，其次上次使用的身份）")
+    ap.add_argument("--host", help="覆寫 NAS 主機（在家 DDNS 連不上可改 192.168.1.101）")
+    ap.add_argument("--user", help="覆寫 SSH 使用者")
+    ap.add_argument("--root", help="覆寫遠端根目錄（預設 /volume1/Git_Server）")
+    ap.add_argument("--identity-file", help="覆寫 SSH 私鑰檔案路徑")
+    ap.add_argument("--quiet", action="store_true", help="不輸出進度與 SSH 指令回音（stderr）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("test", help="測試 NAS 連線")
+    p = sub.add_parser("list", help="列出所有倉庫")
+    p.add_argument("--json", action="store_true", help="以 JSON 輸出")
+    p = sub.add_parser("detail", help="單一倉庫明細")
+    p.add_argument("repo", help="倉庫名稱")
+    sub.add_parser("healthcheck", help="伺服器健檢報告")
+    sub.add_parser("disk-usage", help="伺服器空間總覽")
+    p = sub.add_parser("sync-mirrors", help="同步 GitHub 鏡像")
+    p.add_argument("repos", nargs="*", help="要同步的倉庫（留空＝全部鏡像）")
+    p = sub.add_parser("backup-sync", help="同步離站備份")
+    p.add_argument("repos", nargs="*", help="要同步的倉庫（留空＝全部已設定備份者，含 _archived）")
+    p = sub.add_parser("log", help="讀伺服器日誌")
+    p.add_argument("logfile", choices=["git_push.log", "ci_violation.log", "post_receive_debug.log",
+                                       "mirror_sync.log", "offsite_backup.log", "healthcheck.log"])
+    p.add_argument("-n", "--lines", type=int, default=200, help="讀最後幾行（預設 200）")
+    args = ap.parse_args(argv)
+
+    cfg, err = cli_resolve_cfg(args)
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+
+    mode_by_cmd = {"test": "test", "list": "list", "detail": "repo_detail",
+                   "healthcheck": "healthcheck", "disk-usage": "disk_usage",
+                   "sync-mirrors": "sync_mirrors", "backup-sync": "backup_sync", "log": "log"}
+    if args.cmd == "detail":
+        cfg["repo_name"] = args.repo
+    elif args.cmd == "sync-mirrors":
+        cfg["mirror_names"] = args.repos
+    elif args.cmd == "backup-sync":
+        cfg["backup_repo_names"] = args.repos
+    elif args.cmd == "log":
+        cfg["logfile"] = args.logfile
+        cfg["log_lines"] = args.lines
+
+    res = cli_run_worker(cfg, mode_by_cmd[args.cmd], quiet=args.quiet)
+    if args.cmd == "list":
+        if args.json:
+            print(json.dumps(cli_repo_items_to_dicts(res["repos"]), ensure_ascii=False, indent=2))
+        else:
+            print(cli_format_repo_table(res["repos"]))
+    else:
+        for report in res["hooks"]:
+            print(report)
+    print(("✔ " if res["ok"] else "✘ ") + (res["msg"] or ""), file=sys.stderr)
+    return 0 if res["ok"] else 1
+
+
 def main():
+    if len(sys.argv) > 1:
+        sys.exit(cli_main(sys.argv[1:]))
     app = QApplication(sys.argv)
     win = MainWindow()
     win.showMaximized()  # 自動貼合目前螢幕可用區域，不用每次自己按最大化

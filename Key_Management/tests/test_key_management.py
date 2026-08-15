@@ -375,5 +375,41 @@ class TestVersionResource(unittest.TestCase):
         self.assertIn("StringStruct('InternalName', 'KeyManagement')", text)
 
 
+class TestCliHelpers(unittest.TestCase):
+    """CLI 模式的格式化/過濾純函式。"""
+
+    def test_record_to_dict_drops_blob_and_formats_mtime(self):
+        rec = {"comment": "c", "blob": b"\x00\x01", "mtime": 1700000000.0, "fingerprint": "SHA256:x"}
+        d = km.cli_record_to_dict(rec)
+        self.assertNotIn("blob", d)                      # bytes 不可進 JSON
+        self.assertEqual(d["comment"], "c")
+        self.assertRegex(d["mtime"], r"^\d{4}-\d{2}-\d{2} ")
+        self.assertIn("blob", rec)                       # 原 rec 不被改動
+
+    def test_filter_advisory_records(self):
+        recs = [{"advisories": "—"}, {"advisories": ""}, {"advisories": None},
+                {"advisories": "⚠ 有事"}, {}]
+        flagged = km.cli_filter_advisory_records(recs)
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["advisories"], "⚠ 有事")
+
+    def test_registry_table_active_first_and_empty(self):
+        self.assertEqual(km.cli_format_registry_table({}), "（名冊是空的）")
+        reg = {"a": {"status": "missing", "comment": "aaa", "fingerprint": "f1"},
+               "b": {"status": "active", "comment": "bbb", "fingerprint": "f2"}}
+        lines = km.cli_format_registry_table(reg).splitlines()
+        self.assertTrue(lines[0].startswith("active"))
+        self.assertTrue(lines[1].startswith("missing"))
+
+    def test_records_table_empty_and_encrypted_marker(self):
+        self.assertEqual(km.cli_format_records_table([]), "（沒有金鑰）")
+        rec = {"priv_path": r"C:\k\id_ed25519", "type": "ssh-ed25519", "strength": "極佳",
+               "fingerprint": "SHA256:y", "comment": "me", "priv_format": "openssh-v1",
+               "priv_encrypted": True, "advisories": "—"}
+        line = km.cli_format_records_table([rec])
+        self.assertIn("id_ed25519", line)
+        self.assertIn("+加密", line)
+
+
 if __name__ == "__main__":
     unittest.main()
