@@ -230,5 +230,45 @@ class TestVersionResource(unittest.TestCase):
         self.assertIn("StringStruct('ProductVersion', '2.12.3')", text)
 
 
+class TestCliRepoFormat(unittest.TestCase):
+    """CLI 模式的倉庫清單格式化（純函式）。
+
+    餵的是 _run_list repos signal 的 10 欄 tuple；「欄位不足防禦性補 None」
+    是跟 GUI 消費端同一條約定，這裡釘住它。
+    """
+
+    FULL = ("repo1", "2026-01-01 (develop)", "soft", "", 2048, "own", "", 3, True, "測試描述")
+
+    def test_dicts_full_row(self):
+        d = ngc.cli_repo_items_to_dicts([self.FULL])[0]
+        self.assertEqual(d["name"], "repo1")
+        self.assertEqual(d["ci_policy"], "soft")
+        self.assertEqual(d["size_kb"], 2048)
+        self.assertEqual(d["backup_days"], 3)
+        self.assertTrue(d["protected"])
+
+    def test_dicts_short_tuple_pads_none(self):
+        d = ngc.cli_repo_items_to_dicts([("only-name",)])[0]
+        self.assertEqual(d["name"], "only-name")
+        self.assertIsNone(d["status"])
+        self.assertIsNone(d["description"])
+
+    def test_table_mirror_overrides_kind(self):
+        # 鏡像旗標永遠壓過 kind——與 effective_repo_kind 同一條規則
+        row = ("m", "x", "none", "https://github.com/a/b", 0, "own", "", None, False, "")
+        self.assertIn("↺鏡像", ngc.cli_format_repo_table([row]))
+        self.assertNotIn("🏠自己", ngc.cli_format_repo_table([row]))
+
+    def test_table_backup_days_states(self):
+        def one(bkd):
+            return ngc.cli_format_repo_table([("r", "s", "none", "", 0, "", "", bkd, False, "")])
+        self.assertIn("無備份", one(None))
+        self.assertIn("備份:未成功", one(-1))   # -1＝設了備份但從沒推成功過
+        self.assertIn("備份:3天前", one(3))
+
+    def test_table_empty(self):
+        self.assertEqual(ngc.cli_format_repo_table([]), "（沒有倉庫）")
+
+
 if __name__ == "__main__":
     unittest.main()

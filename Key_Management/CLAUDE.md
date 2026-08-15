@@ -10,9 +10,12 @@ Single-file PyQt6 GUI tool (`key_management.py`) that scans the local machine fo
 
 ```
 pip install -r requirements.txt   # PyQt6
-python .\key_management.py        # run the GUI
+python .\key_management.py        # run the GUI (no args = GUI)
+python .\key_management.py scan   # CLI mode: scan / list / audit (any arg switches to CLI)
 build_exe.bat                     # build dist\KeyManagement.exe (onefile/windowed, via PyInstaller)
 ```
+
+CLI mode (`cli_main`, dispatched from `main()` whenever any argument is present) is deliberately local-only and non-destructive: `scan` (updates `registry.json`), `list` (registry read-only), `audit` (scan without registry update, prints only records with advisories, exit code 1 when any exist — for scheduled checks). No NAS sync, no generate/delete/rotate — those stay in the GUI with its confirmation gates. Full conventions (stdout/stderr split, UTF-8 reconfigure, exit codes, windowed-exe caveat) are documented in the sibling `NAS_GIT_Tools/CLAUDE.md` "CLI mode" section, which covers both tools.
 
 `tests/test_key_management.py` holds `unittest`-based regression tests for the pure functions (pubkey/RFC4716/ppk parsers, `classify_private_key_file` — verified against real `ssh-keygen`-generated keys where available — `build_advisories`, `rewrite_ssh_config_identity`, `merge_registries`); run with `py -m unittest discover -s tests` from this folder. Deliberately stdlib-only. Every parser bug in this file's history was found by real key files, not synthetic ones — when the next one surfaces, fix it *and* pin the offending shape here. GUI/Worker behavior is still verified manually (`python -c "import key_management"` for a quick syntax/import check); no linter or CI config.
 

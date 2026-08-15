@@ -26,6 +26,7 @@
 作者備註：本機資料（金鑰名冊、稽核紀錄、封存區、同步連線設定）都放在 ~/.key_management/。
 """
 
+import argparse
 import os
 import sys
 import re
@@ -58,7 +59,7 @@ try:
 except ImportError:
     pyzipper = None
 
-__version__ = "1.9.1"
+__version__ = "1.10.0"
 
 # Windows 下讓子行程不要彈黑窗
 if os.name == "nt":
@@ -3219,7 +3220,157 @@ class MainWindow(QMainWindow):
         self.status.setStyleSheet("color:#1a7f37;")
 
 
+# ============================================================
+# CLI 模式：python key_management.py <子指令> …（不帶參數＝原本的 GUI）
+# 純本機操作（掃描/名冊/稽核），不含 NAS 同步與任何金鑰產生/刪除/輪替——
+# 那些留在 GUI，有確認閘與密碼輸入框。
+# 輸出約定：資料走 stdout、進度走 stderr；結束碼 0=成功、1=失敗，
+# audit 子指令另外用 1 表示「有建議事項」方便排程判斷。
+# 注意：dist\ 的 exe 是 --windowed 建置、沒有 console，CLI 請用 python 直跑。
+# ============================================================
+
+def cli_record_to_dict(rec: dict) -> dict:
+    """把 build_records 的單筆紀錄轉成 JSON 可序列化的 dict（純函式，tests 有釘）。
+
+    參數 rec 是 build_records 回傳清單的元素；剔除 bytes 型別的 blob、
+    mtime 轉成 ISO 日期字串，其餘欄位原樣保留。回傳新 dict，不改動 rec。
+    """
+    out = {}
+    for key, val in rec.items():
+        if isinstance(val, (bytes, bytearray)):
+            continue
+        if key == "mtime" and val:
+            try:
+                val = datetime.fromtimestamp(val).strftime("%Y-%m-%d %H:%M:%S")
+            except (OSError, OverflowError, ValueError):
+                val = None
+        out[key] = val
+    return out
+
+
+def cli_filter_advisory_records(records: list) -> list:
+    """挑出帶建議事項的紀錄（advisories 非空且非「—」）。純函式，audit 子指令用。"""
+    return [r for r in records if (r.get("advisories") or "—") != "—"]
+
+
+def cli_format_records_table(records: list) -> str:
+    """把掃描紀錄排成 tab 分隔表格文字（純函式）。
+
+    欄位依序：檔名 / 型別(強度) / 指紋 / 註解 / 私鑰格式 / 建議事項。
+    回傳多行字串；空清單回「（沒有金鑰）」。
+    """
+    if not records:
+        return "（沒有金鑰）"
+    lines = []
+    for rec in records:
+        base = os.path.basename(rec.get("priv_path") or rec.get("pub_path") or "")
+        type_strength = rec.get("type") or "?"
+        if rec.get("strength"):
+            type_strength += f"（{rec['strength']}）"
+        fmt = rec.get("priv_format") or ("—" if not rec.get("priv_path") else "?")
+        if rec.get("priv_encrypted"):
+            fmt += "+加密"
+        lines.append("\t".join([base, type_strength, rec.get("fingerprint") or "",
+                                rec.get("comment") or "", fmt,
+                                rec.get("advisories") or "—"]))
+    return "\n".join(lines)
+
+
+def cli_format_registry_table(reg: dict) -> str:
+    """把 registry.json 內容排成 tab 分隔表格文字（純函式）。
+
+    欄位依序：狀態 / 指紋 / 型別 / 註解 / 最後看到時間 / 路徑。
+    依狀態（active 在前）再依註解排序；空名冊回「（名冊是空的）」。
+    """
+    if not reg:
+        return "（名冊是空的）"
+    entries = sorted(reg.values(),
+                     key=lambda e: (e.get("status") != "active", e.get("comment") or ""))
+    lines = []
+    for e in entries:
+        path = e.get("priv_path") or e.get("pub_path") or ""
+        lines.append("\t".join([e.get("status") or "?", e.get("fingerprint") or "",
+                                e.get("type") or "", e.get("comment") or "",
+                                e.get("last_seen") or "", path]))
+    return "\n".join(lines)
+
+
+def cli_default_scan_folders() -> list:
+    """讀 GUI 存的掃描資料夾清單（QSettings scan_folders）；沒存過就 ~/.ssh。"""
+    st = QSettings("TerryTools", "KeyManagement")
+    saved = st.value("scan_folders", [], type=list)
+    return list(saved) if saved else [os.path.join(os.path.expanduser("~"), ".ssh")]
+
+
+def cli_main(argv) -> int:
+    """CLI 進入點：解析參數、跑掃描/名冊/稽核、印結果。回傳結束碼 int。"""
+    # 重導向到檔案/管線時 Windows 預設 cp950，advisories 裡的 ⚠/CJK 會讓 print
+    # 拋 UnicodeEncodeError——排程情境幾乎都有重導向，先統一成 UTF-8。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+    ap = argparse.ArgumentParser(
+        prog="key_management.py",
+        description="SSH 金鑰管家 CLI 模式（掃描＋名冊＋稽核；不帶任何參數則開 GUI）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("scan", help="掃描金鑰並更新名冊 registry.json")
+    p.add_argument("--folder", action="append", help="要掃的資料夾（可重複；預設沿用 GUI 存的清單，其次 ~/.ssh）")
+    p.add_argument("--age-days", type=int, default=DEFAULT_KEY_AGE_DAYS, help=f"幾天未變更提示輪替（預設 {DEFAULT_KEY_AGE_DAYS}）")
+    p.add_argument("--json", action="store_true", help="以 JSON 輸出")
+    p = sub.add_parser("list", help="列出名冊 registry.json（不掃描、不改動任何檔案）")
+    p.add_argument("--json", action="store_true", help="以 JSON 輸出")
+    p = sub.add_parser("audit", help="掃描並只列出有建議事項的金鑰（不更新名冊；有建議事項時結束碼=1）")
+    p.add_argument("--folder", action="append", help="要掃的資料夾（可重複；預設同 scan）")
+    p.add_argument("--age-days", type=int, default=DEFAULT_KEY_AGE_DAYS, help=f"幾天未變更提示輪替（預設 {DEFAULT_KEY_AGE_DAYS}）")
+    p.add_argument("--json", action="store_true", help="以 JSON 輸出")
+    args = ap.parse_args(argv)
+
+    if args.cmd == "list":
+        reg = load_registry()
+        if args.json:
+            print(json.dumps(reg, ensure_ascii=False, indent=2))
+        else:
+            print(cli_format_registry_table(reg))
+        print(f"共 {len(reg)} 筆名冊條目。", file=sys.stderr)
+        return 0
+
+    folders = args.folder or cli_default_scan_folders()
+    print(f"掃描 {len(folders)} 個資料夾中…", file=sys.stderr)
+    walk_errors = []
+    records = build_records(folders, errors=walk_errors, age_days=args.age_days)
+    for we in walk_errors[:20]:
+        print(f"⚠ 讀不到：{we}", file=sys.stderr)
+    if len(walk_errors) > 20:
+        print(f"⚠ 共 {len(walk_errors)} 個位置讀不到（僅列前 20）", file=sys.stderr)
+
+    if args.cmd == "audit":
+        flagged = cli_filter_advisory_records(records)
+        if args.json:
+            print(json.dumps([cli_record_to_dict(r) for r in flagged], ensure_ascii=False, indent=2))
+        else:
+            print(cli_format_records_table(flagged) if flagged else "（沒有建議事項）")
+        print(f"掃到 {len(records)} 組金鑰，其中 {len(flagged)} 組有建議事項。", file=sys.stderr)
+        return 1 if flagged else 0
+
+    # scan：跟 GUI 同一約定——名冊更新失敗不吃掉掃描結果，帶警語照樣輸出
+    reg_note = ""
+    try:
+        update_registry_from_scan(records)
+    except OSError as e:
+        reg_note = f"⚠ 名冊 registry.json 更新失敗（{e}），本次掃描結果只顯示、未記錄。"
+    if args.json:
+        print(json.dumps([cli_record_to_dict(r) for r in records], ensure_ascii=False, indent=2))
+    else:
+        print(cli_format_records_table(records))
+    print(f"掃描完成，共找到 {len(records)} 組金鑰。" + (("\n" + reg_note) if reg_note else ""), file=sys.stderr)
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1:
+        sys.exit(cli_main(sys.argv[1:]))
     app = QApplication(sys.argv)
     win = MainWindow()
     win.showMaximized()  # 自動貼合目前螢幕可用區域，不用每次自己按最大化
