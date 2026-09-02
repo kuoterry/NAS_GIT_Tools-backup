@@ -14,36 +14,15 @@ cmd.exe 沒有 \" 這種跳脫，for /f ('...') 是靠引號奇偶數判斷指�
 import re
 import sys
 
+from pe_version_resource import render_version_file as _render_version_file
+
 SOURCE = "nas_git_connector.py"
 INTERNAL_NAME = "NasGitConnector"
 DESCRIPTION = "NAS Git 專案串接工具"
 
-# PyInstaller 的 --version-file 是一段會被 eval 的 Python 字面值。
-# filevers/prodvers 必須是四個整數的 tuple，Windows 的「檔案版本」欄位吃的是這個；
-# 字串區的 FileVersion/ProductVersion 才是使用者在檔案內容裡看到的文字。
-VERSION_FILE_TEMPLATE = """\
-# 由 get_version.py 自動產生，請勿手動編輯（改 {source} 的 __version__ 才是正解）。
-VSVersionInfo(
-  ffi=FixedFileInfo(
-    filevers={vers}, prodvers={vers},
-    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)
-  ),
-  kids=[
-    StringFileInfo([
-      StringTable('040404b0', [
-        StringStruct('CompanyName', 'TerryTools'),
-        StringStruct('FileDescription', '{desc}'),
-        StringStruct('FileVersion', '{version}'),
-        StringStruct('InternalName', '{internal}'),
-        StringStruct('OriginalFilename', '{internal}.exe'),
-        StringStruct('ProductName', '{desc}'),
-        StringStruct('ProductVersion', '{version}'),
-      ])
-    ]),
-    VarFileInfo([VarStruct('Translation', [1028, 1200])])
-  ]
-)
-"""
+# 樣板本體在 pe_version_resource.py，跟 pyqt-serial-toolkit 共用同一份（2026-09-02
+# 抽出，vendor 一份副本進來而非用 submodule——這個 repo 一貫是單檔／少相依的風格，
+# 見 secret_store.py 同樣的 vendor 慣例）。這裡只加一行自動產生標頭註解。
 
 
 def read_version(path=SOURCE):
@@ -62,9 +41,15 @@ def version_tuple(version):
 
 
 def render_version_file(version):
-    return VERSION_FILE_TEMPLATE.format(
-        source=SOURCE, vers=version_tuple(version), version=version,
-        desc=DESCRIPTION, internal=INTERNAL_NAME)
+    header = f"# 由 get_version.py 自動產生，請勿手動編輯（改 {SOURCE} 的 __version__ 才是正解）。\n"
+    return header + _render_version_file(
+        company_name="TerryTools",
+        file_description=DESCRIPTION,
+        version=version,
+        internal_name=INTERNAL_NAME,
+        original_filename=f"{INTERNAL_NAME}.exe",
+        product_name=DESCRIPTION,
+    )
 
 
 def main(argv):
