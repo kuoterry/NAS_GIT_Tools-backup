@@ -9,24 +9,17 @@ echo   (onefile / windowed / auto-install deps)
 echo ============================================
 echo.
 
-rem === locate Python ===
-rem 1) try the known full path on this machine
-set "PY=C:\Users\kuote\AppData\Local\Programs\Python\Python313\python.exe"
-if exist "%PY%" goto found
-
-rem 2) fall back to py / python on PATH
-set "PY="
-py -3 --version >nul 2>&1 && set "PY=py -3"
-if not defined PY (
-  python --version >nul 2>&1 && set "PY=python"
-)
-if not defined PY (
-  echo [X] Cannot find Python. Edit this .bat and set PY= to your python.exe full path.
+rem === locate Python (shared helper: actually runs each candidate, not just
+rem     checks it exists -- see find_python.bat header for why "if exist" isn't
+rem     enough) ===
+set "NASGT_PY=C:\Users\kuote\AppData\Local\Programs\Python\Python313\python.exe"
+call "%~dp0find_python.bat"
+if errorlevel 1 (
   pause
   exit /b 1
 )
+set "PY=%PY_EXE%"
 
-:found
 echo Using Python: %PY%
 %PY% --version
 echo.
