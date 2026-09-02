@@ -17,6 +17,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import nas_git_connector as ngc
+import secret_store
 
 
 class TestIsSafeName(unittest.TestCase):
@@ -268,6 +269,37 @@ class TestCliRepoFormat(unittest.TestCase):
 
     def test_table_empty(self):
         self.assertEqual(ngc.cli_format_repo_table([]), "（沒有倉庫）")
+
+
+class TestSecretStore(unittest.TestCase):
+    """secret_store：DPAPI 加密密碼取代明碼存登錄檔，見 2026-09-02 修復。
+
+    DPAPI 只在 Windows 上可用，這裡的 encode/decode 往返會實際呼叫 CryptProtectData，
+    在非 Windows CI 上會失敗——但這個專案本來就是 Windows-only 工具，其餘測試也不假裝
+    跨平台，維持一致。
+    """
+
+    def test_roundtrip(self):
+        encoded = secret_store.encode_secret("a-real-password-!@#")
+        self.assertTrue(encoded.startswith("dpapi:v1:"))
+        self.assertNotIn("a-real-password-!@#", encoded)
+        self.assertEqual(secret_store.decode_secret(encoded), "a-real-password-!@#")
+
+    def test_empty_string_not_encrypted(self):
+        self.assertEqual(secret_store.encode_secret(""), "")
+        self.assertEqual(secret_store.decode_secret(""), "")
+
+    def test_legacy_plaintext_passthrough(self):
+        # 升級前存的是明碼，沒有 dpapi:v1: 前綴——decode_secret 要原樣放行，
+        # 讓呼叫端（load_profile_into_fields）能無感遷移，不逼使用者重新輸入密碼。
+        self.assertEqual(secret_store.decode_secret("old-plaintext-password"), "old-plaintext-password")
+
+    def test_different_password_different_ciphertext(self):
+        # 不該讓人一眼看出兩筆密文是不是同一組密碼（DPAPI 本身會處理，這裡只是釘住行為）
+        a = secret_store.encode_secret("password-A")
+        b = secret_store.encode_secret("password-A")
+        self.assertNotEqual(a, b)  # DPAPI 每次加密結果不同（內含隨機性），仍能各自解回同一明碼
+        self.assertEqual(secret_store.decode_secret(a), secret_store.decode_secret(b))
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ import traceback
 import threading
 import time
 import tempfile
+import secret_store
 from datetime import datetime, timezone
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QCoreApplication
@@ -7238,7 +7239,7 @@ class MainWindow(QMainWindow):
         ng.addWidget(self.show_pw_check, 5, 4)
 
         self.remember_pw_check = QCheckBox(
-            "記住此身份的密碼（明碼存於本機登錄檔，較不安全；建議改用 SSH 金鑰）"
+            "記住此身份的密碼（以 Windows DPAPI 加密存於本機登錄檔，綁此帳號＋此機器；建議改用 SSH 金鑰）"
         )
         ng.addWidget(self.remember_pw_check, 6, 0, 1, 5)
 
@@ -7771,7 +7772,18 @@ class MainWindow(QMainWindow):
         self.root_edit.setText(vals["remote_root"])
         self.identity_file_edit.setText(vals["identity_file"])
         # 密碼：只有之前勾了「記住」才會有存；沒有就留空
-        saved_pw = self.settings.value(f"profiles/{name}/password", "")
+        # 舊版本存的是明碼，讀到沒有 dpapi:v1: 前綴的資料視為舊格式，解出來照樣能用，
+        # 並立刻以加密格式重新寫回，使用者不需要重新輸入密碼就完成無感遷移。
+        stored_pw = self.settings.value(f"profiles/{name}/password", "")
+        is_legacy_plaintext = bool(stored_pw) and not stored_pw.startswith("dpapi:v1:")
+        try:
+            saved_pw = secret_store.decode_secret(stored_pw)
+        except OSError:
+            # 密文只有原本存它的那個 Windows 帳號＋機器解得開；換人/換機器時視同沒存過。
+            saved_pw = ""
+        else:
+            if is_legacy_plaintext:
+                self.settings.setValue(f"profiles/{name}/password", secret_store.encode_secret(saved_pw))
         self.pw_edit.setText(saved_pw)
         self.remember_pw_check.setChecked(bool(saved_pw))
 
@@ -7791,9 +7803,9 @@ class MainWindow(QMainWindow):
             "remote_root": self.root_edit.text().strip(),
             "identity_file": self.identity_file_edit.text().strip(),
         })
-        # 密碼：勾了「記住」才寫入登錄檔；沒勾就把之前存的清掉
+        # 密碼：勾了「記住」才寫入登錄檔（DPAPI 加密，見 secret_store.py）；沒勾就把之前存的清掉
         if self.remember_pw_check.isChecked():
-            self.settings.setValue(f"profiles/{name}/password", self.pw_edit.text())
+            self.settings.setValue(f"profiles/{name}/password", secret_store.encode_secret(self.pw_edit.text()))
         else:
             self.settings.remove(f"profiles/{name}/password")
         if not silent:
