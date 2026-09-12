@@ -19,6 +19,8 @@ Versioning: `__version__` near the top of `nas_git_connector.py` (shown in the w
 - `HOWTO_新增SSH金鑰到NAS.md` walks through the four key-provisioning scenarios (`CreateGitDevsUserDialog`/`AddKeyForUserDialog`/`RotateKeyDialog`/`SshKeysDialog`); `HOWTO_跨機器同步.md` does the same for cross-machine profile/registry sync (both tools) and explains the merge rules in plain language (newest `updated_at`/`last_seen` wins per field, `machines`/`seen_hosts` always union) — the part a button tour doesn't make obvious. Both are user-facing "what do I click"; this file is "why is the code like this". They deliberately don't repeat each other.
 
 Three loose top-level files are one-off or personal, not part of either GUI tool: `fix_git_user3_home_acl.sh` (point-in-time script for the `git_user3` incident, kept as history only — its ACL theory was superseded by the home-directory-ownership root cause), `sync-git-identity.ps1`/`.md` (unrelated personal utility keeping `git config user.name` distinct per machine), and `how to ues it.txt` (sic, typo is in the tracked filename — a one-line leftover from initial setup, superseded by Commands below; left alone because renaming it only churns history).
+
+A fourth loose file and one docs series are **workspace-level, not NAS-tool-level**, parked here since 2026-09-12 because this repo is the D:\git workspace's admin home: `scan_workspace.ps1` (read-only scan of every D:\git root item plus nested repos → TSV/MD in `D:\tmp`, no GUI/Worker involvement) and `docs/資產盤點報告_YYYY-MM-DD.md` (periodic D:\git asset inventory, one file per round, older rounds kept as history — the inventory process itself is documented in `D:\git\CLAUDE.md`, not here).
 ## Commands
 
 ```
